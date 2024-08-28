@@ -1088,6 +1088,7 @@ int CALL_CONV bladerf_set_sample_rate(struct bladerf *dev,
 API_EXPORT
 int CALL_CONV bladerf_set_sample_rate_dec(struct bladerf *dev,
                                       bladerf_channel ch,
+                                      bladerf_sample_rate rate,
                                       bladerf_sample_rate *actual);
 
 /**

@@ -538,6 +538,14 @@ static struct bladerf_range const bladerf2_sample_rate_range_4x = {
     FIELD_INIT(.scale,  1),
 };
 
+/* Sample rates allowed for 2x decimation -- SNW this is completely made up based on how DS uses this */
+static struct bladerf_range const bladerf2_sample_rate_range_dec_2x = {
+    FIELD_INIT(.min,    5000000),
+    FIELD_INIT(.max,    40000000),
+    FIELD_INIT(.step,   1),
+    FIELD_INIT(.scale,  1),
+};
+
 /* Bandwidth Range */
 static struct bladerf_range const bladerf2_bandwidth_range = {
     FIELD_INIT(.min,    200000),

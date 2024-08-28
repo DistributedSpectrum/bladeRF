@@ -271,6 +271,7 @@ struct board_fns {
                                     struct bladerf_rational_rate *actual);
     int (*set_sample_rate_dec)(struct bladerf *dev,
                             bladerf_channel ch,
+                            bladerf_sample_rate rate,
                             bladerf_sample_rate *actual);
     int (*get_sample_rate)(struct bladerf *dev,
                            bladerf_channel ch,

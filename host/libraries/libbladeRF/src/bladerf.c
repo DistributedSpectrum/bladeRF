@@ -715,13 +715,14 @@ int bladerf_set_sample_rate(struct bladerf *dev,
 
 int bladerf_set_sample_rate_dec(struct bladerf *dev,
                                 bladerf_channel ch,
+                                bladerf_sample_rate rate,
                                 bladerf_sample_rate *actual)
 {
     int status;
     bladerf_feature feature = dev->feature;
     MUTEX_LOCK(&dev->lock);
     if((feature & BLADERF_FEATURE_OVERSAMPLE_DECIMATE)) {
-        status = dev->board->set_sample_rate_dec(dev, ch, actual);
+        status = dev->board->set_sample_rate_dec(dev, ch, rate, actual);
         if (status != 0) {
             log_error("Sample rate (decimated) config failure\n");
             status = dev->board->set_sample_rate(dev, ch, (bladerf_sample_rate)20e6, actual);
