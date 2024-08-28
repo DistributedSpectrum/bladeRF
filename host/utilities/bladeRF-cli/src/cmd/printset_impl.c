@@ -1228,7 +1228,8 @@ int print_feature(struct cli_state *state, int argc, char **argv)
     bladerf_feature feature;
 
     bladerf_get_feature(state->dev, &feature);
-    printf("  Feature:  %s enabled\n", (feature == BLADERF_FEATURE_DEFAULT) ? "Default" : "Oversample");
+    printf(" Feature: %d\n", feature);
+    printf("  Feature:  %s enabled\n", (feature == BLADERF_FEATURE_DEFAULT) ? "Default" : (feature == BLADERF_FEATURE_OVERSAMPLE) ? "Oversample" : "Decimate");
 
     return rv;
 }
@@ -1279,6 +1280,20 @@ int set_feature(struct cli_state *state, int argc, char **argv)
         }
 
         status = set_bitmode(state, 3, str_8_enable);
+        if (status < 0) {
+            *err = status;
+            rv   = CLI_RET_LIBBLADERF;
+            goto out;
+        }
+    } else if(!strcasecmp("decimate", argv[2])) {
+        status = bladerf_enable_feature(state->dev, BLADERF_FEATURE_OVERSAMPLE_DECIMATE, true);
+        if (status < 0) {
+            *err = status;
+            rv   = CLI_RET_LIBBLADERF;
+            goto out;
+        }
+
+        status = set_bitmode(state, 3, str_16_enable);
         if (status < 0) {
             *err = status;
             rv   = CLI_RET_LIBBLADERF;

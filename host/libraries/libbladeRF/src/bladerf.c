@@ -713,6 +713,34 @@ int bladerf_set_sample_rate(struct bladerf *dev,
     return status;
 }
 
+int bladerf_set_sample_rate_dec(struct bladerf *dev,
+                                bladerf_channel ch,
+                                bladerf_sample_rate *actual)
+{
+    int status;
+    bladerf_feature feature = dev->feature;
+    MUTEX_LOCK(&dev->lock);
+    if((feature & BLADERF_FEATURE_OVERSAMPLE_DECIMATE)) {
+        status = dev->board->set_sample_rate_dec(dev, ch, actual);
+        if (status != 0) {
+            log_error("Sample rate (decimated) config failure\n");
+            status = dev->board->set_sample_rate(dev, ch, (bladerf_sample_rate)20e6, actual);
+            if(status != 0) {
+                log_error("Sample rate (decimated) config failure\n");
+            }
+        }
+    }  else {
+        log_warning("decimated sample rate feature not enabled");
+        status = dev->board->set_sample_rate(dev, ch, (bladerf_sample_rate)20e6, actual);
+        if(status != 0) {
+            log_error("Sample rate (decimated) config failure\n");
+        }
+    }
+
+    MUTEX_UNLOCK(&dev->lock);
+    return status;
+
+}
 int bladerf_get_sample_rate(struct bladerf *dev,
                             bladerf_channel ch,
                             bladerf_sample_rate *rate)
@@ -2086,6 +2114,11 @@ int bladerf_enable_feature(struct bladerf *dev, bladerf_feature feature, bool en
         if(feature == BLADERF_FEATURE_OVERSAMPLE) {
             if (strcmp(bladerf_get_board_name(dev), "bladerf2") != 0) {
                 log_error("BladeRF2 required for OVERSAMPLE feature\n");
+                status = BLADERF_ERR_UNSUPPORTED;
+            }
+        } else if(feature == BLADERF_FEATURE_OVERSAMPLE_DECIMATE) {
+            if (strcmp(bladerf_get_board_name(dev), "bladerf2") != 0) {
+                log_error("BladeRF2 required for OVERSAMPLE_DECIMATE feature\n");
                 status = BLADERF_ERR_UNSUPPORTED;
             }
         } else {

@@ -1069,6 +1069,28 @@ int CALL_CONV bladerf_set_sample_rate(struct bladerf *dev,
                                       bladerf_sample_rate *actual);
 
 /**
+ * Configure the channel's sample rate to 20 Mhz, but sample at 40 Mhz with 2x decimation.
+ *
+ * @note This requires the sample rate is an integer value of Hz.  Use
+ *       bladerf_set_rational_sample_rate() for more arbitrary values.
+ *
+ * @see Use bladerf_get_sample_rate_range() to determine the range of supported
+ *      sample rates.
+ *
+ * @param       dev         Device handle
+ * @param[in]   ch          Channel
+ * @param[in]   rate        Sample rate
+ * @param[out]  actual      If non-NULL, this is written with the actual
+ *                          sample rate achieved.
+ *
+ * @return 0 on success, value from \ref RETCODES list upon failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_set_sample_rate_dec(struct bladerf *dev,
+                                      bladerf_channel ch,
+                                      bladerf_sample_rate *actual);
+
+/**
  * Configure the channel's sample rate as a rational fraction of Hz.
  *
  * @see Use bladerf_get_sample_rate_range() to determine the range of supported
@@ -4139,7 +4161,8 @@ int CALL_CONV bladerf_get_rf_ports(struct bladerf *dev,
  */
 typedef enum {
     BLADERF_FEATURE_DEFAULT = 0,   /**< No feature enabled */
-    BLADERF_FEATURE_OVERSAMPLE     /**< Enforces AD9361 OC and 8bit mode */
+    BLADERF_FEATURE_OVERSAMPLE,     /**< Enforces AD9361 OC and 8bit mode */
+    BLADERF_FEATURE_OVERSAMPLE_DECIMATE /**< Set sample rate 2x and apply Dec factor 2 (rx only) for flattened noise floor at low gain*/
 } bladerf_feature;
 
 /**

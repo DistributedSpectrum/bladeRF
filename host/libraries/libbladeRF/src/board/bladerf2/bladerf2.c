@@ -996,13 +996,19 @@ static int bladerf2_set_rational_sample_rate(
     bladerf_sample_rate integer_rate, actual_integer_rate;
 
     integer_rate = (bladerf_sample_rate)(rate->integer + rate->num / rate->den);
-
-    CHECK_STATUS(dev->board->set_sample_rate(dev, ch, integer_rate,
+    if( dev-> feature == BLADERF_FEATURE_OVERSAMPLE_DECIMATE ) {
+        log_warn("setting decimated sample rate");
+        CHECK_STATUS(dev->board->set_sample_rate_dec(dev, ch, &actual_integer_rate));
+    } else{
+        CHECK_STATUS(dev->board->set_sample_rate(dev, ch, integer_rate,
                                              &actual_integer_rate));
-
-    if (actual != NULL) {
-        CHECK_STATUS(dev->board->get_rational_sample_rate(dev, ch, actual));
+        if (actual != NULL) {
+            CHECK_STATUS(dev->board->get_rational_sample_rate(dev, ch, actual));
+        }
     }
+
+
+
 
     return 0;
 }
@@ -1024,6 +1030,7 @@ static int bladerf2_get_sample_rate(struct bladerf *dev,
         double_rate = *rate*2;
         *rate = double_rate;
     }
+    
 
     return 0;
 }
@@ -1148,6 +1155,90 @@ static int bladerf2_set_sample_rate(struct bladerf *dev,
     /* If requested, fetch the new sample rate and return it. */
     if (actual != NULL) {
         CHECK_STATUS(dev->board->get_sample_rate(dev, ch, actual));
+    }
+
+    /* Warn the user if this isn't achievable */
+    check_total_sample_rate(dev);
+
+    return 0;
+}
+
+static int bladerf2_set_sample_rate_decimated(struct bladerf *dev,
+                                            bladerf_channel ch,
+                                            /*bladerf_sample_rate rate,*/
+                                            bladerf_sample_rate *actual)
+{
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+
+    struct bladerf2_board_data *board_data = dev->board_data;
+    struct controller_fns const *rfic      = board_data->rfic;
+    struct bladerf_range const *range      = NULL;
+    bladerf_sample_rate current;
+    bladerf_sample_rate rate = 40e6; // hardcoding to 40e6 to get 20e6 effective after decimation
+    bladerf_rfic_rxfir rxfir;
+    bladerf_rfic_txfir txfir;
+
+    /* Range checking */
+    CHECK_STATUS(dev->board->get_sample_rate_range(dev, ch, &range));
+
+    if (!is_within_range(range, rate)) {
+        return BLADERF_ERR_RANGE;
+    }
+    if (dev->feature != BLADERF_FEATURE_OVERSAMPLE_DECIMATE) {
+        log_error("%s: BLADERF OVERSAMPLE DECIMATE NOT ENABLED\n",
+            __FUNCTION__);
+    }
+
+    /* Get current sample rate, and check it against the low-rate range */
+    CHECK_STATUS(dev->board->get_sample_rate(dev, ch, &current));
+
+    /* Get current filter status */
+    CHECK_STATUS(
+        rfic->get_filter(dev, BLADERF_CHANNEL_RX(0), &rxfir, NULL));
+    CHECK_STATUS(
+        rfic->get_filter(dev, BLADERF_CHANNEL_TX(0), NULL, &txfir));
+
+    if(rxfir != BLADERF_RFIC_RXFIR_DEC2 ||
+       txfir != BLADERF_RFIC_TXFIR_INT2) {
+        bool fir_set_failed = false;
+        int status;
+        log_debug("%s: enabling 2x decimation/interpolation filters\n",
+                  __FUNCTION__);
+
+        status = rfic->set_filter(dev, BLADERF_CHANNEL_RX(0), BLADERF_RFIC_RXFIR_DEC2, 0);
+        if (status < 0) {
+            log_error("%s: could not set RX filter mode: %s\n",
+                      __FUNCTION__, bladerf_strerror(status));
+            fir_set_failed = true;
+        }
+        status = rfic->set_filter(dev, BLADERF_CHANNEL_TX(0), 0, BLADERF_RFIC_TXFIR_INT2);
+        if (status < 0) {
+            log_error("%s: could not set TX filter mode: %s\n",
+                      __FUNCTION__, bladerf_strerror(status));
+            fir_set_failed = true;
+        }
+
+        if(fir_set_failed) {
+            log_debug("%s: attempting to reset filters to default...\n",
+                      __FUNCTION__);
+            CHECK_STATUS(rfic->set_filter(dev, BLADERF_CHANNEL_RX(0),
+                                          BLADERF_RFIC_RXFIR_DEFAULT, 0));
+            CHECK_STATUS(rfic->set_filter(dev, BLADERF_CHANNEL_TX(0), 0,
+                                          BLADERF_RFIC_TXFIR_DEFAULT));
+
+            return BLADERF_ERR_UNEXPECTED;
+        }
+    }
+
+    /* Set the sample rate */
+    CHECK_STATUS(rfic->set_sample_rate(dev, ch, rate));
+
+    /* If requested, fetch the new sample rate and return it. */
+    if (actual != NULL) {
+        CHECK_STATUS(dev->board->get_sample_rate(dev, ch, actual));
+            log_debug("%s: actual sample rate pre-decimation is %d \n",
+                  __FUNCTION__, *actual);
+        (*actual) /= 2;
     }
 
     /* Warn the user if this isn't achievable */
@@ -2894,6 +2985,7 @@ struct board_fns const bladerf2_board_fns = {
     FIELD_INIT(.get_gain_stage_range, bladerf2_get_gain_stage_range),
     FIELD_INIT(.get_gain_stages, bladerf2_get_gain_stages),
     FIELD_INIT(.set_sample_rate, bladerf2_set_sample_rate),
+    FIELD_INIT(.set_sample_rate_dec, bladerf2_set_sample_rate_decimated),
     FIELD_INIT(.set_rational_sample_rate, bladerf2_set_rational_sample_rate),
     FIELD_INIT(.get_sample_rate, bladerf2_get_sample_rate),
     FIELD_INIT(.get_sample_rate_range, bladerf2_get_sample_rate_range),
