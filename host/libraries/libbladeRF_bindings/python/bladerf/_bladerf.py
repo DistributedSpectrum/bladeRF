@@ -608,7 +608,21 @@ class BladeRF:
         _check_error(ret)
 
     # Gain
-
+    def set_gain_calibration(self, ch, path):
+        ret = libbladeRF.bladerf_load_gain_calibration(self.dev[0], ch, path.encode())
+        _check_error(ret)
+        return ret
+    def enable_gain_calibration(self, ch, enable):
+        ret = libbladeRF.bladerf_enable_gain_calibration(self.dev[0], ch, enable)
+        _check_error(ret)
+        return ret
+    
+    def get_gain_calibration(self, ch):
+        gain = ffi.new("int *")
+        ret = libbladeRF.bladerf_get_gain_target(self.dev[0], ch, gain)
+        _check_error(ret)
+        return gain[0]
+    
     def set_gain(self, ch, gain):
         ret = libbladeRF.bladerf_set_gain(self.dev[0], ch, gain)
         _check_error(ret)
@@ -1134,11 +1148,16 @@ class BladeRF:
         def gain(self):
             """Gain, in dB"""
             return self.dev.get_gain(self.channel)
-
+        
+        @property
+        def gain_target(self):
+            "Computes the gain target for a specified channel, incorporating calibration corrections."
+            return self.dev.get_gain_calibration(self.channel)
+        
         @gain.setter
         def gain(self, value):
             return self.dev.set_gain(self.channel, value)
-
+        
         @property
         def gain_mode(self):
             """Gain mode"""
@@ -1241,6 +1260,14 @@ class BladeRF:
 
         def set_enable(self, value):
             return self.dev.enable_module(self.channel, value)
+
+        def load_gain_table (self, csv_path):
+            return self.dev.set_gain_calibration(self.channel, csv_path)
+
+
+        def enable_gain_table(self, ch, en):
+            return self.dev.enable_gain_calibration((self.channel, en))
+
 
         enable = property(fset=set_enable, doc="Enable/disable RF chain")
 
