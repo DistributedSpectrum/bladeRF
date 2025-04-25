@@ -355,6 +355,7 @@
 "Usage: load_gain <rx|tx> <filename>\n" \
 "\n" \
 "Load a .tbl file for either RX or TX gain table calibration.\n" \
+"CURRENT LIMITATION OF ONLY RX0 or TX0 can be calibrated, didnt want to figure out ch sorting\n" \
 "\n" \
 
 #define CLI_CMD_HELPTEXT_xb \
