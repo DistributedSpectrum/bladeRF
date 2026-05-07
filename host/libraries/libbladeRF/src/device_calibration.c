@@ -355,8 +355,6 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
     int num_channels = 4;
     struct bladerf_gain_cal_tbl gain_tbls[num_channels];
     bladerf_gain current_gain;
-    uint64_t frequency;
-    float power;
     size_t entry_counter = 0;
     int status = 0;
 
@@ -386,8 +384,18 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
     }
 
     entry_size = (BLADERF_CHANNEL_IS_TX(ch))
-        ? sizeof(chain) + sizeof(gain) + sizeof(cw_freq) + sizeof(frequency) + sizeof(power)
-        : sizeof(chain) + sizeof(gain) + sizeof(vsg_power) + sizeof(signal_freq) + sizeof(frequency) + sizeof(rssi) + sizeof(power);
+        ? sizeof(uint8_t)        /* chain */
+          + sizeof(bladerf_gain) /* gain */
+          + sizeof(uint64_t)     /* cw_freq */
+          + sizeof(uint64_t)     /* frequency */
+          + sizeof(float)        /* power */
+        : sizeof(uint8_t)        /* chain */
+          + sizeof(bladerf_gain) /* gain */
+          + sizeof(float)        /* vsg_power */
+          + sizeof(uint64_t)     /* signal_freq */
+          + sizeof(uint64_t)     /* frequency */
+          + sizeof(int32_t)      /* rssi */
+          + sizeof(float);       /* power */
 
     image = bladerf_alloc_image(dev, BLADERF_IMAGE_TYPE_GAIN_CAL, 0, 0);
     status = bladerf_image_read(image, binary_path);
