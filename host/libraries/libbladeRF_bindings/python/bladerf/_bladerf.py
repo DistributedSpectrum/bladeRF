@@ -1322,6 +1322,10 @@ RxGainTag = collections.namedtuple(
 RX_GAIN_TAG_VERSION_NONE = 0
 RX_GAIN_TAG_VERSION_1 = 1
 RX_GAIN_TAG_CHANGED = 1 << 0
+# Only fast-attack AGC ever sets this: the AD9361 drives gain lock from the
+# fast-attack state machine, and UG-570 says it applies only to that mode. In
+# slow-attack and hybrid it is always clear. Use gain_index_min == gain_index_max
+# with `changed` False to decide whether the gain was steady in any mode.
 RX_GAIN_TAG_LOCKED = 1 << 1
 
 
@@ -1333,6 +1337,9 @@ def rx_gain_tag(meta):
 
     Returns an RxGainTag, or None when the FPGA did not supply one (needs
     v0.17.0 or later, and a metadata RX format).
+
+    Note `locked` is meaningful in fast-attack AGC only; see
+    RX_GAIN_TAG_LOCKED.
     """
     tag = ffi.new("struct bladerf_rx_gain_tag *")
     ffi.memmove(tag, meta.reserved, ffi.sizeof("struct bladerf_rx_gain_tag"))

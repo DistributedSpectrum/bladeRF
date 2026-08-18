@@ -373,6 +373,9 @@ def main():
                                 hdr += f" {'dBFS':>7} {'dBm':>8}"
                             print(hdr)
                             header_printed = True
+                        # L is fast-attack AGC only: the AD9361 drives gain
+                        # lock from the fast-attack state machine, so it stays
+                        # '-' in slow and hybrid modes by design.
                         flg = ("C" if tag and tag.changed else "-") + \
                               ("L" if tag and tag.locked else "-")
                         line = (f"{freq/1e6:9.3f} {pkt:4d} {row['timestamp']:12d} "

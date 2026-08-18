@@ -335,7 +335,8 @@ begin
            -- read in SC16_Q11_META mode. It either keeps its historical constant
            -- or carries the RFIC gain tag:
            --   31:25  base gain index at the first sample of this message
-           --      24  AGC gain lock
+           --      24  AGC gain lock (CTRL_OUT[7]; fast-attack AGC only per
+           --          UG-570, so it reads 0 in slow-attack and hybrid)
            --   23:18  chunk 0 delta, signed, index at end of chunk minus base
            --   17:12  chunk 1 delta
            --   11:6   chunk 2 delta

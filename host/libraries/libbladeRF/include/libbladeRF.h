@@ -2607,7 +2607,8 @@ struct bladerf_rx_gain_tag {
     uint8_t version;
 
     /** Bitwise OR of ::BLADERF_RX_GAIN_TAG_CHANGED and
-     *  ::BLADERF_RX_GAIN_TAG_LOCKED */
+     *  ::BLADERF_RX_GAIN_TAG_LOCKED. Note the latter is only ever set in
+     *  fast-attack AGC. */
     uint8_t flags;
 
     /** RX1 full gain-table index at the first sample returned */
@@ -2642,7 +2643,16 @@ struct bladerf_rx_gain_tag {
 /** The gain moved partway through the returned samples */
 #define BLADERF_RX_GAIN_TAG_CHANGED (1 << 0)
 
-/** The AGC reported its gain as locked */
+/** The AGC reported its gain as locked.
+ *
+ * Only ::BLADERF_GAIN_FASTATTACK_AGC ever sets this. The AD9361 drives its gain
+ * lock signal from the fast-attack state machine, and UG-570 states it "applies
+ * only to fast AGC mode", so in slow-attack and hybrid modes the bit is always
+ * clear and says nothing about whether the gain is steady. To judge that in any
+ * mode, use `gain_index_min == gain_index_max` together with
+ * ::BLADERF_RX_GAIN_TAG_CHANGED being clear -- a stronger statement anyway,
+ * since it is derived from the gain index actually applied to these samples.
+ */
 #define BLADERF_RX_GAIN_TAG_LOCKED (1 << 1)
 
 /** @} (End of STREAMING_FORMAT_METADATA) */

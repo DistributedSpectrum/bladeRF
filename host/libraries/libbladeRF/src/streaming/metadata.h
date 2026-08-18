@@ -50,7 +50,7 @@
  * actually applied:
  *
  *      31:25  base: full gain-table index at the first sample of this message
- *         24  AGC gain lock
+ *         24  AGC gain lock (fast-attack AGC only; always 0 otherwise)
  *      23:18  chunk 0 delta, 6-bit signed
  *      17:12  chunk 1 delta
  *      11:6   chunk 2 delta
@@ -138,7 +138,10 @@
 /* Decoded gain profile for one message */
 struct metadata_gain_tag {
     uint8_t base;  /**< Gain index at the first sample of the message */
-    bool lock;     /**< AGC gain lock */
+    bool lock;     /**< AGC gain lock. Fast-attack AGC only -- the AD9361
+                    *   drives this from the fast-attack state machine and
+                    *   UG-570 says it applies only to that mode, so it is
+                    *   always false in slow-attack and hybrid. */
     /** Absolute gain index at the end of each chunk */
     uint8_t chunk[METADATA_GAIN_TAG_CHUNKS];
 };
