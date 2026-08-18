@@ -609,6 +609,18 @@ class BladeRF:
         _check_error(ret)
 
     # Gain
+    def get_timestamp(self, direction):
+        """Current sample counter for the given direction.
+
+        Useful for telling which samples predate a retune: samples with a
+        timestamp below the value read just after bladerf_set_frequency() were
+        captured at the previous frequency.
+        """
+        ts = ffi.new("bladerf_timestamp *")
+        ret = libbladeRF.bladerf_get_timestamp(self.dev[0], direction.value, ts)
+        _check_error(ret)
+        return ts[0]
+
     def set_gain_calibration(self, ch, path):
         ret = libbladeRF.bladerf_load_gain_calibration(self.dev[0], ch, path.encode())
         _check_error(ret)

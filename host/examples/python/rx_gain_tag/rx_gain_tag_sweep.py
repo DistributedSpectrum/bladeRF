@@ -242,6 +242,18 @@ def main():
     # silently drops the rest, which leaves gaps between packets.
     next_ts = None
     resyncs = 0
+    # Reading contiguously means asking for the samples after the previous
+    # packet, so the reader runs behind real time by up to
+    # num_buffers * nsamples / sample_rate. set_frequency() takes effect in real
+    # time, so for that long after a retune the packets still contain the
+    # PREVIOUS frequency's samples. Record the sample counter at each retune and
+    # attribute every packet by its timestamp instead of by the last request.
+    # (ts_before, ts_after, freq). Bracketing the retune matters:
+    # bladerf_set_frequency() moves the LO early and then spends milliseconds on
+    # band selection and recalibration, so a timestamp taken after it returns is
+    # late -- measured 8 ms at 20 Msps. Packets overlapping the window are marked
+    # uncertain rather than assigned to a frequency.
+    bounds = [(0, 0, freqs[0])]
     # index -> dB depends only on the index and the tuned band, and the call
     # costs a USB round trip in FPGA tuning mode, so memoise it per frequency
     # rather than paying it on every packet.
@@ -249,7 +261,10 @@ def main():
     try:
         for lap in range(args.repeat):
             for seg, freq in enumerate(freqs):
+                ts_before = dev.get_timestamp(_bladerf.Direction.RX)
                 dev.set_frequency(ch, freq)
+                ts_after = dev.get_timestamp(_bladerf.Direction.RX)
+                bounds.append((ts_before, ts_after, freq))
                 retune_wall = time.monotonic()
                 retune_ts = None
                 prev_ts = None
@@ -289,6 +304,23 @@ def main():
                         gap = int(meta.timestamp - prev_ts) - nsamples
                     prev_ts = meta.timestamp
 
+                    # Which frequency was actually tuned when these samples were
+                    # captured, as opposed to the one most recently requested.
+                    ts_i = int(meta.timestamp)
+                    j = 0
+                    for k in range(len(bounds) - 1, -1, -1):
+                        if bounds[k][0] < ts_i + nsamples:
+                            j = k
+                            break
+                    b_before, b_after, b_freq = bounds[j]
+                    if ts_i >= b_after:
+                        true_freq, certain = b_freq, True
+                    elif ts_i + nsamples <= b_before:
+                        true_freq = bounds[j - 1][2] if j > 0 else bounds[0][2]
+                        certain = True
+                    else:
+                        true_freq, certain = b_freq, False
+
                     gain_db = None
                     if tag is not None:
                         key = (freq, tag.gain_index)
@@ -313,6 +345,9 @@ def main():
                         "wall_s": round(time.monotonic() - retune_wall, 6),
                         "count": int(meta.actual_count),
                         "gap_samples": gap,
+                        "true_freq_hz": true_freq,
+                        "mislabeled": int(certain and true_freq != freq),
+                        "certain": int(certain),
                         "status": int(meta.status),
                         "gain_index": tag.gain_index if tag else None,
                         "gain_db": round(gain_db, 2) if gain_db is not None else None,
@@ -369,8 +404,11 @@ def main():
           f"{'settle ms':>10} {'dropped':>9}")
     for lap in range(args.repeat):
         for seg, freq in enumerate(freqs):
+            # Exclude packets whose samples predate this retune: they belong to
+            # the previous step and would otherwise dominate the "settling".
             sub = [r for r in rows if r["lap"] == lap and r["seg"] == seg
-                   and r["gain_index"] is not None]
+                   and r["gain_index"] is not None and not r["mislabeled"]
+                   and r["certain"]]
             if not sub:
                 continue
             idx = [r["gain_index"] for r in sub]
@@ -391,9 +429,18 @@ def main():
     overruns = sum(1 for r in rows if r["status"] & 0x1)
     untagged = sum(1 for r in rows if r["gain_index"] is None)
     dropped = sum(r["gap_samples"] for r in rows if r["gap_samples"] > 0)
+    mislabeled = sum(r["mislabeled"] for r in rows)
     print(f"\n{len(rows)} packets, {overruns} with overrun status, "
           f"{untagged} without a gain tag, {dropped} samples dropped, "
           f"{resyncs} resyncs")
+    uncertain = sum(1 for r in rows if not r["certain"])
+    if mislabeled or uncertain:
+        print(f"{mislabeled} packets ({100*mislabeled/len(rows):.1f}%) held "
+              f"samples captured at the PREVIOUS frequency, and {uncertain} "
+              f"overlapped a retune window. The reader lags real time, so a "
+              f"retune reaches the data later than it is requested. Both are "
+              f"marked in the CSV (mislabeled / certain, plus true_freq_hz) and "
+              f"excluded from the summary above.")
     if dropped:
         print("note: samples were dropped, so a gain change spanning a gap "
               "cannot be pinned to one moment. Lower --sample-rate to keep up.")
