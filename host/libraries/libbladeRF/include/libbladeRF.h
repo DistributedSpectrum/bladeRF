@@ -2567,8 +2567,12 @@ struct bladerf_metadata {
  * The FPGA divides each message into `chunks` equal spans and records the gain
  * index at the end of each, so the gain profile travels with the IQ instead of
  * having to be polled asynchronously with bladerf_get_gain(). Requires FPGA
- * v0.17.0 or later, RX1, and an AGC gain mode
- * (::BLADERF_GAIN_SLOWATTACK_AGC by default).
+ * v0.17.0 or later and RX1.
+ *
+ * Specified for AGC gain modes (::BLADERF_GAIN_SLOWATTACK_AGC by default). The
+ * index has also been observed to track commanded manual gain, but AD9361
+ * UG-570 documents these bits for AGC modes only, so do not depend on it in
+ * ::BLADERF_GAIN_MGC.
  *
  * To get absolute power, pass an index through
  * bladerf_rx_gain_tag_to_gain_db() and subtract:
