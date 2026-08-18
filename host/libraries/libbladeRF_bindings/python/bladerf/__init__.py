@@ -48,8 +48,18 @@ TX = _bladerf.TX
 CHANNEL_RX = _bladerf.CHANNEL_RX
 CHANNEL_TX = _bladerf.CHANNEL_TX
 
+rx_gain_tag = _bladerf.rx_gain_tag
+RxGainTag = _bladerf.RxGainTag
+RX_GAIN_TAG_VERSION_NONE = _bladerf.RX_GAIN_TAG_VERSION_NONE
+RX_GAIN_TAG_VERSION_1 = _bladerf.RX_GAIN_TAG_VERSION_1
+RX_GAIN_TAG_CHANGED = _bladerf.RX_GAIN_TAG_CHANGED
+RX_GAIN_TAG_LOCKED = _bladerf.RX_GAIN_TAG_LOCKED
+
 main = _tool.main
 
 __all__ = ['BladeRF', 'get_bootloader_list', 'get_device_list',
            'load_fw_from_bootloader', 'set_verbosity', 'version', 'RX', 'TX',
-           'CHANNEL_RX', 'CHANNEL_TX', 'main']
+           'CHANNEL_RX', 'CHANNEL_TX', 'main',
+           'rx_gain_tag', 'RxGainTag', 'RX_GAIN_TAG_VERSION_NONE',
+           'RX_GAIN_TAG_VERSION_1', 'RX_GAIN_TAG_CHANGED',
+           'RX_GAIN_TAG_LOCKED']

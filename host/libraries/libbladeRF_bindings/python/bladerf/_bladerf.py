@@ -996,6 +996,20 @@ class BladeRF:
     rfic_ctrl_out = property(get_rfic_ctrl_out,
                              doc="RFIC CTRL_OUT status pins")
 
+    def rx_gain_tag_to_gain_db(self, ch, gain_index):
+        """Convert an RX gain-table index into the achieved conversion gain, dB.
+
+        Intended for the indices in an RxGainTag. Returns None if the device
+        rejects the index, which usually means the RFIC's CTRL_OUT is not
+        pointed at the gain index.
+        """
+        gain_db = ffi.new("float *")
+        ret = libbladeRF.bladerf_rx_gain_tag_to_gain_db(self.dev[0], ch,
+                                                       gain_index, gain_db)
+        if ret < 0:
+            return None
+        return gain_db[0]
+
     # Phase Detector/Frequency Synthesizer
 
     def get_pll_lock_state(self):
@@ -1287,3 +1301,40 @@ class BladeRF:
         """
         return self._Channel(self, ch)
 
+
+RxGainTag = collections.namedtuple(
+    "RxGainTag",
+    "version flags gain_index gain_index_min gain_index_max chunks "
+    "num_messages chunk_gain_index changed locked")
+
+RX_GAIN_TAG_VERSION_NONE = 0
+RX_GAIN_TAG_VERSION_1 = 1
+RX_GAIN_TAG_CHANGED = 1 << 0
+RX_GAIN_TAG_LOCKED = 1 << 1
+
+
+def rx_gain_tag(meta):
+    """Decode the RFIC gain profile that bladerf_sync_rx() overlays on
+    bladerf_metadata.reserved.
+
+    `meta` is the cffi "struct bladerf_metadata *" passed to sync_rx.
+
+    Returns an RxGainTag, or None when the FPGA did not supply one (needs
+    v0.17.0 or later, and a metadata RX format).
+    """
+    tag = ffi.new("struct bladerf_rx_gain_tag *")
+    ffi.memmove(tag, meta.reserved, ffi.sizeof("struct bladerf_rx_gain_tag"))
+    if tag.version == RX_GAIN_TAG_VERSION_NONE:
+        return None
+    n = min(tag.chunks, len(tag.chunk_gain_index))
+    return RxGainTag(version=tag.version,
+                     flags=tag.flags,
+                     gain_index=tag.gain_index,
+                     gain_index_min=tag.gain_index_min,
+                     gain_index_max=tag.gain_index_max,
+                     chunks=tag.chunks,
+                     num_messages=tag.num_messages,
+                     chunk_gain_index=tuple(tag.chunk_gain_index[i]
+                                            for i in range(n)),
+                     changed=bool(tag.flags & RX_GAIN_TAG_CHANGED),
+                     locked=bool(tag.flags & RX_GAIN_TAG_LOCKED))
