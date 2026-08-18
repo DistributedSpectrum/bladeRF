@@ -369,10 +369,7 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
         return BLADERF_ERR_MEM;
     }
 
-    uint64_t frequency;
-    float power;
     size_t entry_counter;
-    size_t offset;
     int status = 0;
 
     struct bladerf_image *image = NULL;
