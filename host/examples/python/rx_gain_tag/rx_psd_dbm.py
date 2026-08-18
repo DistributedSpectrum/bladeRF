@@ -86,10 +86,26 @@ def rssi_dbm(p_lin, mask):
 
 def capture(dev, ch, nsamples, want, args):
     """Contiguous capture. Returns (iq_normalised, gain_db_per_sample, info)."""
+    import time
     ffi = _bladerf.ffi
     bufsize = nsamples + 4
     meta = ffi.new("struct bladerf_metadata *")
     buf = bytearray(4 * bufsize)
+
+    # Let the AGC converge before capturing. Streaming starts at maximum gain, so
+    # without this the capture contains the whole ramp down -- and any part the
+    # front end compressed at high gain is nonlinear, which no amount of gain
+    # correction can undo.
+    if args.settle > 0:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < args.settle:
+            meta.flags = 0x80000000
+            meta.timestamp = 0
+            meta.status = 0
+            try:
+                dev.sync_rx(buf, nsamples, 3500, meta)
+            except Exception:
+                break
 
     npkt = -(-want // nsamples)
     iq = np.empty(npkt * nsamples, dtype=np.complex64)
@@ -184,6 +200,12 @@ def main():
     ap.add_argument("--gain-cal", metavar="PATH",
                     help="RX gain calibration table, or 'auto'. Required for the "
                          "result to be absolute")
+    ap.add_argument("--settle", type=float, default=0.25, metavar="SEC",
+                    help="stream and discard for this long before capturing "
+                         "(default 0.25) so the AGC converges first. Without it "
+                         "the capture starts at maximum gain and walks down, and "
+                         "any samples the front end compressed at high gain "
+                         "cannot be rescued by a gain correction")
     ap.add_argument("--num-buffers", type=int, default=1024)
     ap.add_argument("--num-transfers", type=int, default=32)
     ap.add_argument("--rssi", metavar="LO:HI",
