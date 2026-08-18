@@ -117,10 +117,26 @@ architecture simple of fifo_writer is
     -- update interval of 1000 us, so more chunks would resolve nothing real.
     constant CHUNK_COUNT   : natural  := 4;
 
-    -- 6 bits signed spans -32..+31. The largest single AGC decision moves the
-    -- index by 2, so this cannot be reached in the default profile; deltas clamp
-    -- rather than wrap so that even a fast-attack excursion degrades instead of
-    -- decoding as a wild value.
+    -- 6 bits signed spans -32..+31. A single AGC decision moves the index by at
+    -- most 2, so what matters is how many decisions fit in a chunk, and that is
+    -- set by the gain update interval rather than the step size:
+    --
+    --   slow-attack, 1000 us interval : at most one decision per packet.
+    --                                   Measured: 95.7% of packets flat, no
+    --                                   packet ever held two transitions.
+    --   fast-attack, 1 us interval    : ~25 decisions per 511-sample chunk at
+    --                                   20 Msps. Measured over 292k packets:
+    --                                   85.8% flat, 8.6% with more than one
+    --                                   transition, largest excursion 29
+    --                                   indices in one packet (21 of them in a
+    --                                   single chunk) -- three short of the
+    --                                   clamp.
+    --
+    -- So the clamp is unreachable in slow-attack but close in fast-attack, and
+    -- closer still at lower sample rates, where a chunk spans more time and
+    -- therefore more decisions. Deltas clamp rather than wrap so that an
+    -- excursion past the field degrades to the nearest representable gain
+    -- instead of decoding as a wild value.
     constant DELTA_WIDTH   : positive := 6;
     constant DELTA_MAX     : integer  := 2**(DELTA_WIDTH-1) - 1;
     constant DELTA_MIN     : integer  := -(2**(DELTA_WIDTH-1));

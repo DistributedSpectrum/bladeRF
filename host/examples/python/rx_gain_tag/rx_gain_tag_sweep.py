@@ -12,6 +12,14 @@ Each packet ("message") is one FPGA DMA buffer: 2044 samples on SuperSpeed,
 index per chunk of the message, so the gain travels with the IQ instead of
 having to be polled asynchronously.
 
+How literally to read that per-chunk profile depends on -g. Slow-attack updates
+gain at most once per 1000 us, so with a 102 us packet at 20 Msps the profile is
+exact: measured 95.7% of packets flat, none with two transitions. Fast-attack
+updates every 1 us, roughly 25 decisions per chunk, and each chunk records only
+its final value -- measured 85.8% flat, 8.6% with more than one transition, and
+excursions up to 29 indices in a single packet. In fast-attack use the min/max
+pair and drop packets flagged C rather than trusting the four values.
+
 Requires FPGA v0.17.0 or later. Buffers are sized to one message so that each
 receive maps to exactly one packet and one gain profile.
 

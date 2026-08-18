@@ -2597,9 +2597,34 @@ struct bladerf_metadata {
  * When `gain_index_min == gain_index_max` and ::BLADERF_RX_GAIN_TAG_CHANGED is
  * clear, one gain applied to every returned sample and the conversion is exact.
  * Otherwise the gain moved: `chunk_gain_index` localises it within the first
- * message, and the min/max pair bounds it across all of them. With the default
- * 1000 us AGC gain update interval this is uncommon -- fewer than one message in
- * fifteen at 30.72 Msps.
+ * message, and the min/max pair bounds it across all of them.
+ *
+ * @note **How much to trust `chunk_gain_index` depends on the gain mode.** A
+ *       single AGC decision changes the index by at most 2, so what governs the
+ *       profile is how many decisions fit in one chunk, and that follows the
+ *       gain update interval:
+ *
+ *       - ::BLADERF_GAIN_SLOWATTACK_AGC (1000 us) admits at most one decision
+ *         per message, so the profile is an exact description. Measured at
+ *         20 Msps: 95.7% of messages flat, and no message ever contained two
+ *         transitions.
+ *       - ::BLADERF_GAIN_FASTATTACK_AGC (1 us) admits roughly 25 decisions per
+ *         chunk at 20 Msps. Since each chunk records only the value at its
+ *         *end*, intermediate gains are lost. Measured over 292k messages:
+ *         85.8% flat, 8.6% with more than one transition, and a largest
+ *         excursion of 29 indices within one message -- 21 of those inside a
+ *         single chunk.
+ *
+ *       So in slow-attack the profile can be read literally, while in
+ *       fast-attack treat it as a bound: use `gain_index_min` /
+ *       `gain_index_max`, and discard messages with
+ *       ::BLADERF_RX_GAIN_TAG_CHANGED set rather than assuming the four values
+ *       describe the message.
+ *
+ * @note Deltas are stored in 6 signed bits and clamp at -32/+31 rather than
+ *       wrapping. Unreachable in slow-attack; fast-attack has been measured at
+ *       29. Note the margin shrinks as the sample rate *falls*, because a chunk
+ *       then spans more time and so more gain decisions.
  */
 struct bladerf_rx_gain_tag {
     /** Format version, or ::BLADERF_RX_GAIN_TAG_VERSION_NONE if no tag was

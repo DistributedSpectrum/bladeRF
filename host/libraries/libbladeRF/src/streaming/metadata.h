@@ -59,7 +59,12 @@
  * The message payload is divided into METADATA_GAIN_TAG_CHUNKS equal spans of
  * dwords. Delta i is the gain index at the *end* of chunk i minus the base, so
  * the profile across the message is base, base+d0, base+d1, base+d2, base+d3.
- * Deltas saturate rather than wrap.
+ * Deltas saturate rather than wrap, and only the *last* value in a chunk is
+ * recorded. Both matter only in fast-attack AGC, whose 1 us gain update interval
+ * allows ~25 gain decisions per chunk at 20 Msps versus at most one per packet in
+ * slow-attack. Measured: slow-attack never produced a packet with two
+ * transitions; fast-attack produced them in 8.6% of packets and reached 29 of the
+ * representable +-32 indices.
  *
  * Because the whole word is used there is no in-band marker: an image predating
  * this emits 0x12344321, which would decode as a plausible-looking profile.
