@@ -2223,8 +2223,14 @@ int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const
 
     bladerf_gain_mode gain_mode_before_gain_reset;
 
+    /* bladerf_set_gain()/bladerf_set_gain_mode() below take dev->lock
+     * themselves, so the lock has to be dropped before calling them. Track
+     * whether it is still held so the error path does not unlock twice. */
+    bool locked = false;
+
     log_debug("Loading gain calibration\n");
     MUTEX_LOCK(&dev->lock);
+    locked = true;
 
     board_name = bladerf_get_board_name(dev);
     if (strcmp(board_name, "bladerf2") != 0) {
@@ -2278,6 +2284,7 @@ int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const
     }
 
     MUTEX_UNLOCK(&dev->lock);
+    locked = false;
 
     /* Save current gain mode before gain reset */
     if (BLADERF_CHANNEL_IS_TX(ch) == false)
@@ -2307,7 +2314,9 @@ error:
     if (filename)
         free(filename);
 
-    MUTEX_UNLOCK(&dev->lock);
+    if (locked) {
+        MUTEX_UNLOCK(&dev->lock);
+    }
     return status;
 }
 
