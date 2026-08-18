@@ -57,14 +57,28 @@ def parse_freqs(text, mhz):
     return out
 
 
-def iq_power_dbfs(raw, count):
-    """Mean power of interleaved SC16 Q11 samples, in dB relative to full scale."""
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
+
+def iq_power_dbfs(buf, count):
+    """Mean power of interleaved SC16 Q11 samples, in dB relative to full scale.
+
+    A pure-Python loop costs ~2*count operations per packet, which at 20 Msps is
+    tens of millions per second and swamps everything else, so use numpy when it
+    is available.
+    """
     import math
-    acc = 0
-    for i in range(count):
-        s = raw[2 * i]
-        q = raw[2 * i + 1]
-        acc += s * s + q * q
+    if _np is not None:
+        v = _np.frombuffer(buf, dtype=_np.int16, count=2 * count)
+        acc = int(_np.dot(v.astype(_np.int64), v.astype(_np.int64)))
+    else:
+        raw = _bladerf.ffi.cast("int16_t *", _bladerf.ffi.from_buffer(buf))
+        acc = 0
+        for i in range(2 * count):
+            acc += raw[i] * raw[i]
     if acc == 0:
         return float("-inf")
     # 2048 is full scale for SC16 Q11
@@ -98,6 +112,14 @@ def main():
                     help="also compute IQ power per packet and the gain-"
                          "corrected absolute power (slower, pure Python)")
     ap.add_argument("--csv", metavar="PATH", help="write a row per packet")
+    ap.add_argument("--num-buffers", type=int, default=256,
+                    help="stream buffers (default 256). Each holds one packet, "
+                         "so this sets how long a stall the loop can absorb "
+                         "before it must resync and lose samples: "
+                         "num_buffers * samples_per_packet / sample_rate")
+    ap.add_argument("--num-transfers", type=int, default=32,
+                    help="USB transfers in flight (default 32; must be less "
+                         "than --num-buffers)")
     ap.add_argument("--now", action="store_true",
                     help="request each packet with RX_NOW instead of reading "
                          "contiguously. Simpler, but discards whatever arrived "
@@ -140,16 +162,21 @@ def main():
           f"{'es' if args.repeat != 1 else ''}")
     print(f"# packet timestamps are in samples at the RX sample rate")
 
+    if args.num_transfers >= args.num_buffers:
+        print("--num-transfers must be less than --num-buffers", file=sys.stderr)
+        return 2
+    slack_ms = args.num_buffers * nsamples / args.sample_rate * 1e3
+    print(f"# {args.num_buffers} buffers / {args.num_transfers} transfers "
+          f"= {slack_ms:.1f} ms of slack before a resync")
     dev.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
                     fmt=_bladerf.Format.SC16_Q11_META,
-                    num_buffers=16, buffer_size=bufsize,
-                    num_transfers=8, stream_timeout=3500)
+                    num_buffers=args.num_buffers, buffer_size=bufsize,
+                    num_transfers=args.num_transfers, stream_timeout=3500)
     dev.enable_module(ch, True)
 
     ffi = _bladerf.ffi
     meta = ffi.new("struct bladerf_metadata *")
     buf = bytearray(4 * bufsize)
-    raw = ffi.cast("int16_t *", ffi.from_buffer(buf)) if args.power else None
 
     rows = []
     header_printed = False
@@ -215,7 +242,7 @@ def main():
 
                     dbfs = dbm = None
                     if args.power:
-                        dbfs = iq_power_dbfs(raw, meta.actual_count)
+                        dbfs = iq_power_dbfs(buf, meta.actual_count)
                         if gain_db is not None:
                             dbm = dbfs - gain_db
 
