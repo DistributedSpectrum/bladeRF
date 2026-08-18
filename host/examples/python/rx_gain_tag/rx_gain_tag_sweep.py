@@ -26,6 +26,8 @@ Examples:
 
 import argparse
 import csv
+import os
+import re
 import sys
 import time
 
@@ -108,6 +110,16 @@ def main():
                     default="slow", help="RX gain mode (default slow)")
     ap.add_argument("--manual-gain", type=int, default=None,
                     help="gain in dB, only with --gain-mode manual")
+    ap.add_argument("--gain-cal", metavar="PATH",
+                    help="load an RX gain calibration table so that the dBm "
+                         "column is an absolute reference. Accepts the binary "
+                         ".tbl form or a .csv sweep (converted to .tbl beside "
+                         "it on load). Pass 'auto' to use the device's own "
+                         "<serial>_rx_gain_cal.tbl from the libbladeRF search "
+                         "path")
+    ap.add_argument("--no-gain-cal", action="store_true",
+                    help="explicitly disable an already-loaded gain "
+                         "calibration table for this run")
     ap.add_argument("--power", action="store_true",
                     help="also compute IQ power per packet and the gain-"
                          "corrected absolute power (slower, pure Python)")
@@ -146,6 +158,43 @@ def main():
     nsamples = MESSAGE_SAMPLES[speed_name]
     bufsize = BUFFER_SAMPLES[speed_name]
 
+    # Load the gain calibration table before anything reads gain back. Loading
+    # resets the gain (libbladeRF restores the gain mode afterwards), so it has
+    # to happen before the mode and frequency are set up below.
+    cal_loaded = False
+    if args.gain_cal:
+        path = None if args.gain_cal == "auto" else args.gain_cal
+
+        # A table from another board loads with only a log warning, which is easy
+        # to miss and silently makes every absolute figure wrong. The filename
+        # normally carries the serial it was swept on, so check it up front.
+        if path is not None:
+            serial = dev.get_serial()
+            m = re.search(r"([0-9a-fA-F]{32})", os.path.basename(path))
+            if m and m.group(1).lower() != serial.lower():
+                print(f"WARNING: {os.path.basename(path)} was swept on device "
+                      f"{m.group(1)}, but this device is {serial}. Absolute "
+                      f"power figures will be wrong.", file=sys.stderr)
+        try:
+            if path is None:
+                # libbladeRF's own default needs a NULL path, which the binding
+                # cannot express (it always encodes the string), so build the
+                # same name it would: <serial>_rx_gain_cal.tbl, resolved through
+                # the search path it uses for FPGA images.
+                path = f"{dev.get_serial()}_rx_gain_cal.tbl"
+            dev.set_gain_calibration(ch, path)
+            cal_loaded = True
+        except Exception as exc:
+            print(f"failed to load gain calibration "
+                  f"{'(auto)' if path is None else path}: {exc}",
+                  file=sys.stderr)
+            return 2
+    if args.no_gain_cal:
+        try:
+            dev.enable_gain_calibration(ch, False)
+        except Exception as exc:
+            print(f"could not disable gain calibration: {exc}", file=sys.stderr)
+
     dev.set_sample_rate(ch, int(args.sample_rate))
     dev.set_bandwidth(ch, int(bandwidth))
     dev.set_frequency(ch, freqs[0])
@@ -160,6 +209,14 @@ def main():
           f"{args.sample_rate/1e6:.3f} Msps, gain mode {args.gain_mode}")
     print(f"# {len(freqs)} frequencies x {args.dwell:g} s x {args.repeat} pass"
           f"{'es' if args.repeat != 1 else ''}")
+    if args.power:
+        if cal_loaded:
+            print(f"# gain calibration loaded"
+                  f"{'' if args.gain_cal == 'auto' else ' from ' + args.gain_cal}"
+                  f": the dBm column is an absolute reference")
+        else:
+            print("# no gain calibration loaded: the dBm column is relative to "
+                  "full scale and carries an uncalibrated offset")
     print(f"# packet timestamps are in samples at the RX sample rate")
 
     if args.num_transfers >= args.num_buffers:
