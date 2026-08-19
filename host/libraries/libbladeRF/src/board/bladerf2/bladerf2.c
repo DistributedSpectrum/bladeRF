@@ -3200,12 +3200,15 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
          * and (G + gain_corr) is exactly the figure to subtract from a measured
          * dBFS power to recover dBm.
          *
-         * This holds in both gain modes, so there is no need to branch on one.
-         * Under AGC nothing pre-compensates the commanded gain -- bladerf_set_gain()
-         * forces MGC, so an AGC user never goes down that path -- and G is the raw
-         * nominal gain. Under MGC with calibration enabled, bladerf_set_gain()
-         * commanded (target - gain_corr), so G already carries the -gain_corr and
-         * the sum collapses back to the requested target. */
+         * This holds in both gain modes, so there is no need to branch on one. The
+         * reason is the RFIC's own rule, not the library's: ad9361_set_rx_gain()
+         * discards a commanded gain unless the mode is MGC, so under AGC nothing can
+         * pre-compensate what the AGC selects and G is the raw nominal gain. Under MGC
+         * with calibration enabled, the commanded gain was (target - gain_corr), so G
+         * already carries the -gain_corr and the sum collapses back to the requested
+         * target. (Do not justify this with "bladerf_set_gain() forces MGC": the
+         * retune path applies a correction through the board layer directly, which
+         * skips that forcing.) */
         if (dev->gain_tbls[ch].enabled) {
             struct bladerf_gain_cal_entry entry;
 

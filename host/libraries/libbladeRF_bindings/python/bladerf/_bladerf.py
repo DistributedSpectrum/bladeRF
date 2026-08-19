@@ -631,11 +631,21 @@ class BladeRF:
         _check_error(ret)
         return ret
     
-    def get_gain_calibration(self, ch):
+    def get_gain_target(self, ch):
+        """The gain that was asked for, in dB.
+
+        With a calibration table enabled this is not what set_gain() commanded: the command
+        carries (target - gain_corr) so the hardware lands on the target, and get_gain() reports
+        that commanded value. This adds the correction back, so it is the one that round-trips
+        with set_gain().
+        """
         gain = ffi.new("int *")
         ret = libbladeRF.bladerf_get_gain_target(self.dev[0], ch, gain)
         _check_error(ret)
         return gain[0]
+
+    # Kept because callers use this name; it never returned a calibration table.
+    get_gain_calibration = get_gain_target
     def print_gain_calibration(self, ch, with_entries):
         ret = libbladeRF.bladerf_print_gain_calibration(self.dev[0], ch, with_entries)
         _check_error(ret)

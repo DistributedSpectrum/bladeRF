@@ -549,7 +549,39 @@ int bladerf_enable_module(struct bladerf *dev, bladerf_channel ch, bool enable)
 /* Gain */
 /******************************************************************************/
 
-int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
+static char const *gain_mode_str(bladerf_gain_mode mode)
+{
+    switch (mode) {
+        case BLADERF_GAIN_DEFAULT:
+            return "default (automatic)";
+        case BLADERF_GAIN_MGC:
+            return "manual";
+        case BLADERF_GAIN_FASTATTACK_AGC:
+            return "fast-attack AGC";
+        case BLADERF_GAIN_SLOWATTACK_AGC:
+            return "slow-attack AGC";
+        case BLADERF_GAIN_HYBRID_AGC:
+            return "hybrid AGC";
+        default:
+            return "unknown";
+    }
+}
+
+/* Command a gain, optionally forcing manual gain control first.
+ *
+ * A commanded gain only means anything in manual gain control -- under AGC the RFIC owns the
+ * gain and discards a commanded one (ad9361_set_rx_gain returns without writing unless the
+ * mode is RX_GAIN_CTL_MGC) -- so the public entry point forces MGC, and warns, because that
+ * silently overrides a mode the caller chose.
+ *
+ * The gain calibration paths want the same write without either: they re-apply a gain purely
+ * so a freshly loaded correction takes effect, they only do so when the mode is already MGC,
+ * and a warning about a mode change that never happened is worse than no warning at all.
+ */
+static int set_gain_common(struct bladerf *dev,
+                           bladerf_channel ch,
+                           int gain,
+                           bool force_mgc)
 {
     int status;
     bladerf_gain_mode gain_mode;
@@ -558,7 +590,7 @@ int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
     MUTEX_LOCK(&dev->lock);
 
     /* Change gain mode to manual if ch = RX */
-    if (BLADERF_CHANNEL_IS_TX(ch) == false) {
+    if (force_mgc && BLADERF_CHANNEL_IS_TX(ch) == false) {
         status = dev->board->get_gain_mode(dev, ch, &gain_mode);
         if (status != 0) {
             log_error("Failed to get gain mode\n");
@@ -566,7 +598,10 @@ int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
         }
 
         if (gain_mode != BLADERF_GAIN_MGC) {
-            log_warning("Setting gain mode to manual\n");
+            log_warning("%s: %s was in %s; a commanded gain requires manual gain "
+                        "control, so switching to it. Re-select the mode afterwards "
+                        "if that was not intended.\n",
+                        __FUNCTION__, channel2str(ch), gain_mode_str(gain_mode));
             status = dev->board->set_gain_mode(dev, ch, BLADERF_GAIN_MGC);
             if (status != 0) {
                 log_error("Failed to set gain mode\n");
@@ -578,8 +613,16 @@ int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
     dev->gain_tbls[ch].gain_target = gain;
 
     if (dev->gain_tbls[ch].enabled == true) {
-        dev->board->get_frequency(dev, ch, &freq);
-        get_gain_correction(dev, freq, ch, &assigned_gain);
+        status = dev->board->get_frequency(dev, ch, &freq);
+        if (status != 0) {
+            log_error("Failed to get frequency for the gain correction\n");
+            goto error;
+        }
+        status = get_gain_correction(dev, freq, ch, &assigned_gain);
+        if (status != 0) {
+            log_error("Failed to compute the gain correction\n");
+            goto error;
+        }
     }
 
     status = dev->board->set_gain(dev, ch, assigned_gain);
@@ -591,6 +634,47 @@ int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
 error:
     MUTEX_UNLOCK(&dev->lock);
     return status;
+}
+
+int bladerf_set_gain(struct bladerf *dev, bladerf_channel ch, int gain)
+{
+    return set_gain_common(dev, ch, gain, true);
+}
+
+/* Re-apply the commanded gain so a newly loaded or newly enabled correction takes effect.
+ *
+ * Only meaningful in manual gain control. Under AGC there is nothing to re-apply: the RFIC
+ * chooses the gain and discards any commanded one, so the correction reaches the hardware
+ * through whatever the AGC selects, not through us. Skipping the write there is what keeps
+ * the caller's gain mode intact -- there is no mode to force and therefore nothing to
+ * restore, which is stronger than saving and restoring it around a change.
+ *
+ * Caller must not hold dev->lock.
+ */
+static int gain_cal_reapply(struct bladerf *dev, bladerf_channel ch)
+{
+    bladerf_gain_mode mode;
+    int status;
+
+    if (BLADERF_CHANNEL_IS_TX(ch)) {
+        return set_gain_common(dev, ch, dev->gain_tbls[ch].gain_target, false);
+    }
+
+    status = bladerf_get_gain_mode(dev, ch, &mode);
+    if (status != 0) {
+        log_error("%s: failed to read the gain mode: %s\n", __FUNCTION__,
+                  bladerf_strerror(status));
+        return status;
+    }
+
+    if (mode != BLADERF_GAIN_MGC) {
+        log_debug("%s: %s is in %s, so the calibration correction is carried by the gain "
+                  "the AGC selects; not commanding one\n",
+                  __FUNCTION__, channel2str(ch), gain_mode_str(mode));
+        return 0;
+    }
+
+    return set_gain_common(dev, ch, dev->gain_tbls[ch].gain_target, false);
 }
 
 int bladerf_get_gain(struct bladerf *dev, bladerf_channel ch, int *gain)
@@ -2221,8 +2305,6 @@ int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const
     char *filename = (char *)calloc(1, filename_len + 1);
     CHECK_NULL(filename);
 
-    bladerf_gain_mode gain_mode_before_gain_reset;
-
     /* bladerf_set_gain()/bladerf_set_gain_mode() below take dev->lock
      * themselves, so the lock has to be dropped before calling them. Track
      * whether it is still held so the error path does not unlock twice. */
@@ -2286,24 +2368,15 @@ int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const
     MUTEX_UNLOCK(&dev->lock);
     locked = false;
 
-    /* Save current gain mode before gain reset */
-    if (BLADERF_CHANNEL_IS_TX(ch) == false)
-        dev->board->get_gain_mode(dev, ch, &gain_mode_before_gain_reset);
-
-    /* Reset gain to ensure calibration adjustment is applied after loading */
-    status = bladerf_set_gain(dev, ch, dev->gain_tbls[ch].gain_target);
+    /* Re-apply the commanded gain so the correction just loaded takes effect. This neither
+     * changes the gain mode nor the commanded gain: in manual control it re-commands the same
+     * target through the new correction, and under AGC it does nothing at all, because the
+     * RFIC owns the gain there. Loading a table therefore leaves the caller's mode and gain
+     * exactly as they were. */
+    status = gain_cal_reapply(dev, ch);
     if (status != 0) {
-        log_error("%s: Failed to reset gain.\n", __FUNCTION__);
+        log_error("%s: failed to re-apply the gain after loading the table\n", __FUNCTION__);
         goto error;
-    }
-
-    /** Restore previous gain mode */
-    if (BLADERF_CHANNEL_IS_TX(ch) == false) {
-        status = bladerf_set_gain_mode(dev, ch, gain_mode_before_gain_reset);
-        if (status != 0) {
-            log_error("%s: Failed to reset gain mode.\n", __FUNCTION__);
-            goto error;
-        }
     }
 
 error:
@@ -2325,16 +2398,28 @@ int bladerf_enable_gain_calibration(struct bladerf *dev, bladerf_channel ch, boo
     CHECK_NULL(dev);
     int status = 0;
 
-    if (dev->gain_tbls[ch].state == BLADERF_GAIN_CAL_UNINITIALIZED) {
-        log_warning("%s: Gain calibration not loaded\n", __FUNCTION__);
-        return 0;
+    MUTEX_LOCK(&dev->lock);
+
+    /* UNLOADED counts as absent too: its entries have been freed, so enabling it would arm a
+     * correction with nothing behind it. */
+    if (dev->gain_tbls[ch].state != BLADERF_GAIN_CAL_LOADED) {
+        log_error("%s: no gain calibration is loaded for %s\n", __FUNCTION__,
+                  channel2str(ch));
+        MUTEX_UNLOCK(&dev->lock);
+        return BLADERF_ERR_INVAL;
     }
 
     dev->gain_tbls[ch].enabled = en;
-    status = bladerf_set_gain(dev, ch, dev->gain_tbls[ch].gain_target);
+    MUTEX_UNLOCK(&dev->lock);
+
+    /* Re-apply the commanded gain so the change takes effect -- without touching the gain
+     * mode. This used to call bladerf_set_gain(), which forces manual gain control and, unlike
+     * the load path, never restored the previous mode: enabling or disabling a calibration
+     * table silently and permanently turned the AGC off. */
+    status = gain_cal_reapply(dev, ch);
     if (status != 0) {
-        log_error("%s: Failed to reset gain.\n", __FUNCTION__);
-        return status;
+        log_error("%s: failed to re-apply the gain after %s the table\n", __FUNCTION__,
+                  en ? "enabling" : "disabling");
     }
 
     return status;
@@ -2354,13 +2439,31 @@ int bladerf_print_gain_calibration(struct bladerf *dev, bladerf_channel ch, bool
         goto error;
     }
 
-    if (gain_tbls[ch].state == BLADERF_GAIN_CAL_UNINITIALIZED) {
-        printf("Gain Calibration [%s]: uninitialized\n", channel2str(ch));
+    /* Anything but LOADED has no entries and no file path to report; printing "loaded" and a
+     * NULL path for the UNLOADED state was both untrue and undefined. */
+    if (gain_tbls[ch].state != BLADERF_GAIN_CAL_LOADED) {
+        printf("Gain Calibration [%s]: %s\n", channel2str(ch),
+               (gain_tbls[ch].state == BLADERF_GAIN_CAL_UNINITIALIZED) ? "uninitialized"
+                                                                      : "unloaded");
         return 0;
     }
 
     printf("Gain Calibration [%s]: loaded\n", channel2str(ch));
     printf("  Status: %s\n", (gain_tbls[ch].enabled) ? "enabled" : "disabled");
+
+    /* "enabled" is about the table, not about whether its correction reaches the hardware: a
+     * commanded gain only lands in manual gain control, so say which mode is in force rather
+     * than leaving the reader to assume. */
+    if (BLADERF_CHANNEL_IS_TX(ch) == false) {
+        bladerf_gain_mode mode;
+        if (dev->board->get_gain_mode(dev, ch, &mode) == 0) {
+            printf("  Gain mode: %s%s\n", gain_mode_str(mode),
+                   (gain_tbls[ch].enabled && mode != BLADERF_GAIN_MGC)
+                       ? "  (the AGC owns the gain, so the correction is carried by the gain "
+                         "it selects, not by a commanded one)"
+                       : "");
+        }
+    }
     printf("  Version: %i.%i.%i\n",
         gain_tbls[ch].version.major, gain_tbls[ch].version.minor, gain_tbls[ch].version.patch);
     printf("  Number of Entries: %u\n", gain_tbls[ch].n_entries);
