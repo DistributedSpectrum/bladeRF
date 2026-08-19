@@ -27,7 +27,8 @@ Two things about this are easy to get wrong.
 The gain profile for a whole multi-packet read comes from
 bladerf_get_rx_gain_tags() (dev.rx_gain_tags()), which returns one entry per
 packet the call consumed, each with its own four-chunk profile and the slice of
-the sample buffer it applies to. The summary tag overlaid on
+the sample buffer it applies to; gain_profile.py in this directory turns those
+into per-sample dB. The summary tag overlaid on
 bladerf_metadata.reserved cannot do this job: it has room for only the *first*
 packet's chunk_gain_index, so with one packet per call it is exact and with 129
 packets per call it describes 1/129th of the data.
@@ -54,10 +55,9 @@ import sys
 
 import numpy as np
 
-from bladerf import _bladerf
-
-FULL_SCALE = 2048.0
-CHUNKS = 4
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gain_profile as gp                                    # noqa: E402
+from bladerf import _bladerf                                 # noqa: E402
 
 GAIN_MODES = {
     "slow": _bladerf.GainMode.SlowAttack_AGC,
@@ -91,58 +91,6 @@ def rssi_dbm(p_lin, mask):
     """Absolute power in the selected bins, dBm."""
     total = float(np.sum(p_lin[mask]))
     return 10.0 * np.log10(total) if total > 0 else float("-inf")
-
-
-def gain_per_sample(tags, msg_samples, count, gdb):
-    """Per-sample gain in dB across one read, from one tag per packet.
-
-    Chunk boundaries are in *packet payload* coordinates while the output is in
-    buffer coordinates, and the two differ whenever a read starts part way into a
-    packet (msg_sample_offset) -- so each chunk is clipped to the part of its
-    packet the read actually returned, then translated.
-
-    A chunk whose end index differs from its start contains a gain transition at
-    an unknown position. Those are split at the midpoint: the first half takes the
-    gain the chunk started at, the second half the gain it ended at. If the
-    transition is uniformly distributed within the chunk that is the midpoint
-    estimator, halving the expected mis-assigned fraction from 0.50 of the chunk
-    to 0.25 (worst case 1.00 to 0.50). In slow-attack, where a decision moves the
-    gain by at most 2 dB and 4.3% of packets contain one, the residual is under
-    0.01 dB on total power -- so nothing has to be discarded.
-
-    Returns (gain_db, samples_filled, ambiguous_samples). Entries tile the
-    returned samples, so samples_filled == count unless the tag array was
-    truncated.
-    """
-    gain = np.zeros(count, dtype=np.float32)
-    clen = msg_samples // CHUNKS
-    filled = 0
-    ambiguous = 0
-
-    for t in tags:
-        # base index at the packet's first sample, then the index at the end of
-        # each chunk: a CHUNKS+1 point profile across the packet
-        pts = [t.gain_index] + list(t.chunk_gain_index[:CHUNKS])
-        end = t.msg_sample_offset + t.sample_count
-
-        for c in range(CHUNKS):
-            lo = max(c * clen, t.msg_sample_offset)
-            hi = min((c + 1) * clen if c < CHUNKS - 1 else msg_samples, end)
-            if hi <= lo:
-                continue                      # chunk outside this entry's span
-            blo = t.sample_offset + (lo - t.msg_sample_offset)
-            bhi = t.sample_offset + (hi - t.msg_sample_offset)
-
-            if pts[c] == pts[c + 1]:
-                gain[blo:bhi] = gdb(pts[c + 1])
-            else:
-                mid = blo + (bhi - blo) // 2
-                gain[blo:mid] = gdb(pts[c])
-                gain[mid:bhi] = gdb(pts[c + 1])
-                ambiguous += bhi - blo
-            filled += bhi - blo
-
-    return gain, filled, ambiguous
 
 
 def capture(dev, ch, msg_samples, want, args):
@@ -180,19 +128,11 @@ def capture(dev, ch, msg_samples, want, args):
     # The read itself takes want/fs seconds, so the timeout has to cover that
     # plus the time the samples spend queued in the buffer pool.
     timeout_ms = int(1000.0 * want / args.sample_rate) + 3000
-    cache = {}
-
-    def gdb(idx):
-        """Index -> dB, memoised. In FPGA tuning mode each miss costs a USB round
-        trip to read the LO frequency, and there are only a handful of distinct
-        indices in a capture."""
-        if idx not in cache:
-            g = dev.rx_gain_tag_to_gain_db(ch, idx)
-            if g is None:
-                raise RuntimeError(f"gain index {idx} outside the gain table. Is "
-                                   f"RFIC register 0x035 still 0x16?")
-            cache[idx] = g
-        return cache[idx]
+    # Key the conversion cache on the frequency actually tuned, not on a command
+    # line argument: rx_lte_rssi.py drives this same function while retuning per
+    # cell, and the index -> dB mapping is band dependent.
+    gains = gp.GainDb(dev, ch)
+    gdb = gains.at(dev.get_frequency(ch))
 
     short = 0
     for attempt in range(args.max_tries):
@@ -214,13 +154,13 @@ def capture(dev, ch, msg_samples, want, args):
             raise RuntimeError("the read returned no gain tag entries")
 
         summary = _bladerf.rx_gain_tag(meta)
-        gain, filled, ambiguous = gain_per_sample(tags, msg_samples, want, gdb)
+        gain, filled, ambiguous = gp.gain_db_array(tags, msg_samples, want, gdb)
         if filled != want:
             raise RuntimeError(f"gain tags covered {filled} of {want} samples")
 
         v = np.frombuffer(buf, dtype=np.int16, count=2 * want)
         iq = (v[0::2].astype(np.float32)
-              + 1j * v[1::2].astype(np.float32)) / FULL_SCALE
+              + 1j * v[1::2].astype(np.float32)) / gp.FULL_SCALE
 
         info = {"packets": len(tags), "restarts": short,
                 "ambiguous_samples": ambiguous,
@@ -234,7 +174,7 @@ def capture(dev, ch, msg_samples, want, args):
                 "num_messages": summary.num_messages,
                 "index_min": summary.gain_index_min,
                 "index_max": summary.gain_index_max,
-                "distinct_gains": sorted(set(cache.values()))}
+                "distinct_gains": gains.values()}
         return iq, gain, info
 
     raise RuntimeError(f"could not obtain {want} contiguous samples in "
@@ -324,8 +264,7 @@ def main():
     if args.gain_mode == "manual" and args.manual_gain is not None:
         dev.set_gain(ch, args.manual_gain)
 
-    speed = dev.get_device_speed()
-    nsamples = 2044 if "super" in str(speed).lower() else 1020
+    nsamples = gp.message_samples(dev)
 
     if args.num_transfers >= args.num_buffers:
         print("--num-transfers must be less than --num-buffers", file=sys.stderr)

@@ -5,10 +5,16 @@ Hops through a list of center frequencies, writes the IQ of each step to its own
 file, and produces a waterfall with one PSD row per USB packet so the spectrum
 can be watched changing across a retune.
 
+Reads cover several packets at a time (--read-packets), and
+bladerf_get_rx_gain_tags() then hands back one entry per packet -- its timestamp,
+the slice of the read it occupies, and its own four-chunk gain profile. So the
+rows, the PSD and the .iq files stay per packet while the loop makes far fewer
+calls, which is what lets it keep up at 20 Msps and above.
+
 The reason this exists as a separate tool from rx_gain_tag_sweep.py is a trap
 worth understanding. Reading contiguously means asking for the samples that
-follow the previous packet, so the reader necessarily runs *behind* real time --
-by up to num_buffers * samples_per_packet / sample_rate, which is 26 ms at the
+follow the previous read, so the reader necessarily runs *behind* real time --
+by up to num_buffers * buffer_size / sample_rate, which is 105 ms at the
 defaults. bladerf_set_frequency() takes effect in real time. So for a while after
 a retune, the packets arriving still contain samples captured at the *previous*
 frequency, and anything that labels them by "the frequency I most recently asked
@@ -41,11 +47,11 @@ import time
 
 import numpy as np
 
-from bladerf import _bladerf
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gain_profile as gp                # noqa: E402
+from bladerf import _bladerf             # noqa: E402
 
-MESSAGE_SAMPLES = {"SuperSpeed": 2044, "Hi-Speed": 1020}
-BUFFER_SAMPLES = {"SuperSpeed": 2048, "Hi-Speed": 1024}
-FULL_SCALE = 2048.0                      # SC16 Q11
+FULL_SCALE = gp.FULL_SCALE               # SC16 Q11
 
 GAIN_MODES = {
     "slow": _bladerf.GainMode.SlowAttack_AGC,
@@ -82,6 +88,13 @@ def main():
                     default="slow")
     ap.add_argument("--gain-cal", metavar="PATH",
                     help="RX gain calibration table (.tbl or .csv), or 'auto'")
+    ap.add_argument("--read-packets", type=int, default=2, metavar="N",
+                    help="packets per sync_rx() call (default 2). Whole-packet "
+                         "reads keep every gain tag entry a complete packet, so "
+                         "rows, PSDs and .iq files stay per packet")
+    ap.add_argument("--buffer-size", type=int, default=8192, metavar="SAMPLES",
+                    help="samples per USB buffer, rounded up to whole packets "
+                         "(default 8192 = 4 packets on SuperSpeed)")
     ap.add_argument("--num-buffers", type=int, default=256)
     ap.add_argument("--num-transfers", type=int, default=32)
     ap.add_argument("-o", "--outdir", default="hop_capture")
@@ -133,26 +146,31 @@ def main():
                   file=sys.stderr)
             return 2
 
-    speed = dev.get_device_speed()
-    speed_name = "SuperSpeed" if "super" in str(speed).lower() else "Hi-Speed"
-    nsamples = MESSAGE_SAMPLES[speed_name]
-    bufsize = BUFFER_SAMPLES[speed_name]
+    speed_name = gp.speed_name(dev)
+    nsamples = gp.MESSAGE_SAMPLES[speed_name]
+    read_n = gp.read_samples(nsamples, args.read_packets)
 
     dev.set_sample_rate(ch, int(args.sample_rate))
     dev.set_bandwidth(ch, int(bandwidth))
     dev.set_frequency(ch, freqs[0])
     dev.set_gain_mode(ch, GAIN_MODES[args.gain_mode])
 
-    lag_ms = args.num_buffers * nsamples / args.sample_rate * 1e3
+    lag_ms = args.num_buffers * args.buffer_size / args.sample_rate * 1e3
     print(f"# FPGA {fpga}, {speed_name}: {nsamples} samples/packet, "
           f"{args.sample_rate/1e6:.3f} Msps, gain mode {args.gain_mode}")
-    print(f"# {args.num_buffers} buffers => the reader may lag real time by up "
-          f"to {lag_ms:.1f} ms, so that much post-retune data can still be from "
-          f"the previous step")
+    print(f"# reading {args.read_packets} packet(s) = {read_n} samples per call, "
+          f"one gain profile per packet")
+    print(f"# {args.num_buffers} buffers x {args.buffer_size} samples => the "
+          f"reader may lag real time by up to {lag_ms:.1f} ms, so that much "
+          f"post-retune data can still be from the previous step")
+
+    if args.num_transfers >= args.num_buffers:
+        print("--num-transfers must be less than --num-buffers", file=sys.stderr)
+        return 2
 
     dev.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
                     fmt=_bladerf.Format.SC16_Q11_META,
-                    num_buffers=args.num_buffers, buffer_size=bufsize,
+                    num_buffers=args.num_buffers, buffer_size=args.buffer_size,
                     num_transfers=args.num_transfers, stream_timeout=3500)
     # Everything captured before the first in-loop retune was taken at freqs[0],
     # which was tuned above. Seed a boundary at sample 0 so those packets are
@@ -161,7 +179,7 @@ def main():
 
     ffi = _bladerf.ffi
     meta = ffi.new("struct bladerf_metadata *")
-    buf = bytearray(4 * bufsize)
+    buf = bytearray(4 * read_n)
 
     # One entry per retune: (ts_before, ts_after, freq, lap, seg).
     #
@@ -179,9 +197,12 @@ def main():
     psd_marks = []         # (psd row, retune sample, freq, lap, seg)
     win = np.hanning(nsamples).astype(np.float32)
     win_norm = float(np.sum(win ** 2))
-    gain_db_cache = {}
+    # index -> dB is band dependent and costs a USB round trip per miss in FPGA
+    # tuning mode, so it is memoised per (frequency, index).
+    gains = gp.GainDb(dev, ch)
     next_ts = None
     stored = {}
+    partial = 0
 
     def attribute(ts, n):
         """What was tuned while samples [ts, ts+n) were captured.
@@ -224,67 +245,85 @@ def main():
                         meta.timestamp = next_ts
                     meta.status = 0
                     try:
-                        dev.sync_rx(buf, nsamples, 3500, meta)
+                        dev.sync_rx(buf, read_n, 3500, meta)
                     except _bladerf.TimePastError:
                         next_ts = None
                         continue
                     except Exception as exc:
                         print(f"  sync_rx: {exc}", file=sys.stderr)
                         break
-                    ts = int(meta.timestamp)
-                    next_ts = ts + nsamples
+                    # actual_count, not read_n: a discontinuity ends the read
+                    # early and the next request has to follow what arrived.
+                    next_ts = int(meta.timestamp) + int(meta.actual_count)
 
+                    tags = dev.rx_gain_tags()
+                    if tags is None:
+                        print("  no gain tag: needs FPGA v0.17.0+ and a "
+                              "metadata RX format", file=sys.stderr)
+                        break
                     v = np.frombuffer(buf, dtype=np.int16,
-                                      count=2 * nsamples).astype(np.float32)
-                    iq = (v[0::2] + 1j * v[1::2]) / FULL_SCALE
-                    dbfs = 10.0 * np.log10(float(np.mean(np.abs(iq) ** 2)) + 1e-30)
+                                      count=2 * int(meta.actual_count))
 
-                    # PSD, one row per packet, FFT sized to the USB buffer
-                    if len(rows) % args.psd_every == 0:
-                        spec = np.fft.fftshift(np.fft.fft(iq * win, n=args.fft))
-                        psd = 10.0 * np.log10(
-                            np.abs(spec) ** 2 / win_norm + 1e-20)
-                        psd_rows.append(psd.astype(np.float32))
-                        psd_index.append(len(rows))
+                    for t in tags:
+                        n = int(t.sample_count)
+                        ts = int(t.timestamp) + t.msg_sample_offset
+                        seg = v[2 * t.sample_offset:2 * (t.sample_offset + n)]
 
-                    tag = _bladerf.rx_gain_tag(meta)
-                    gain_db = None
-                    true_freq, true_lap, true_seg, certain = attribute(ts, nsamples)
-                    if tag is not None:
-                        key = (true_freq, tag.gain_index)
-                        if key not in gain_db_cache:
-                            gain_db_cache[key] = dev.rx_gain_tag_to_gain_db(
-                                ch, tag.gain_index)
-                        gain_db = gain_db_cache[key]
+                        f32 = seg.astype(np.float32)
+                        iq = (f32[0::2] + 1j * f32[1::2]) / FULL_SCALE
 
-                    rows.append({
-                        "seq": len(rows),
-                        "timestamp": ts,
-                        "label_freq_hz": freq,          # naive: last retune asked for
-                        "true_freq_hz": true_freq,      # from the timestamp
-                        "mislabeled": int(true_freq != freq),
-                        "certain": int(certain),
-                        "lap": true_lap,
-                        "seg": true_seg,
-                        "gain_index": tag.gain_index if tag else None,
-                        "gain_db": round(gain_db, 2) if gain_db is not None else None,
-                        "dbfs": round(dbfs, 2),
-                        "dbm": round(dbfs - gain_db, 2) if gain_db is not None else None,
-                        "changed": int(tag.changed) if tag else None,
-                    })
+                        true_freq, true_lap, true_seg, certain = attribute(ts, n)
+                        gdb = gains.at(true_freq)
+                        gain_db = gdb(t.gain_index)
+                        # Per-chunk correction, so a packet the AGC moved inside
+                        # is still right; a single gain would not be.
+                        dbfs, dbm = gp.packet_power(v, t, nsamples, gdb)
 
-                    # file the IQ under the frequency it was really captured at
-                    if not args.no_iq and certain:
-                        k = (true_lap, true_seg)
-                        if stored.get(k, 0) < args.max_packets:
-                            if k not in files:
-                                name = (f"step{true_seg:02d}_lap{true_lap}_"
-                                        f"{true_freq/1e6:.3f}MHz.iq")
-                                files[k] = open(os.path.join(args.outdir, name), "wb")
-                            files[k].write(
-                                np.frombuffer(buf, dtype=np.int16,
-                                              count=2 * nsamples).tobytes())
-                            stored[k] = stored.get(k, 0) + 1
+                        # PSD, one row per packet, FFT sized to the USB buffer.
+                        # A short entry cannot use the packet-length window, and
+                        # only appears after a truncated read, so skip it.
+                        if len(rows) % args.psd_every == 0:
+                            if n == nsamples:
+                                spec = np.fft.fftshift(
+                                    np.fft.fft(iq * win, n=args.fft))
+                                psd = 10.0 * np.log10(
+                                    np.abs(spec) ** 2 / win_norm + 1e-20)
+                                psd_rows.append(psd.astype(np.float32))
+                                psd_index.append(len(rows))
+                            else:
+                                partial += 1
+
+                        rows.append({
+                            "seq": len(rows),
+                            "timestamp": ts,
+                            "label_freq_hz": freq,     # naive: last retune asked for
+                            "true_freq_hz": true_freq, # from the timestamp
+                            "mislabeled": int(true_freq != freq),
+                            "certain": int(certain),
+                            "lap": true_lap,
+                            "seg": true_seg,
+                            "count": n,
+                            "gain_index": t.gain_index,
+                            "gain_db": round(gain_db, 2),
+                            "chunks": ",".join(str(c) for c in
+                                               t.chunk_gain_index[:4]),
+                            "dbfs": round(dbfs, 2),
+                            "dbm": round(dbm, 2),
+                            "changed": int(gp.profile(t)[2]),
+                            "carried": int(t.carried),
+                        })
+
+                        # file the IQ under the frequency it was really captured at
+                        if not args.no_iq and certain:
+                            k = (true_lap, true_seg)
+                            if stored.get(k, 0) < args.max_packets:
+                                if k not in files:
+                                    name = (f"step{true_seg:02d}_lap{true_lap}_"
+                                            f"{true_freq/1e6:.3f}MHz.iq")
+                                    files[k] = open(
+                                        os.path.join(args.outdir, name), "wb")
+                                files[k].write(seg.tobytes())
+                                stored[k] = stored.get(k, 0) + 1
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
     finally:
@@ -310,6 +349,9 @@ def main():
           f"different frequency than the naive label")
     print(f"{strad} packets overlapped a retune window (frequency uncertain, "
           f"not written to any .iq file)")
+    if partial:
+        print(f"{partial} packets were truncated by a discontinuity and have no "
+              f"PSD row")
 
     # How long each retune kept delivering the *previous* step's samples. Keyed
     # by the boundary itself so laps stay separate.

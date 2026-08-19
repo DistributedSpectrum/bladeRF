@@ -12,6 +12,13 @@ Each packet ("message") is one FPGA DMA buffer: 2044 samples on SuperSpeed,
 index per chunk of the message, so the gain travels with the IQ instead of
 having to be polled asynchronously.
 
+A read covers several packets (--read-packets, 2 by default) and
+bladerf_get_rx_gain_tags() then returns one entry per packet, so there is still a
+row per packet here while the loop makes half as many calls -- or fewer. The dBm
+column is built from each packet's own chunk profile, dividing every span of
+constant gain by its own linear gain before averaging, so a packet the AGC moved
+inside is handled correctly rather than being assigned one gain.
+
 How literally to read that per-chunk profile depends on -g. Slow-attack updates
 gain at most once per 1000 us, so with a 102 us packet at 20 Msps the profile is
 exact: measured 95.7% of packets flat, none with two transitions. Fast-attack
@@ -20,8 +27,7 @@ its final value -- measured 85.8% flat, 8.6% with more than one transition, and
 excursions up to 29 indices in a single packet. In fast-attack use the min/max
 pair and drop packets flagged C rather than trusting the four values.
 
-Requires FPGA v0.17.0 or later. Buffers are sized to one message so that each
-receive maps to exactly one packet and one gain profile.
+Requires FPGA v0.17.0 or later.
 
 Examples:
 
@@ -39,12 +45,9 @@ import re
 import sys
 import time
 
-from bladerf import _bladerf
-
-# The FPGA reserves 4 samples of every DMA buffer for the header, so a buffer
-# sized to one message returns this many samples.
-MESSAGE_SAMPLES = {"SuperSpeed": 2044, "Hi-Speed": 1020}
-BUFFER_SAMPLES = {"SuperSpeed": 2048, "Hi-Speed": 1024}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gain_profile as gp                                      # noqa: E402
+from bladerf import _bladerf                                   # noqa: E402
 
 GAIN_MODES = {
     "slow": _bladerf.GainMode.SlowAttack_AGC,
@@ -65,34 +68,6 @@ def parse_freqs(text, mhz):
     if not out:
         raise argparse.ArgumentTypeError("no frequencies given")
     return out
-
-
-try:
-    import numpy as _np
-except ImportError:
-    _np = None
-
-
-def iq_power_dbfs(buf, count):
-    """Mean power of interleaved SC16 Q11 samples, in dB relative to full scale.
-
-    A pure-Python loop costs ~2*count operations per packet, which at 20 Msps is
-    tens of millions per second and swamps everything else, so use numpy when it
-    is available.
-    """
-    import math
-    if _np is not None:
-        v = _np.frombuffer(buf, dtype=_np.int16, count=2 * count)
-        acc = int(_np.dot(v.astype(_np.int64), v.astype(_np.int64)))
-    else:
-        raw = _bladerf.ffi.cast("int16_t *", _bladerf.ffi.from_buffer(buf))
-        acc = 0
-        for i in range(2 * count):
-            acc += raw[i] * raw[i]
-    if acc == 0:
-        return float("-inf")
-    # 2048 is full scale for SC16 Q11
-    return 10.0 * math.log10(acc / count / (2048.0 * 2048.0))
 
 
 def main():
@@ -129,19 +104,30 @@ def main():
                     help="explicitly disable an already-loaded gain "
                          "calibration table for this run")
     ap.add_argument("--power", action="store_true",
-                    help="also compute IQ power per packet and the gain-"
-                         "corrected absolute power (slower, pure Python)")
+                    help="also compute IQ power per packet and the absolute "
+                         "power after removing the packet's own per-chunk gain")
     ap.add_argument("--csv", metavar="PATH", help="write a row per packet")
+    ap.add_argument("--read-packets", type=int, default=2, metavar="N",
+                    help="packets per sync_rx() call (default 2, i.e. 4088 "
+                         "samples on SuperSpeed). Reading whole packets keeps "
+                         "every gain tag entry a complete packet, so there is "
+                         "still one CSV row per packet; larger values just mean "
+                         "fewer calls per second")
+    ap.add_argument("--buffer-size", type=int, default=8192, metavar="SAMPLES",
+                    help="samples per USB buffer, rounded up to whole packets "
+                         "(default 8192 = 4 packets on SuperSpeed). Independent "
+                         "of --read-packets: this sizes the USB transfers, that "
+                         "sizes the reads")
     ap.add_argument("--num-buffers", type=int, default=256,
-                    help="stream buffers (default 256). Each holds one packet, "
-                         "so this sets how long a stall the loop can absorb "
-                         "before it must resync and lose samples: "
-                         "num_buffers * samples_per_packet / sample_rate")
+                    help="stream buffers (default 256). With --buffer-size this "
+                         "sets how long a stall the loop can absorb before it "
+                         "must resync and lose samples: "
+                         "num_buffers * buffer_size / sample_rate")
     ap.add_argument("--num-transfers", type=int, default=32,
                     help="USB transfers in flight (default 32; must be less "
                          "than --num-buffers)")
     ap.add_argument("--now", action="store_true",
-                    help="request each packet with RX_NOW instead of reading "
+                    help="request each read with RX_NOW instead of reading "
                          "contiguously. Simpler, but discards whatever arrived "
                          "between calls, so packets have gaps and the AGC's "
                          "evolution cannot be followed packet to packet")
@@ -161,10 +147,9 @@ def main():
               f"v0.17.0 or later is required.", file=sys.stderr)
         return 2
 
-    speed = dev.get_device_speed()
-    speed_name = "SuperSpeed" if "super" in str(speed).lower() else "Hi-Speed"
-    nsamples = MESSAGE_SAMPLES[speed_name]
-    bufsize = BUFFER_SAMPLES[speed_name]
+    speed_name = gp.speed_name(dev)
+    nsamples = gp.MESSAGE_SAMPLES[speed_name]
+    read_n = gp.read_samples(nsamples, args.read_packets)
 
     # Load the gain calibration table before anything reads gain back. Loading
     # resets the gain (libbladeRF restores the gain mode afterwards), so it has
@@ -215,6 +200,8 @@ def main():
 
     print(f"# FPGA {fpga}, {speed_name}: {nsamples} samples/packet, "
           f"{args.sample_rate/1e6:.3f} Msps, gain mode {args.gain_mode}")
+    print(f"# reading {args.read_packets} packet(s) = {read_n} samples per call, "
+          f"one gain profile per packet")
     print(f"# {len(freqs)} frequencies x {args.dwell:g} s x {args.repeat} pass"
           f"{'es' if args.repeat != 1 else ''}")
     if args.power:
@@ -230,18 +217,19 @@ def main():
     if args.num_transfers >= args.num_buffers:
         print("--num-transfers must be less than --num-buffers", file=sys.stderr)
         return 2
-    slack_ms = args.num_buffers * nsamples / args.sample_rate * 1e3
-    print(f"# {args.num_buffers} buffers / {args.num_transfers} transfers "
-          f"= {slack_ms:.1f} ms of slack before a resync")
+    slack_ms = args.num_buffers * args.buffer_size / args.sample_rate * 1e3
+    print(f"# {args.num_buffers} buffers x {args.buffer_size} samples / "
+          f"{args.num_transfers} transfers = {slack_ms:.1f} ms of slack before "
+          f"a resync")
     dev.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
                     fmt=_bladerf.Format.SC16_Q11_META,
-                    num_buffers=args.num_buffers, buffer_size=bufsize,
+                    num_buffers=args.num_buffers, buffer_size=args.buffer_size,
                     num_transfers=args.num_transfers, stream_timeout=3500)
     dev.enable_module(ch, True)
 
     ffi = _bladerf.ffi
     meta = ffi.new("struct bladerf_metadata *")
-    buf = bytearray(4 * bufsize)
+    buf = bytearray(4 * read_n)
 
     rows = []
     header_printed = False
@@ -262,10 +250,10 @@ def main():
     # late -- measured 8 ms at 20 Msps. Packets overlapping the window are marked
     # uncertain rather than assigned to a frequency.
     bounds = [(0, 0, freqs[0])]
-    # index -> dB depends only on the index and the tuned band, and the call
-    # costs a USB round trip in FPGA tuning mode, so memoise it per frequency
-    # rather than paying it on every packet.
-    gain_db_cache = {}
+    # index -> dB depends on the tuned band as well as the index, and the call
+    # costs a USB round trip in FPGA tuning mode, so it is memoised per
+    # (frequency, index) rather than paid per packet -- let alone per chunk.
+    gains = gp.GainDb(dev, ch)
     try:
         for lap in range(args.repeat):
             for seg, freq in enumerate(freqs):
@@ -275,7 +263,7 @@ def main():
                 bounds.append((ts_before, ts_after, freq))
                 retune_wall = time.monotonic()
                 retune_ts = None
-                prev_ts = None
+                prev_end = None
                 pkt = 0
 
                 while time.monotonic() - retune_wall < args.dwell:
@@ -287,7 +275,7 @@ def main():
                         meta.flags = 0
                         meta.timestamp = next_ts
                     try:
-                        dev.sync_rx(buf, nsamples, 3500, meta)
+                        dev.sync_rx(buf, read_n, 3500, meta)
                     except Exception as exc:
                         # Usually means the requested timestamp already went by,
                         # i.e. this loop fell behind the stream. Resynchronise on
@@ -298,104 +286,114 @@ def main():
                             continue
                         print(f"  sync_rx failed: {exc}", file=sys.stderr)
                         break
-                    next_ts = int(meta.timestamp) + nsamples
+                    # actual_count, not read_n: a discontinuity inside the read
+                    # ends it early, and the next request must follow what did
+                    # arrive.
+                    next_ts = int(meta.timestamp) + int(meta.actual_count)
 
-                    tag = _bladerf.rx_gain_tag(meta)
-                    if retune_ts is None:
-                        retune_ts = meta.timestamp
+                    # One entry per packet the read spanned, each with its own
+                    # timestamp and chunk profile. Whole-packet reads mean every
+                    # entry is a complete packet, so a row is still a packet.
+                    tags = dev.rx_gain_tags()
+                    if tags is None:
+                        print("  no gain tag: needs FPGA v0.17.0+ and a metadata "
+                              "RX format", file=sys.stderr)
+                        break
+                    v = (gp.samples_view(buf, int(meta.actual_count))
+                         if args.power else None)
 
-                    # Samples missing between this packet and the previous one.
-                    # Non-zero means the consumer fell behind, and a gain change
-                    # spanning the gap cannot be pinned to a single moment.
-                    gap = 0
-                    if prev_ts is not None:
-                        gap = int(meta.timestamp - prev_ts) - nsamples
-                    prev_ts = meta.timestamp
+                    for t in tags:
+                        ts_i = int(t.timestamp) + t.msg_sample_offset
+                        count = int(t.sample_count)
+                        if retune_ts is None:
+                            retune_ts = ts_i
 
-                    # Which frequency was actually tuned when these samples were
-                    # captured, as opposed to the one most recently requested.
-                    ts_i = int(meta.timestamp)
-                    j = 0
-                    for k in range(len(bounds) - 1, -1, -1):
-                        if bounds[k][0] < ts_i + nsamples:
-                            j = k
-                            break
-                    b_before, b_after, b_freq = bounds[j]
-                    if ts_i >= b_after:
-                        true_freq, certain = b_freq, True
-                    elif ts_i + nsamples <= b_before:
-                        true_freq = bounds[j - 1][2] if j > 0 else bounds[0][2]
-                        certain = True
-                    else:
-                        true_freq, certain = b_freq, False
+                        # Samples missing between this packet and the previous
+                        # one. Non-zero means the consumer fell behind, and a
+                        # gain change spanning the gap cannot be pinned to a
+                        # single moment.
+                        gap = 0 if prev_end is None else int(ts_i - prev_end)
+                        prev_end = ts_i + count
 
-                    gain_db = None
-                    if tag is not None:
-                        key = (freq, tag.gain_index)
-                        if key not in gain_db_cache:
-                            gain_db_cache[key] = dev.rx_gain_tag_to_gain_db(
-                                ch, tag.gain_index)
-                        gain_db = gain_db_cache[key]
+                        # Which frequency was actually tuned when these samples
+                        # were captured, as opposed to the one most recently
+                        # requested.
+                        j = 0
+                        for k in range(len(bounds) - 1, -1, -1):
+                            if bounds[k][0] < ts_i + count:
+                                j = k
+                                break
+                        b_before, b_after, b_freq = bounds[j]
+                        if ts_i >= b_after:
+                            true_freq, certain = b_freq, True
+                        elif ts_i + count <= b_before:
+                            true_freq = bounds[j - 1][2] if j > 0 else bounds[0][2]
+                            certain = True
+                        else:
+                            true_freq, certain = b_freq, False
 
-                    dbfs = dbm = None
-                    if args.power:
-                        dbfs = iq_power_dbfs(buf, meta.actual_count)
-                        if gain_db is not None:
-                            dbm = dbfs - gain_db
+                        # Convert indices against the band that was really tuned
+                        # for these samples, not the one last asked for.
+                        gdb = gains.at(true_freq)
+                        gain_db = gdb(t.gain_index)
+                        idx_min, idx_max, changed = gp.profile(t)
 
-                    row = {
-                        "lap": lap,
-                        "seg": seg,
-                        "freq_hz": freq,
-                        "pkt": pkt,
-                        "timestamp": int(meta.timestamp),
-                        "ts_since_retune": int(meta.timestamp - retune_ts),
-                        "wall_s": round(time.monotonic() - retune_wall, 6),
-                        "count": int(meta.actual_count),
-                        "gap_samples": gap,
-                        "true_freq_hz": true_freq,
-                        "mislabeled": int(certain and true_freq != freq),
-                        "certain": int(certain),
-                        "status": int(meta.status),
-                        "gain_index": tag.gain_index if tag else None,
-                        "gain_db": round(gain_db, 2) if gain_db is not None else None,
-                        "idx_min": tag.gain_index_min if tag else None,
-                        "idx_max": tag.gain_index_max if tag else None,
-                        "chunks": ",".join(str(c) for c in tag.chunk_gain_index)
-                                  if tag else None,
-                        "changed": int(tag.changed) if tag else None,
-                        "locked": int(tag.locked) if tag else None,
-                        "msgs": tag.num_messages if tag else None,
-                        "dbfs": round(dbfs, 2) if dbfs is not None else None,
-                        "dbm": round(dbm, 2) if dbm is not None else None,
-                    }
-                    rows.append(row)
-
-                    if not args.quiet:
-                        if not header_printed:
-                            hdr = (f"{'freq_MHz':>9} {'pkt':>4} {'timestamp':>12} "
-                                   f"{'dts':>8} {'gap':>8} {'idx':>4} "
-                                   f"{'gain_dB':>8} {'chunk profile':>17} "
-                                   f"{'flg':>4}")
-                            if args.power:
-                                hdr += f" {'dBFS':>7} {'dBm':>8}"
-                            print(hdr)
-                            header_printed = True
-                        # L is fast-attack AGC only: the AD9361 drives gain
-                        # lock from the fast-attack state machine, so it stays
-                        # '-' in slow and hybrid modes by design.
-                        flg = ("C" if tag and tag.changed else "-") + \
-                              ("L" if tag and tag.locked else "-")
-                        line = (f"{freq/1e6:9.3f} {pkt:4d} {row['timestamp']:12d} "
-                                f"{row['ts_since_retune']:8d} {gap:8d} "
-                                f"{row['gain_index'] if tag else -1:4d} "
-                                f"{row['gain_db'] if gain_db is not None else float('nan'):8.2f} "
-                                f"{row['chunks'] or '':>17} {flg:>4}")
+                        dbfs = dbm = None
                         if args.power:
-                            line += (f" {dbfs:7.2f} "
-                                     f"{dbm if dbm is not None else float('nan'):8.2f}")
-                        print(line)
-                    pkt += 1
+                            dbfs, dbm = gp.packet_power(v, t, nsamples, gdb)
+
+                        row = {
+                            "lap": lap,
+                            "seg": seg,
+                            "freq_hz": freq,
+                            "pkt": pkt,
+                            "timestamp": ts_i,
+                            "ts_since_retune": ts_i - retune_ts,
+                            "wall_s": round(time.monotonic() - retune_wall, 6),
+                            "count": count,
+                            "gap_samples": gap,
+                            "true_freq_hz": true_freq,
+                            "mislabeled": int(certain and true_freq != freq),
+                            "certain": int(certain),
+                            "status": int(meta.status),
+                            "gain_index": t.gain_index,
+                            "gain_db": round(gain_db, 2),
+                            "idx_min": idx_min,
+                            "idx_max": idx_max,
+                            "chunks": ",".join(str(c) for c in
+                                               t.chunk_gain_index[:4]),
+                            "changed": int(changed),
+                            "locked": int(t.locked),
+                            "carried": int(t.carried),
+                            "pkts_in_read": len(tags),
+                            "dbfs": round(dbfs, 2) if dbfs is not None else None,
+                            "dbm": round(dbm, 2) if dbm is not None else None,
+                        }
+                        rows.append(row)
+
+                        if not args.quiet:
+                            if not header_printed:
+                                hdr = (f"{'freq_MHz':>9} {'pkt':>4} "
+                                       f"{'timestamp':>12} {'dts':>8} {'gap':>8} "
+                                       f"{'idx':>4} {'gain_dB':>8} "
+                                       f"{'chunk profile':>17} {'flg':>4}")
+                                if args.power:
+                                    hdr += f" {'dBFS':>7} {'dBm':>8}"
+                                print(hdr)
+                                header_printed = True
+                            # L is fast-attack AGC only: the AD9361 drives gain
+                            # lock from the fast-attack state machine, so it stays
+                            # '-' in slow and hybrid modes by design.
+                            flg = ("C" if changed else "-") + \
+                                  ("L" if t.locked else "-")
+                            line = (f"{freq/1e6:9.3f} {pkt:4d} {ts_i:12d} "
+                                    f"{row['ts_since_retune']:8d} {gap:8d} "
+                                    f"{t.gain_index:4d} {gain_db:8.2f} "
+                                    f"{row['chunks']:>17} {flg:>4}")
+                            if args.power:
+                                line += f" {dbfs:7.2f} {dbm:8.2f}"
+                            print(line)
+                        pkt += 1
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
     finally:
@@ -441,9 +439,9 @@ def main():
     untagged = sum(1 for r in rows if r["gain_index"] is None)
     dropped = sum(r["gap_samples"] for r in rows if r["gap_samples"] > 0)
     mislabeled = sum(r["mislabeled"] for r in rows)
-    print(f"\n{len(rows)} packets, {overruns} with overrun status, "
-          f"{untagged} without a gain tag, {dropped} samples dropped, "
-          f"{resyncs} resyncs")
+    print(f"\n{len(rows)} packets in {len(rows) // max(1, args.read_packets)} "
+          f"reads, {overruns} with overrun status, {untagged} without a gain "
+          f"tag, {dropped} samples dropped, {resyncs} resyncs")
     uncertain = sum(1 for r in rows if not r["certain"])
     if mislabeled or uncertain:
         print(f"{mislabeled} packets ({100*mislabeled/len(rows):.1f}%) held "

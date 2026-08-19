@@ -330,9 +330,29 @@ tag = _bladerf.rx_gain_tag(meta)       # None if the FPGA supplied no tag
 tag.gain_index, tag.chunk_gain_index, tag.changed, tag.locked
 tags = dev.rx_gain_tags()              # one entry per packet in the last read
 tags[0].sample_offset, tags[0].sample_count, tags[0].chunk_gain_index
+tags[0].timestamp, tags[0].msg_sample_offset, tags[0].carried
 dev.rx_gain_tag_to_gain_db(ch, idx)    # dB, or None if idx is outside the table
 dev.get_timestamp(_bladerf.Direction.RX)
 dev.set_gain_calibration(ch, path)     # bladerf_load_gain_calibration
+```
+
+`gain_profile.py` in this directory carries the reconstruction every example needs,
+so none of them hand-roll it:
+
+```python
+import gain_profile as gp
+
+msg = gp.message_samples(dev)              # 2044 or 1020
+read_n = gp.read_samples(msg, packets=2)   # request whole packets: 4088
+
+gains = gp.GainDb(dev, ch)                 # memoised per (frequency, index)
+gdb = gains.at(freq_hz)
+
+for span in gp.chunk_spans(tag, msg):      # constant-gain spans, buffer coords
+    span.lo, span.hi, span.index, span.split
+gain_db, filled, ambiguous = gp.gain_db_array(tags, msg, count, gdb)
+dbfs, dbm = gp.packet_power(v, tag, msg, gdb)   # one packet, per-chunk corrected
+idx_min, idx_max, changed = gp.profile(tag)     # the summary fields, per packet
 ```
 
 ---
@@ -404,7 +424,9 @@ as a bound.
 `rx_gain_tags()` removes the one-packet-per-call constraint: request whatever
 size suits the processing, then build the same per-sample array over the whole
 read. Each entry carries its own profile, so the loop above becomes the loop
-below with no change in resolution.
+below with no change in resolution. That loop is `gain_profile.chunk_spans()` and
+`gain_profile.gain_db_array()`, which is what the examples call — it is spelled out
+here because the coordinate handling is the part worth understanding:
 
 ```python
 dev.sync_rx(buf, nsamples, 3500, meta)          # nsamples >> 2044 is fine
@@ -449,6 +471,14 @@ fills `gain_db` completely. Two details worth knowing:
   reports the same thing.
 
 Sizing a C array for it: at most `num_samples / 2044 + 2` entries on SuperSpeed.
+
+**Request whole packets** and both wrinkles disappear: with a read of
+`k * 2044` samples starting on a packet boundary, every entry is a complete
+packet, `msg_sample_offset` is 0 and `carried` is never set, so per-packet
+bookkeeping needs no special cases. That is what `gain_profile.read_samples()` is
+for, and why `--read-packets` rather than `--read-samples` is the knob the hop
+examples expose. Contiguous reads keep the alignment indefinitely; a resync starts
+a new one at the next packet boundary.
 
 `rx_psd_dbm.py` is written this way — one `sync_rx()` for the whole capture, then
 one pass over `rx_gain_tags()` — and asserts the coverage rather than assuming it:
@@ -595,9 +625,17 @@ power held to **1.2 dB**.
 
 ## 7. Examples in this directory
 
+All of them reconstruct the gain from `rx_gain_tags()` rather than from the
+per-call summary, so reads are decoupled from packets. The two hop tools read
+several packets per `sync_rx()` (`--read-packets`, 2 by default) and still emit a
+row, a PSD and an `.iq` file per packet, at a fraction of the call rate; the two
+power tools take a whole capture in one read. `--buffer-size` sizes the USB
+transfers independently of either.
+
 | script | purpose |
 |---|---|
-| `rx_gain_tag_sweep.py` | per-packet timestamp and gain across a frequency hop list; CSV, per-dwell AGC summary |
+| `gain_profile.py` | shared module: chunk spans, per-sample gain, per-packet power, memoised index → dB |
+| `rx_gain_tag_sweep.py` | per-packet timestamp and gain across a frequency hop list; CSV, per-dwell AGC summary. `--power` reports each packet's absolute power using its own per-chunk profile |
 | `rx_hop_waterfall.py` | per-step IQ files plus a waterfall with one PSD row per packet; shows the retune lag directly |
 | `rx_psd_dbm.py` | one large contiguous read → per-packet gain from `rx_gain_tags()` → Welch PSD calibrated in dBm, with an RSSI band |
 | `rx_lte_rssi.py` | RSSI of LTE cells given as `CENTER:CHANNEL_BW`, each tuned to its own centre |

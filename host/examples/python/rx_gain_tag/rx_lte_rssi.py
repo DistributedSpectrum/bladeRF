@@ -2,9 +2,9 @@
 """Measure the RSSI of LTE cells, tuning each to its own center frequency.
 
 For every cell given as CENTER:CHANNEL_BW (MHz), retunes to that center, captures
-contiguous IQ, applies the per-chunk RFIC gain from the packet headers, and
-reports the absolute power in the channel bandwidth and in the occupied
-bandwidth.
+contiguous IQ in a single read, applies the per-chunk RFIC gain of every packet
+that read spanned, and reports the absolute power in the channel bandwidth and in
+the occupied bandwidth.
 
 Tuning per cell rather than capturing several at once matters for accuracy:
 
@@ -35,6 +35,7 @@ import types
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gain_profile as gp                                  # noqa: E402
 import rx_psd_dbm as psd                                   # noqa: E402
 from bladerf import _bladerf                               # noqa: E402
 
@@ -111,8 +112,14 @@ def main():
     ap.add_argument("--overlap", type=float, default=0.5)
     ap.add_argument("--gain-cal", metavar="PATH")
     ap.add_argument("--settle", type=float, default=0.3)
-    ap.add_argument("--num-buffers", type=int, default=1024)
-    ap.add_argument("--num-transfers", type=int, default=64)
+    ap.add_argument("--num-buffers", type=int, default=256)
+    ap.add_argument("--num-transfers", type=int, default=32)
+    ap.add_argument("--buffer-size", type=int, default=16384, metavar="SAMPLES",
+                    help="samples per USB buffer, rounded up to whole packets "
+                         "(default 16384 = 8 packets on SuperSpeed)")
+    ap.add_argument("--max-tries", type=int, default=20, metavar="N",
+                    help="restart a cell's capture at most N times when a "
+                         "discontinuity truncates it")
     ap.add_argument("--repeat", type=int, default=1,
                     help="measure each cell this many times (default 1)")
     ap.add_argument("--plot", metavar="PATH",
@@ -150,18 +157,22 @@ def main():
 
     dev.set_sample_rate(ch, int(args.sample_rate))
     dev.set_bandwidth(ch, int(args.bandwidth))
-    speed = dev.get_device_speed()
-    nsamples = 2044 if "super" in str(speed).lower() else 1020
+    nsamples = gp.message_samples(dev)
+
+    if args.num_transfers >= args.num_buffers:
+        print("--num-transfers must be less than --num-buffers", file=sys.stderr)
+        return 2
 
     dev.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
                     fmt=_bladerf.Format.SC16_Q11_META,
-                    num_buffers=args.num_buffers, buffer_size=nsamples + 4,
+                    num_buffers=args.num_buffers, buffer_size=args.buffer_size,
                     num_transfers=args.num_transfers, stream_timeout=3500)
     dev.enable_module(ch, True)
 
     print(f"# FPGA {fpga}, {args.sample_rate/1e6:.3f} Msps, "
           f"{args.bandwidth/1e6:.1f} MHz BW, {args.gain_mode} AGC, "
-          f"2^{args.log2n} samples/measurement")
+          f"2^{args.log2n} samples/measurement in one read "
+          f"({-(-2**args.log2n // nsamples)} packets, one gain profile each)")
     print(f"# bin = {args.sample_rate/args.nperseg/1e3:.3f} kHz"
           f"{'' if calibrated else '   [UNCALIBRATED: values carry an offset]'}")
     print()
