@@ -91,9 +91,13 @@ Two crossovers matter:
 Between those, a packet may hold a few changes but no chunk holds more than one,
 so the profile stays faithful.
 
-At any normal rate the practical consequence is simple: **discard packets with
-`BLADERF_RX_GAIN_TAG_CHANGED` set** and everything remaining has one exact gain.
-At 20 Msps that costs 4.3% of packets.
+At any normal rate the practical consequence is that **nothing needs to be
+discarded**. 95.7% of packets carry one exact gain. For the 4.3% that contain a
+change, the ambiguous chunk is split at its midpoint — first half the gain the
+chunk started at, second half the gain it ended at — which is the midpoint
+estimator for a transition of unknown position. See
+[§4](#build-the-per-chunk-gain-array) for the residual error, which is under
+0.01 dB.
 
 Fast-attack is a different regime — 1 µs interval, so ~25 decisions per chunk at
 20 Msps. Measured over 292k packets: 85.8% flat, 8.6% with more than one chunk
@@ -171,25 +175,48 @@ returns `float`.
 
 ### Build the per-chunk gain array
 
-`chunk_gain_index[i]` is the index at the **end** of chunk i, so use that value
-for chunk i's samples and note that a chunk whose end differs from its start
-contains the transition at an unknown point inside:
+`chunk_gain_index[i]` is the index at the **end** of chunk i, and `base` is the
+index at sample 0, so chunk i runs from `pts[i]` to `pts[i+1]`. When those differ
+the chunk contains a transition at an unknown position, so split the chunk at its
+midpoint:
 
 ```python
 CHUNKS = 4
 clen = nsamples // CHUNKS                     # 511 on SuperSpeed
 pts = [tag.gain_index] + list(tag.chunk_gain_index[:CHUNKS])
 
+def gdb(idx):                                 # USB round trip in FPGA tuning
+    if idx not in cache:                      # mode, so memoise per (freq, idx)
+        cache[idx] = dev.rx_gain_tag_to_gain_db(ch, idx)
+    return cache[idx]
+
 gain_db = np.empty(nsamples, dtype=np.float32)
 for i in range(CHUNKS):
     lo = i * clen
     hi = lo + clen if i < CHUNKS - 1 else nsamples   # last chunk takes the remainder
-    idx = pts[i + 1]
-    if idx not in cache:
-        cache[idx] = dev.rx_gain_tag_to_gain_db(ch, idx)   # USB round trip in
-    gain_db[lo:hi] = cache[idx]                            # FPGA tuning mode:
-                                                           # memoise per (freq, idx)
+    if pts[i] == pts[i + 1]:                        # flat: exact
+        gain_db[lo:hi] = gdb(pts[i + 1])
+    else:                                           # transition inside: split
+        mid = lo + (hi - lo) // 2
+        gain_db[lo:mid] = gdb(pts[i])
+        gain_db[mid:hi] = gdb(pts[i + 1])
 ```
+
+**Why the midpoint, and what it costs.** If the transition is uniformly
+distributed within the chunk, assigning the whole chunk one value mis-assigns an
+expected 0.50 of it (worst case 1.00); splitting at the midpoint mis-assigns an
+expected 0.25 (worst case 0.50). So the split halves the error and removes any
+need to discard data.
+
+The residual is negligible in slow-attack, where a decision moves the gain by at
+most 2 dB and 4.3% of packets contain one. That leaves ~0.27% of samples carrying
+a one-step error, bounding total power to **under 0.01 dB**. Measured on hardware
+over 2¹⁸ samples at 731 MHz, the two strategies differed by **0.0035 dB** in total
+power and **0.0046 dB** in a 3 MHz RSSI band.
+
+Fast-attack is not covered by this reasoning: a chunk there can hold ~25
+decisions, so a midpoint split is not meaningful and the profile should be treated
+as a bound.
 
 ### Apply it in the time domain, before any FFT
 
@@ -271,6 +298,10 @@ power held to **1.2 dB**.
   so accuracy degrades toward the band edges. Tune each signal near centre.
 * **`locked` is fast-attack only.** To ask whether the gain was steady in any
   mode, use `gain_index_min == gain_index_max` with `CHANGED` clear.
+* **A chunk that contains a transition** knows its gain only to chunk resolution.
+  Splitting at the midpoint (§4) keeps the residual under 0.01 dB in slow-attack,
+  so packets need not be dropped — but in fast-attack the same chunk may hold many
+  decisions, and there `CHANGED` packets are better excluded.
 
 ---
 
