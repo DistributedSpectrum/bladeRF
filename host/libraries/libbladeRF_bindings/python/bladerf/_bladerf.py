@@ -1008,40 +1008,6 @@ class BladeRF:
     rfic_ctrl_out = property(get_rfic_ctrl_out,
                              doc="RFIC CTRL_OUT status pins")
 
-    # Scheduled retunes
-
-    def get_quick_tune(self, ch):
-        """Capture a quick tune profile for the currently tuned frequency.
-
-        Tune to the frequency first: this stores the RFIC fast lock profile as it
-        stands and saves a copy in the Nios, returning the handle to it. Keep the
-        returned object alive for as long as you intend to schedule it.
-        """
-        qt = ffi.new("struct bladerf_quick_tune *")
-        _check_error(libbladeRF.bladerf_get_quick_tune(self.dev[0], ch, qt))
-        return qt
-
-    def schedule_retune(self, ch, timestamp, frequency=0, quick_tune=None):
-        """Retune at an exact sample timestamp.
-
-        `timestamp` is in the channel's sample clock, the same counter
-        bladerf_metadata.timestamp and get_timestamp() use, so the retune lands at
-        a point the caller can compare a packet's timestamp against -- which is
-        what makes hop attribution exact rather than a window. Pass
-        RETUNE_NOW (0) to apply it immediately.
-
-        bladeRF 2.0 requires `quick_tune`; there is no path there that computes
-        the tuning parameters on the fly.
-        """
-        _check_error(libbladeRF.bladerf_schedule_retune(
-            self.dev[0], ch, int(timestamp), int(frequency),
-            quick_tune if quick_tune is not None else ffi.NULL))
-
-    def cancel_scheduled_retunes(self, ch):
-        """Drop every retune queued for `ch` that has not fired yet."""
-        _check_error(libbladeRF.bladerf_cancel_scheduled_retunes(
-            self.dev[0], ch))
-
     def rx_gain_tag_to_gain_db(self, ch, gain_index):
         """Convert an RX gain-table index into the achieved conversion gain, dB.
 
@@ -1396,9 +1362,6 @@ RxGainTag = collections.namedtuple(
     "RxGainTag",
     "version flags gain_index gain_index_min gain_index_max chunks "
     "num_messages chunk_gain_index changed locked")
-
-# bladerf_schedule_retune() timestamp meaning "apply immediately"
-RETUNE_NOW = 0
 
 RX_GAIN_TAG_VERSION_NONE = 0
 RX_GAIN_TAG_VERSION_1 = 1

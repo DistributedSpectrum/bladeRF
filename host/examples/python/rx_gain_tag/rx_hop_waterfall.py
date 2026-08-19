@@ -26,13 +26,13 @@ every packet by comparing its timestamp against those boundaries, so a step's
 file holds only samples actually captured at that frequency. Packets that
 straddle a boundary contain both and are flagged rather than filed.
 
-By default the boundary is exact, because the hop is a scheduled retune
-(bladerf_schedule_retune) at a timestamp chosen in advance rather than a
-bladerf_set_frequency() call whose effect lands somewhere inside it. Measured at
-20 Msps: the power steps in the very packet containing the scheduled timestamp,
-against a 13.5 ms window with set_frequency() -- 130 packets whose frequency, and
-therefore whose gain band, could not be pinned down. --no-schedule keeps the old
-behaviour.
+The boundary is a window, not an instant: bladerf_set_frequency() spends
+milliseconds on band selection, port switching and recalibration, and the RF moves
+somewhere inside that -- measured 13.5 ms wide at 20 Msps with the change 5.8 ms
+in. So roughly 130 packets per hop have a frequency, and therefore a gain band,
+that cannot be pinned down; they are reported as uncertain and carry dBFS but no
+dBm. What *is* certain is the timestamp read after the call returns: every sample
+at or after it was captured at the new frequency.
 
 Outputs, under --outdir:
     step<NN>_lap<L>_<freq>MHz.iq   interleaved int16 SC16 Q11, little-endian
@@ -96,14 +96,6 @@ def main():
                     default="slow")
     ap.add_argument("--gain-cal", metavar="PATH",
                     help="RX gain calibration table (.tbl or .csv), or 'auto'")
-    ap.add_argument("--no-schedule", action="store_true",
-                    help="hop with bladerf_set_frequency() instead of a "
-                         "scheduled retune, which leaves a 13.5 ms window per hop "
-                         "in which the frequency is unknown rather than a single "
-                         "exact boundary")
-    ap.add_argument("--hop-lead", type=float, default=5.0, metavar="MS",
-                    help="schedule each hop this far ahead of the stream "
-                         "(default 5 ms)")
     ap.add_argument("--read-packets", type=int, default=2, metavar="N",
                     help="packets per sync_rx() call (default 2). Whole-packet "
                          "reads keep every gain tag entry a complete packet, so "
@@ -165,7 +157,6 @@ def main():
     speed_name = gp.speed_name(dev)
     nsamples = gp.MESSAGE_SAMPLES[speed_name]
     read_n = gp.read_samples(nsamples, args.read_packets)
-    lead_samples = max(1, int(args.hop_lead * 1e-3 * args.sample_rate))
 
     dev.set_sample_rate(ch, int(args.sample_rate))
     dev.set_bandwidth(ch, int(bandwidth))
@@ -180,25 +171,6 @@ def main():
     print(f"# {args.num_buffers} buffers x {args.buffer_size} samples => the "
           f"reader may lag real time by up to {lag_ms:.1f} ms, so that much "
           f"post-retune data can still be from the previous step")
-
-    # An exact retune timestamp is what turns attribution from a window into a
-    # comparison. Quick tune profiles are captured from the tuned state, so every
-    # frequency is visited once, calibrated, before streaming starts.
-    scheduled = not args.no_schedule
-    qt = {}
-    if scheduled:
-        try:
-            for f in freqs:
-                dev.set_frequency(ch, f)
-                qt[f] = dev.get_quick_tune(ch)
-            dev.set_frequency(ch, freqs[0])
-        except Exception as exc:
-            print(f"# scheduled retunes unavailable ({exc}); falling back to "
-                  f"set_frequency()", file=sys.stderr)
-            scheduled = False
-            qt = {}
-    print(f"# hops via {'scheduled retune at an exact timestamp'
-                        if scheduled else 'set_frequency() (13.5 ms window)'}")
 
     if args.num_transfers >= args.num_buffers:
         print("--num-transfers must be less than --num-buffers", file=sys.stderr)
@@ -219,10 +191,6 @@ def main():
 
     # One entry per retune: (ts_lo, ts_hi, freq, lap, seg), the RF having changed
     # somewhere in [ts_lo, ts_hi].
-    #
-    # A scheduled retune collapses that to an instant, ts_lo == ts_hi, so only the
-    # packet the boundary falls inside is uncertain -- and it really does hold
-    # samples of both frequencies.
     #
     # set_frequency() can only be bracketed. It moves the AD9361 LO early in its
     # sequence and then spends milliseconds on band selection, port switching and
@@ -269,15 +237,9 @@ def main():
     try:
         for lap in range(args.repeat):
             for seg, freq in enumerate(freqs):
-                if scheduled:
-                    now = int(dev.get_timestamp(_bladerf.Direction.RX))
-                    t_hop = max(now, next_ts or 0) + lead_samples
-                    dev.schedule_retune(ch, t_hop, freq, qt[freq])
-                    ts_lo = ts_hi = t_hop
-                else:
-                    ts_lo = int(dev.get_timestamp(_bladerf.Direction.RX))
-                    dev.set_frequency(ch, freq)
-                    ts_hi = int(dev.get_timestamp(_bladerf.Direction.RX))
+                ts_lo = int(dev.get_timestamp(_bladerf.Direction.RX))
+                dev.set_frequency(ch, freq)
+                ts_hi = int(dev.get_timestamp(_bladerf.Direction.RX))
                 bounds.append((ts_lo, ts_hi, freq, lap, seg))
                 psd_marks.append((len(psd_rows), len(rows), ts_lo, ts_hi,
                                   freq, lap, seg))
@@ -406,10 +368,10 @@ def main():
     if partial:
         print(f"{partial} packets were truncated by a discontinuity and have no "
               f"PSD row")
-    if not scheduled and strad:
-        print(f"that is {strad/max(1,len(freqs)*args.repeat):.0f} packets per hop; "
-              f"scheduled retunes (drop --no-schedule) reduce it to the one packet "
-              f"the boundary lands inside.")
+    if strad:
+        print(f"that is {strad/max(1,len(freqs)*args.repeat):.0f} packets per hop, "
+              f"which is the width of the set_frequency() call itself; the RF moves "
+              f"somewhere inside it and no host-side timestamp can say where.")
 
     # How long each retune kept delivering the *previous* step's samples. Keyed
     # by the boundary itself so laps stay separate.

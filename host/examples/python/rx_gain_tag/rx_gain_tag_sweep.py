@@ -126,18 +126,6 @@ def main():
     ap.add_argument("--num-transfers", type=int, default=32,
                     help="USB transfers in flight (default 32; must be less "
                          "than --num-buffers)")
-    ap.add_argument("--no-schedule", action="store_true",
-                    help="hop with bladerf_set_frequency() instead of a "
-                         "scheduled retune. That call takes milliseconds and the "
-                         "RF moves somewhere inside it -- measured 13.5 ms wide "
-                         "with the change 5.8 ms in at 20 Msps -- so every packet "
-                         "in that window has an unknown frequency, and an unknown "
-                         "gain band with it. Scheduled retunes narrow that to the "
-                         "one packet the boundary falls inside")
-    ap.add_argument("--hop-lead", type=float, default=5.0, metavar="MS",
-                    help="schedule each hop this far ahead of the stream "
-                         "(default 5 ms), enough for the command to reach the "
-                         "FPGA before the timestamp it names")
     ap.add_argument("--now", action="store_true",
                     help="request each read with RX_NOW instead of reading "
                          "contiguously. Simpler, but discards whatever arrived "
@@ -162,7 +150,6 @@ def main():
     speed_name = gp.speed_name(dev)
     nsamples = gp.MESSAGE_SAMPLES[speed_name]
     read_n = gp.read_samples(nsamples, args.read_packets)
-    lead_samples = max(1, int(args.hop_lead * 1e-3 * args.sample_rate))
 
     # Load the gain calibration table before anything reads gain back. Loading
     # resets the gain (libbladeRF restores the gain mode afterwards), so it has
@@ -227,26 +214,6 @@ def main():
                   "full scale and carries an uncalibrated offset")
     print(f"# packet timestamps are in samples at the RX sample rate")
 
-    # Retunes at an exact sample timestamp, so a packet's frequency follows from
-    # its timestamp instead of from a window. A quick tune profile is captured
-    # from the tuned state, so each frequency is visited once up front -- with
-    # full calibration, which the fast lock profile then restores on every hop.
-    scheduled = not args.no_schedule
-    qt = {}
-    if scheduled:
-        try:
-            for f in freqs:
-                dev.set_frequency(ch, f)
-                qt[f] = dev.get_quick_tune(ch)
-            dev.set_frequency(ch, freqs[0])
-        except Exception as exc:
-            print(f"# scheduled retunes unavailable ({exc}); falling back to "
-                  f"set_frequency()", file=sys.stderr)
-            scheduled = False
-            qt = {}
-    print(f"# hops via {'scheduled retune at an exact timestamp'
-                        if scheduled else 'set_frequency() (windowed)'}")
-
     if args.num_transfers >= args.num_buffers:
         print("--num-transfers must be less than --num-buffers", file=sys.stderr)
         return 2
@@ -279,16 +246,14 @@ def main():
     # attribute every packet by its timestamp instead of by the last request.
     # (ts_lo, ts_hi, freq): the RF certainly changed somewhere in [ts_lo, ts_hi].
     #
-    # A scheduled retune makes that an instant -- ts_lo == ts_hi == the timestamp
-    # the retune was scheduled for -- so the only uncertain packet is the one the
-    # boundary falls inside, and it genuinely holds samples of both frequencies.
-    #
-    # set_frequency() cannot do better than a bracket. It moves the LO early in
-    # its sequence and then spends milliseconds on band selection and
+    # set_frequency() can only be bracketed, never pinned to a sample. It moves the
+    # LO early in its sequence and then spends milliseconds on band selection and
     # recalibration, so a timestamp read after it returns is late: measured 13.5 ms
     # wide at 20 Msps with the RF actually changing 5.8 ms in. Every packet in that
     # window has an unknown frequency, and since the index -> dB mapping is band
     # dependent, an unknown gain too -- so those rows carry dBFS but no dB or dBm.
+    # What IS certain is ts_after: every sample at or after it was captured at the
+    # new frequency, which is the guarantee a capture should be gated on.
     bounds = [(0, 0, freqs[0])]
     # index -> dB depends on the tuned band as well as the index, and the call
     # costs a USB round trip in FPGA tuning mode, so it is memoised per
@@ -297,19 +262,13 @@ def main():
     try:
         for lap in range(args.repeat):
             for seg, freq in enumerate(freqs):
-                if scheduled:
-                    # Far enough ahead that the command reaches the FPGA first,
-                    # and ahead of the reader so no already-consumed sample can
-                    # fall on the far side of the boundary.
-                    now = int(dev.get_timestamp(_bladerf.Direction.RX))
-                    t_hop = max(now, next_ts or 0) + lead_samples
-                    dev.schedule_retune(ch, t_hop, freq, qt[freq])
-                    bounds.append((t_hop, t_hop, freq))
-                else:
-                    ts_before = int(dev.get_timestamp(_bladerf.Direction.RX))
-                    dev.set_frequency(ch, freq)
-                    ts_after = int(dev.get_timestamp(_bladerf.Direction.RX))
-                    bounds.append((ts_before, ts_after, freq))
+                # Bracket the retune: the RF certainly changed somewhere between
+                # these two timestamps, and every sample at or after ts_after is
+                # certainly at the new frequency.
+                ts_before = int(dev.get_timestamp(_bladerf.Direction.RX))
+                dev.set_frequency(ch, freq)
+                ts_after = int(dev.get_timestamp(_bladerf.Direction.RX))
+                bounds.append((ts_before, ts_after, freq))
                 retune_wall = time.monotonic()
                 # The dwell is counted in samples from the retune, not in wall
                 # clock from the request: the reader runs behind the stream, so a
@@ -510,15 +469,16 @@ def main():
         print(f"{mislabeled} packets ({100*mislabeled/len(rows):.1f}%) held "
               f"samples captured at the PREVIOUS frequency: the reader lags real "
               f"time, so a retune reaches the data later than it is requested. "
-              f"{uncertain} packets straddled a retune "
-              f"{'boundary' if scheduled else 'window'} and have no gain_db/dbm, "
+              f"{uncertain} packets fell inside a retune "
+              f"window and have no gain_db/dbm, "
               f"since the band -- and so the index -> dB mapping -- is not known "
               f"for them. Both are marked in the CSV (mislabeled / certain, plus "
               f"true_freq_hz) and excluded from the summary above.")
-    if not scheduled and uncertain:
+    if uncertain:
         print(f"that is {uncertain/max(1,len(freqs)*args.repeat):.0f} packets per "
-              f"hop; scheduled retunes (drop --no-schedule) reduce it to the one "
-              f"packet the boundary lands inside.")
+              f"hop: bladerf_set_frequency() takes milliseconds and the RF moves "
+              f"somewhere inside the call, so its effect can only be bracketed, "
+              f"never pinned to a sample.")
     if dropped:
         print("note: samples were dropped, so a gain change spanning a gap "
               "cannot be pinned to one moment. Lower --sample-rate to keep up.")
