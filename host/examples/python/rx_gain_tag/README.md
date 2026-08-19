@@ -334,6 +334,9 @@ tags[0].timestamp, tags[0].msg_sample_offset, tags[0].carried
 dev.rx_gain_tag_to_gain_db(ch, idx)    # dB, or None if idx is outside the table
 dev.get_timestamp(_bladerf.Direction.RX)
 dev.set_gain_calibration(ch, path)     # bladerf_load_gain_calibration
+qt = dev.get_quick_tune(ch)            # profile for the frequency tuned NOW
+dev.schedule_retune(ch, timestamp, freq, qt)   # hop at an exact sample count
+dev.cancel_scheduled_retunes(ch)
 ```
 
 `gain_profile.py` in this directory carries the reconstruction every example needs,
@@ -598,13 +601,43 @@ power held to **1.2 dB**.
   Read contiguously (request the samples following the previous packet) rather
   than with `BLADERF_META_FLAG_RX_NOW`, which returns whatever is current and
   silently discards the rest without setting an overrun status.
-* **The reader lags real time** by up to `num_buffers × payload / fs` — 26 ms at
-  1024 buffers and 20 Msps. `bladerf_set_frequency()` takes effect in real time,
-  so for that long after a retune the packets still contain the *previous*
-  frequency's samples. Attribute by timestamp, bracketing each retune with
-  `bladerf_get_timestamp()` before and after; `set_frequency()` moves the LO early
-  and then spends milliseconds recalibrating, so a single timestamp taken
-  afterwards is ~8 ms late.
+* **The reader lags real time** by up to `num_buffers × buffer_size / fs` — 105 ms
+  at 256 buffers of 8192 samples and 20 Msps. A retune takes effect in real time,
+  so for that long afterwards the packets still contain the *previous* frequency's
+  samples, and anything labelling them by "the frequency I last asked for" is
+  wrong. Attribute by timestamp instead.
+* **`bladerf_set_frequency()` gives you a window, not a boundary**, so timestamp
+  attribution across it is still a guess. It moves the LO early in its sequence and
+  then spends milliseconds on band selection and recalibration, so bracketing it
+  with `bladerf_get_timestamp()` yields a window that only *contains* the change.
+  Measured at 20 Msps: **13.5 ms wide, with the RF actually moving 5.8 ms in** —
+  130 packets whose frequency is unknown. And an unknown frequency means an unknown
+  *gain*: `bladerf_rx_gain_tag_to_gain_db()` is band dependent, so converting index
+  72 against the wrong side of the hop is off by 1.46 dB between 951 and 731 MHz —
+  a plausible-looking wrong number rather than an obvious one.
+* **Hop with a scheduled retune** and the window becomes an instant.
+  `bladerf_schedule_retune()` with a quick tune profile fires at a sample timestamp
+  chosen in advance, so a packet's frequency follows from comparing its timestamp
+  against that number. Measured: the power steps in the *very packet containing*
+  the scheduled timestamp, and a 46-hop sweep leaves exactly one uncertain packet
+  per hop — the one the boundary lands inside, which genuinely holds samples of
+  both — against 130 per hop for `set_frequency()`. Capture the profiles once up
+  front, while calibrated:
+
+  ```python
+  qt = {}
+  for f in freqs:                       # visit each frequency once, calibrated
+      dev.set_frequency(ch, f)
+      qt[f] = dev.get_quick_tune(ch)
+  ...
+  now = dev.get_timestamp(_bladerf.Direction.RX)
+  t_hop = now + int(0.005 * fs)         # a few ms of lead for the command
+  dev.schedule_retune(ch, t_hop, freqs[k], qt[freqs[k]])
+  ```
+
+  It is also what makes the dwell exact: read until a packet's timestamp reaches
+  `t_hop + dwell * fs` rather than dwelling on the wall clock, which ends early by
+  the reader's lag.
 * **Let the AGC settle** before capturing. Streaming starts at maximum gain; any
   samples the front end compressed there are nonlinear and no gain correction can
   undo them.
@@ -637,6 +670,10 @@ transfers independently of either.
 | `gain_profile.py` | shared module: chunk spans, per-sample gain, per-packet power, memoised index → dB |
 | `rx_gain_tag_sweep.py` | per-packet timestamp and gain across a frequency hop list; CSV, per-dwell AGC summary. `--power` reports each packet's absolute power using its own per-chunk profile |
 | `rx_hop_waterfall.py` | per-step IQ files plus a waterfall with one PSD row per packet; shows the retune lag directly |
+
+Both hop tools schedule their retunes by default, so each hop is one exact
+timestamp; `--no-schedule` reverts to `bladerf_set_frequency()` and its 13.5 ms
+window, and prints how many packets that costs.
 | `rx_psd_dbm.py` | one large contiguous read → per-packet gain from `rx_gain_tags()` → Welch PSD calibrated in dBm, with an RSSI band |
 | `rx_lte_rssi.py` | RSSI of LTE cells given as `CENTER:CHANNEL_BW`, each tuned to its own centre |
 

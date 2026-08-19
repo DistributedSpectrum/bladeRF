@@ -56,6 +56,7 @@ RX_GAIN_TAG_VERSION_1 = _bladerf.RX_GAIN_TAG_VERSION_1
 RX_GAIN_TAG_CHANGED = _bladerf.RX_GAIN_TAG_CHANGED
 RX_GAIN_TAG_LOCKED = _bladerf.RX_GAIN_TAG_LOCKED
 RX_GAIN_TAG_CARRIED = _bladerf.RX_GAIN_TAG_CARRIED
+RETUNE_NOW = _bladerf.RETUNE_NOW
 
 main = _tool.main
 
@@ -65,4 +66,4 @@ __all__ = ['BladeRF', 'get_bootloader_list', 'get_device_list',
            'rx_gain_tag', 'RxGainTag', 'RxGainTagMsg',
            'RX_GAIN_TAG_CARRIED', 'RX_GAIN_TAG_VERSION_NONE',
            'RX_GAIN_TAG_VERSION_1', 'RX_GAIN_TAG_CHANGED',
-           'RX_GAIN_TAG_LOCKED']
+           'RX_GAIN_TAG_LOCKED', 'RETUNE_NOW']
