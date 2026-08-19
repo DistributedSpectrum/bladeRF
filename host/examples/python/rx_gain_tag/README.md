@@ -57,7 +57,147 @@ checks it before decoding.
 
 ---
 
-## 2. Sample rate versus the 1000 µs slow-attack AGC interval
+## 2. The data path: a 12-bit sample to a USB transfer
+
+Four sizes govern everything between the ADC and `bladerf_sync_rx()`. The first
+two are fixed by the hardware and the FX3 firmware; the last two are the
+`bladerf_sync_config()` parameters:
+
+| unit | size | set by |
+|---|---|---|
+| sample | 4 bytes (`SC16_Q11`), 2 (`SC8_Q7`), 3 (`SC16_Q11_PACKED`) | `format` |
+| message, i.e. packet | 8192 B SuperSpeed, 4096 B Hi-Speed | FX3 firmware ≥ v2.5.0 with FPGA ≥ v0.16.0; 2048/1024 B before that |
+| buffer = one USB transfer | `buffer_size` samples, rounded up to whole messages | you |
+| pipeline and pool depth | `num_transfers`, `num_buffers` | you |
+
+### One sample
+
+The AD9361 delivers 12 bits of I and 12 bits of Q. In `SC16_Q11` the FPGA
+sign-extends each into an `int16_t`, so one sample is one 32-bit dword:
+
+```
+   AD9361 RX                            one sample, SC16_Q11
+   +--------------+                     31            16 15             0
+   | ADC   I[11:0]|---+                +---------------+---------------+
+   |       Q[11:0]|---+--sign-extend-->|    Q int16    |    I int16    |
+   +--------------+      12 -> 16      +---------------+---------------+
+                                        little-endian, I first, and
+                                        [-2048, 2047] means [-1.0, +1.0)
+```
+
+Those 12 significant bits are why every example divides by 2048: `|IQ| / 2048` is
+a fraction of full scale, which is what `dBFS` in
+[§5](#5-removing-the-front-end-gain-to-get-dbm-and-rssi) is relative to. `SC8_Q7`
+truncates to 8 bits per component (2 bytes per sample) and `SC16_Q11_PACKED` packs
+the 12-bit pairs with no padding (3 bytes), but only the two `_META` formats carry
+a gain tag at all.
+
+### One message
+
+`fifo_writer` in the FPGA fills one fixed-size message per FX3 DMA buffer: a
+16-byte header, then payload. The header is what the gain profile travels in, and
+it costs four dwords of every message — which is why the payload is 2044 samples
+and not 2048:
+
+```
+   message = one FX3 GPIF buffer = 8192 B SuperSpeed (4096 B Hi-Speed)
+
+   byte  0        4                12        16                        8192
+         +--------+----------------+---------+----------------------------+
+         |  gain  |    timestamp   |  flags  |      2044 dwords of IQ     |
+         | 32 bit |     64 bit     | 32 bit  |      (1020 on Hi-Speed)    |
+         +--------+----------------+---------+----------------------------+
+           |          |                 |
+           |          |                 `- RX_HW_UNDERFLOW, MINIEXP1/2
+           |          `- sample counter of the FIRST payload sample
+           `- base | L | d0 | d1 | d2 | d3      (FPGA v0.17.0 and later;
+                                                 previously a constant)
+```
+
+Both header fields address the same payload, one as an instant and one as a
+profile across it:
+
+```
+   payload  |<--- 511 --->|<--- 511 --->|<--- 511 --->|<--- 511 --->|
+   dword    0            511          1022          1533          2043
+   gain     base -------> d0 --------> d1 --------> d2 --------> d3
+   time     t ------------------------------------------------------> t+2043
+```
+
+The gain word is committed at the *tail* of its message, which is what lets the
+profile describe that message's own samples; the timestamp still refers to the
+first payload sample. One header per message means gain profiles arrive at
+`fs / 2044` — 9786 per second at 20 Msps, each covering 102.2 µs.
+
+### One buffer, one USB transfer
+
+A buffer is a whole number of messages, and one buffer is exactly one USB bulk
+transfer:
+
+```
+   buffer_size = 8192 samples  ->  4 messages, 32768 bytes
+
+   buffer[k]  +-----------+-----------+-----------+-----------+
+              |h|  msg 0  |h|  msg 1  |h|  msg 2  |h|  msg 3  |
+              +-----------+-----------+-----------+-----------+
+               ^ 16-byte header, one per message, never split across buffers
+              \______________ one libusb bulk transfer, EP 0x81 ____________/
+```
+
+`bladerf_sync_config()` rounds `buffer_size` up to a whole number of messages and
+warns; `bladerf_init_stream()` rejects it instead. (Both compare against the
+SuperSpeed 8192-byte figure regardless of the negotiated speed, `sync.c:146`, so
+on Hi-Speed the smallest buffer is two messages rather than one.)
+
+Below the transfer, sizes the host does not choose: the FX3 hands the GPIF data to
+the USB endpoint through an AUTO DMA channel of **11 buffers of one message each**
+(`fx3_firmware/src/rf.c:293`), and SuperSpeed bulk moves them as 1024-byte packets
+in bursts of up to 16 — so a message is 8 packets and the buffer above is 32.
+
+Above the transfer, the two depths the host does choose:
+
+```
+        in flight (num_transfers = 32)          full, waiting for sync_rx()
+   +----+----+----+ ... +----+   +----+----+----+----+ ... +----+
+   |  0 |  1 |  2 |     | 31 |   | 32 | 33 | 34 | 35 |     |255 |
+   +----+----+----+ ... +----+   +----+----+----+----+ ... +----+
+    \________________ num_buffers = 256, buffer_size samples each _______/
+        submitted to libusb              refilled by the RX worker as
+        (must be < num_buffers)          transfers complete
+```
+
+At 20 Msps with those numbers: 2441 transfers per second of 32 KB each (80 MB/s),
+and `num_buffers * buffer_size / fs` = **105 ms** of slack before a stalled reader
+loses data. When the pool does fill, the worker discards `num_transfers` whole
+buffers to recover — headers and all — which is the one way a gain value is truly
+lost rather than merely summarised.
+
+### One read
+
+`bladerf_sync_rx()` walks messages inside the pool: strip the 16-byte header, fold
+its gain word into the tag state, copy payload, repeat until the request is
+satisfied. So the request size — not `buffer_size` — decides how many profiles one
+`bladerf_metadata` has to describe:
+
+```
+   n = 2044   [h|<------------- 2044 ------------->]
+              meta.timestamp = t, reserved: base/d0..d3 exact for these samples
+              rx_gain_tags(): 1 entry
+
+   n = 8176   [h|<-2044->][h|<-2044->][h|<-2044->][h|<-2044->]
+              meta.timestamp = t, reserved: chunk_gain_index of the FIRST
+                message only, plus min/max/CHANGED across all four
+              rx_gain_tags(): 4 entries, one full profile each, tiling the
+                returned samples
+```
+
+`meta.timestamp` is the timestamp of the first sample returned, so a contiguous
+read asks for `previous timestamp + n`; the per-message entries carry their own
+timestamps, which is how a discontinuity inside a large read stays visible.
+
+---
+
+## 3. Sample rate versus the 1000 µs slow-attack AGC interval
 
 Slow-attack AGC changes gain at most once per gain update interval, 1000 µs by
 default (`agc_gain_update_interval_us` in `fpga_common/src/ad936x_params.c`), and
@@ -96,7 +236,7 @@ discarded**. 95.7% of packets carry one exact gain. For the 4.3% that contain a
 change, the ambiguous chunk is split at its midpoint — first half the gain the
 chunk started at, second half the gain it ended at — which is the midpoint
 estimator for a transition of unknown position. See
-[§4](#build-the-per-chunk-gain-array) for the residual error, which is under
+[§5](#build-the-per-chunk-gain-array) for the residual error, which is under
 0.01 dB.
 
 Fast-attack is a different regime — 1 µs interval, so ~25 decisions per chunk at
@@ -107,7 +247,7 @@ power work.
 
 ---
 
-## 3. The API
+## 4. The API
 
 ### C
 
@@ -197,7 +337,7 @@ dev.set_gain_calibration(ch, path)     # bladerf_load_gain_calibration
 
 ---
 
-## 4. Removing the front-end gain to get dBm and RSSI
+## 5. Removing the front-end gain to get dBm and RSSI
 
 ### Load a calibration table first
 
@@ -422,7 +562,7 @@ power held to **1.2 dB**.
 
 ---
 
-## 5. Pitfalls
+## 6. Pitfalls
 
 * **Contiguity.** Concatenating IQ across dropped samples corrupts the spectrum.
   Read contiguously (request the samples following the previous packet) rather
@@ -447,13 +587,13 @@ power held to **1.2 dB**.
   read gets a profile for 1/129th of its samples and no error is reported. Either
   read one packet per call or use `bladerf_get_rx_gain_tags()`.
 * **A chunk that contains a transition** knows its gain only to chunk resolution.
-  Splitting at the midpoint (§4) keeps the residual under 0.01 dB in slow-attack,
+  Splitting at the midpoint (§5) keeps the residual under 0.01 dB in slow-attack,
   so packets need not be dropped — but in fast-attack the same chunk may hold many
   decisions, and there `CHANGED` packets are better excluded.
 
 ---
 
-## 6. Examples in this directory
+## 7. Examples in this directory
 
 | script | purpose |
 |---|---|
