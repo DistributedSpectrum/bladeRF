@@ -126,6 +126,25 @@ struct bladerf_rx_gain_tag {
     uint8_t  chunk_gain_index[8];  /* absolute index at the end of each chunk  */
 };
 
+/* One entry per message a sync_rx() call consumed, retrieved after the call.
+ * Entries tile the returned samples in order. */
+struct bladerf_rx_gain_tag_msg {
+    bladerf_timestamp timestamp;   /* first sample of the message             */
+    uint32_t sample_offset;        /* where it starts in the caller's buffer   */
+    uint32_t sample_count;         /* how many samples of it were returned     */
+    uint16_t msg_sample_offset;    /* payload offset of the first of those     */
+    uint8_t  gain_index;           /* base index, message's first sample       */
+    uint8_t  flags;                /* _LOCKED | _CARRIED                       */
+    uint8_t  chunk_gain_index[8];  /* this message's own chunk profile         */
+    uint8_t  reserved[4];
+};
+
+/* *num_tags is what was AVAILABLE, which may exceed max_tags; at most max_tags
+ * are written. Call after sync_rx(), before the next one. */
+int bladerf_get_rx_gain_tags(struct bladerf *dev,
+                             struct bladerf_rx_gain_tag_msg *tags,
+                             unsigned int max_tags, unsigned int *num_tags);
+
 /* Index -> the conversion gain the chain actually achieved, in dB. Includes the
  * per-band offset AND the loaded gain calibration table, so the result is on the
  * same scale bladerf_get_gain() reports. */
@@ -138,9 +157,29 @@ resolves it once at `sync_init()` and leaves `version` at `_NONE` otherwise.
 
 One `bladerf_sync_rx()` call can span many packets but returns a single
 `bladerf_metadata`, so `gain_index_min`/`max`/`CHANGED`/`num_messages` summarise
-all of them while `chunk_gain_index` describes the first. **Set `buffer_size` to
-2048 samples on SuperSpeed (1024 on Hi-Speed) to get exactly one packet per
-call**, and the summary and the profile then describe the same packet.
+all of them while `chunk_gain_index` describes only the first. Two ways to keep
+every profile:
+
+* **Read one packet per call** — request exactly 2044 samples (1020 on
+  Hi-Speed). Each call then consumes exactly one header, `num_messages` is 1, and
+  `chunk_gain_index` describes precisely the samples returned. This depends on
+  the *request size*, not on `buffer_size`: a buffer of many packets works
+  identically and costs far fewer USB transfers, which is what matters at high
+  sample rates. `buffer_size` only has to be a whole number of packets, and
+  `bladerf_sync_config()` rounds it up to one.
+* **Read as much as you like and call `bladerf_get_rx_gain_tags()`** — returns
+  one entry per packet consumed, each with its own chunk profile and the slice of
+  the buffer it applies to. Nothing is summarised away.
+
+Reading several packets per call *without* the second is what loses resolution.
+
+`num_messages` counts headers *read*, which is normally the number of entries but
+can be one higher: a header can be read and still contribute no samples — the last
+one before a discontinuity ended the call, or one walked past while seeking to a
+requested timestamp. Those are counted in `num_messages` and dropped from the
+array, which only ever holds entries that describe samples. Size an array from the
+request (`num_samples / 2044 + 2`), and trust `*num_tags`, not `num_messages`, for
+how many entries there are.
 
 ### Python
 
@@ -149,6 +188,8 @@ from bladerf import _bladerf
 
 tag = _bladerf.rx_gain_tag(meta)       # None if the FPGA supplied no tag
 tag.gain_index, tag.chunk_gain_index, tag.changed, tag.locked
+tags = dev.rx_gain_tags()              # one entry per packet in the last read
+tags[0].sample_offset, tags[0].sample_count, tags[0].chunk_gain_index
 dev.rx_gain_tag_to_gain_db(ch, idx)    # dB, or None if idx is outside the table
 dev.get_timestamp(_bladerf.Direction.RX)
 dev.set_gain_calibration(ch, path)     # bladerf_load_gain_calibration
@@ -217,6 +258,109 @@ power and **0.0046 dB** in a 3 MHz RSSI band.
 Fast-attack is not covered by this reasoning: a chunk there can hold ~25
 decisions, so a midpoint split is not meaningful and the profile should be treated
 as a bound.
+
+### Reads larger than one packet
+
+`rx_gain_tags()` removes the one-packet-per-call constraint: request whatever
+size suits the processing, then build the same per-sample array over the whole
+read. Each entry carries its own profile, so the loop above becomes the loop
+below with no change in resolution.
+
+```python
+dev.sync_rx(buf, nsamples, 3500, meta)          # nsamples >> 2044 is fine
+iq = np.frombuffer(buf, np.int16, 2 * meta.actual_count).astype(np.float32)
+iq = (iq[0::2] + 1j * iq[1::2]) / 2048.0
+
+gain_db = np.empty(meta.actual_count, dtype=np.float32)
+for t in dev.rx_gain_tags():
+    clen = MESSAGE_SAMPLES // CHUNKS               # 511 on SuperSpeed
+    pts = [t.gain_index] + list(t.chunk_gain_index[:CHUNKS])
+    for c in range(CHUNKS):
+        # chunk c spans payload samples [c*clen, (c+1)*clen); intersect that
+        # with the part of the message this entry actually returned
+        lo = max(c * clen, t.msg_sample_offset)
+        hi = min((c + 1) * clen if c < CHUNKS - 1 else MESSAGE_SAMPLES,
+                 t.msg_sample_offset + t.sample_count)
+        if hi <= lo:
+            continue
+        # payload coordinates -> buffer coordinates
+        blo = t.sample_offset + (lo - t.msg_sample_offset)
+        bhi = t.sample_offset + (hi - t.msg_sample_offset)
+        if pts[c] == pts[c + 1]:                   # flat: exact
+            gain_db[blo:bhi] = gdb(pts[c + 1])
+        else:                                      # transition: midpoint split
+            mid = blo + (bhi - blo) // 2
+            gain_db[blo:mid] = gdb(pts[c])
+            gain_db[mid:bhi] = gdb(pts[c + 1])
+```
+
+Entries tile the returned samples — `sample_offset + sample_count` of one is the
+`sample_offset` of the next, and the last ends at `meta.actual_count` — so this
+fills `gain_db` completely. Two details worth knowing:
+
+* A call that begins part way into a packet (because the previous call ended part
+  way into it) gets an entry flagged `carried`, with `msg_sample_offset` saying
+  how far in. Its profile came from the header an earlier call read, which is why
+  the chunk arithmetic above works in payload coordinates rather than buffer
+  coordinates.
+* Packets the call skipped over — seeking to a requested timestamp, or discarding
+  after an overrun — produce no entry, so a jump in `timestamp` between adjacent
+  entries marks a discontinuity. `meta.status & BLADERF_META_STATUS_OVERRUN`
+  reports the same thing.
+
+Sizing a C array for it: at most `num_samples / 2044 + 2` entries on SuperSpeed.
+
+`rx_psd_dbm.py` is written this way — one `sync_rx()` for the whole capture, then
+one pass over `rx_gain_tags()` — and asserts the coverage rather than assuming it:
+
+```python
+gain_db, filled, ambiguous = gain_per_sample(tags, MESSAGE_SAMPLES, want, gdb)
+if filled != want:
+    raise RuntimeError(f"gain tags covered {filled} of {want} samples")
+```
+
+### Turning a tagged index into a gain-table entry
+
+Every index in a tag — `gain_index` and each `chunk_gain_index[i]` — is a row of
+the AD9361's **RX full gain table**, which is the same table the RFIC's AGC walks.
+`bladerf_rx_gain_tag_to_gain_db()` is what resolves one into dB, and it composes
+three things:
+
+1. **The table row.** Gain is affine in the index above a per-band offset:
+   `starting_gain_db + (index - idx_step_offset) * gain_step_db`, clamped at the
+   band's maximum. The three bands are in
+   `fpga_common/src/ad936x_helpers.c:196`, mirroring `ad9361_init_gain_tables()`
+   in the RFIC driver:
+
+   | LO | starting dB | step | idx offset | max dB | usable indices |
+   |---|---|---|---|---|---|
+   | ≤ 1300 MHz | +1 | 1 | 0 | 77 | 0…76 |
+   | ≤ 4000 MHz | −4 | 1 | 1 | 71 | 0…76 |
+   | > 4000 MHz | −10 | 1 | 4 | 62 | 0…76 |
+
+   So the *same index means a different gain in a different band* — the mapping is
+   not a property of the index alone.
+
+2. **The per-band front-end offset**, the same one `bladerf_get_gain()` adds, so
+   the result is on the scale that call reports rather than a bare RFIC figure.
+
+3. **The gain calibration table**, if one is loaded and enabled for the channel.
+   Its `gain_corr` entry is interpolated at the tuned frequency and folded in,
+   which is what makes the number absolute instead of nominal. This is also why
+   the return type is `float`: the correction has a fractional part (+4.32 dB at
+   731 MHz, +3.40 dB at 915 MHz on one board).
+
+Two consequences for how to call it:
+
+* **Memoise per (frequency, index), not per index.** The conversion depends on the
+  tuned LO through all three terms, so a cache has to be invalidated on retune. In
+  `BLADERF_TUNING_MODE_FPGA` each call also costs a USB round trip to read the LO,
+  which is why the examples cache: a capture only ever contains a handful of
+  distinct indices (measured 4 to 6 over 2¹⁸ samples), so the miss count is tiny
+  even though the call count is one per chunk per packet.
+* **A `None` / `BLADERF_ERR_INVAL` return is a configuration error, not a bad
+  sample.** It means the index fell outside the table, which almost always means
+  `CTRL_OUT` is not pointed at row `0x16` — check RFIC register `0x035`.
 
 ### Apply it in the time domain, before any FFT
 
@@ -298,6 +442,10 @@ power held to **1.2 dB**.
   so accuracy degrades toward the band edges. Tune each signal near centre.
 * **`locked` is fast-attack only.** To ask whether the gain was steady in any
   mode, use `gain_index_min == gain_index_max` with `CHANGED` clear.
+* **Reading many packets per call and using only `meta.reserved`** silently loses
+  resolution: `chunk_gain_index` there describes the first packet, so a 129-packet
+  read gets a profile for 1/129th of its samples and no error is reported. Either
+  read one packet per call or use `bladerf_get_rx_gain_tags()`.
 * **A chunk that contains a transition** knows its gain only to chunk resolution.
   Splitting at the midpoint (§4) keeps the residual under 0.01 dB in slow-attack,
   so packets need not be dropped — but in fast-attack the same chunk may hold many
@@ -311,7 +459,7 @@ power held to **1.2 dB**.
 |---|---|
 | `rx_gain_tag_sweep.py` | per-packet timestamp and gain across a frequency hop list; CSV, per-dwell AGC summary |
 | `rx_hop_waterfall.py` | per-step IQ files plus a waterfall with one PSD row per packet; shows the retune lag directly |
-| `rx_psd_dbm.py` | contiguous capture → Welch PSD calibrated in dBm, with an RSSI band |
+| `rx_psd_dbm.py` | one large contiguous read → per-packet gain from `rx_gain_tags()` → Welch PSD calibrated in dBm, with an RSSI band |
 | `rx_lte_rssi.py` | RSSI of LTE cells given as `CENTER:CHANNEL_BW`, each tuned to its own centre |
 
 All need the in-repo bindings and a libbladeRF containing the tag support:

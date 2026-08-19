@@ -3221,6 +3221,28 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     return 0;
 }
 
+int bladerf_get_rx_gain_tags(struct bladerf *dev,
+                             struct bladerf_rx_gain_tag_msg *tags,
+                             unsigned int max_tags,
+                             unsigned int *num_tags)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+    NULL_CHECK(num_tags);
+
+    struct bladerf2_board_data *board_data = dev->board_data;
+
+    if (!board_data->sync[BLADERF_RX].initialized) {
+        RETURN_INVAL("rx gain tags", "sync rx not initialized");
+    }
+
+    /* Deliberately not under dev->lock: this reads state that belongs to the
+     * last bladerf_sync_rx(), which does not take that lock either, and it must
+     * not be made to wait behind an unrelated control transfer. */
+    return sync_get_gain_tags(&board_data->sync[BLADERF_RX], tags, max_tags,
+                              num_tags);
+}
+
 int bladerf_get_rfic_rx_fir(struct bladerf *dev, bladerf_rfic_rxfir *rxfir)
 {
     CHECK_BOARD_IS_BLADERF2(dev);

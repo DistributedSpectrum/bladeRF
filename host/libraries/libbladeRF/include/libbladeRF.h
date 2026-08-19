@@ -2584,15 +2584,26 @@ struct bladerf_metadata {
  * That conversion needs a gain calibration table loaded and enabled for the
  * channel (bladerf_load_gain_calibration()) to be an absolute reference.
  *
- * @note **Choosing `buffer_size`.** The metadata header, and therefore this
- *       profile, is per *message* -- not per buffer. A message holds 2044
- *       samples on SuperSpeed and 1020 on Hi-Speed, and bladerf_sync_config()
- *       rounds `buffer_size` up to a whole number of messages. Setting
- *       `buffer_size` to **2048 samples (SuperSpeed) or 1024 (Hi-Speed)** gives
- *       exactly one message per buffer, so a bladerf_sync_rx() of up to 2044
- *       (or 1020) samples maps one-to-one onto a single message and a single
- *       profile. Larger buffers still work, but many messages then collapse into
- *       the summary fields and `chunk_gain_index` describes only the first.
+ * @note **This profile covers one message; a call can span many.** The metadata
+ *       header, and therefore this profile, is per *message* -- not per buffer
+ *       and not per call. A message holds 2044 samples on SuperSpeed and 1020 on
+ *       Hi-Speed. Two ways to keep the full resolution:
+ *
+ *       - Request exactly 2044 samples (1020 on Hi-Speed) per
+ *         bladerf_sync_rx(). Each call then consumes exactly one header,
+ *         `num_messages` is 1, and `chunk_gain_index` describes precisely the
+ *         samples returned. This is independent of `buffer_size`, which only
+ *         needs to be a whole number of messages -- bladerf_sync_config() rounds
+ *         it up to one -- and is better left large so the USB transfer rate
+ *         stays low.
+ *       - Request as much as you like and call bladerf_get_rx_gain_tags()
+ *         afterwards, which returns one ::bladerf_rx_gain_tag_msg per message
+ *         the call consumed, each with its own `chunk_gain_index` and its
+ *         position within the returned buffer.
+ *
+ *       Reading more than one message per call *without* doing the latter is
+ *       what loses resolution: the messages collapse into the summary fields
+ *       below and `chunk_gain_index` then describes only the first of them.
  *
  * When `gain_index_min == gain_index_max` and ::BLADERF_RX_GAIN_TAG_CHANGED is
  * clear, one gain applied to every returned sample and the conversion is exact.
@@ -2649,8 +2660,15 @@ struct bladerf_rx_gain_tag {
      *  `chunk_gain_index` */
     uint8_t chunks;
 
-    /** Number of messages summarized. Zero means no header was consumed by this
-     *  call and the fields describe the message an earlier call started. */
+    /** Number of message headers read. Zero means no header was consumed by
+     *  this call and the fields describe the message an earlier call started.
+     *
+     *  This can be one higher than the number of entries
+     *  bladerf_get_rx_gain_tags() returns: a header can be read and still
+     *  contribute no samples -- the last one before a discontinuity ended the
+     *  call, or one walked past while seeking to a requested timestamp. Those
+     *  are counted here and omitted there, since an entry always describes
+     *  samples. */
     uint16_t num_messages;
 
     /** Gain index at the end of each chunk of the first message returned.
@@ -2679,6 +2697,84 @@ struct bladerf_rx_gain_tag {
  * since it is derived from the gain index actually applied to these samples.
  */
 #define BLADERF_RX_GAIN_TAG_LOCKED (1 << 1)
+
+/** This entry's message header was consumed by an earlier bladerf_sync_rx()
+ *  call, so its profile was carried over rather than read from a header during
+ *  the call that produced it.
+ *
+ *  Only ever set in ::bladerf_rx_gain_tag_msg::flags. It appears on at most the
+ *  first entry, and only when a call began part way into a message.
+ */
+#define BLADERF_RX_GAIN_TAG_CARRIED (1 << 2)
+
+/**
+ * @brief One message's gain profile, positioned within a receive.
+ *
+ * ::bladerf_rx_gain_tag summarizes a whole bladerf_sync_rx() call and can only
+ * carry `chunk_gain_index` for the *first* message, because it has to fit in
+ * ::bladerf_metadata::reserved. When a call spans several messages -- which any
+ * request larger than 2044 samples (1020 on Hi-Speed) does -- retrieve the full
+ * per-message profile with bladerf_get_rx_gain_tags() instead.
+ *
+ * Entries are in receive order and tile the samples the call returned: entry
+ * `i` describes `sample_count` samples starting at `sample_offset` in the
+ * caller's buffer, and
+ *
+ * @code
+ *     tags[i].sample_offset + tags[i].sample_count == tags[i+1].sample_offset
+ * @endcode
+ *
+ * holds across the whole array, with the last entry ending at
+ * ::bladerf_metadata::actual_count. Messages the call skipped over (seeking to a
+ * requested timestamp, or discarding after an overrun) contribute no entry, so
+ * a gap in `timestamp` between adjacent entries marks a discontinuity that
+ * ::BLADERF_META_STATUS_OVERRUN also reports.
+ *
+ * Chunk boundaries are in *message payload* coordinates, not buffer
+ * coordinates. Chunk `c` of a message covers payload samples
+ * `[c*L, (c+1)*L)` where `L = samples_per_message / chunks`, and this entry's
+ * samples begin at payload offset `msg_sample_offset`. So the chunk that
+ * applies to buffer sample `s` is
+ *
+ * @code
+ *     c = (msg_sample_offset + (s - sample_offset)) / L;
+ * @endcode
+ *
+ * `msg_sample_offset` is zero for every entry except, possibly, the first.
+ *
+ * @see bladerf_get_rx_gain_tags()
+ */
+struct bladerf_rx_gain_tag_msg {
+    /** Timestamp of the first sample of the *message*, which is
+     *  `msg_sample_offset` samples before the first sample this entry
+     *  describes */
+    bladerf_timestamp timestamp;
+
+    /** Index into the caller's sample buffer of the first sample this entry
+     *  describes */
+    uint32_t sample_offset;
+
+    /** Number of samples this entry describes. Always nonzero. */
+    uint32_t sample_count;
+
+    /** Offset within the message payload of the first sample this entry
+     *  describes. Nonzero only on a first entry whose message was already
+     *  partly consumed. */
+    uint16_t msg_sample_offset;
+
+    /** RX1 full gain-table index at the message's first sample */
+    uint8_t gain_index;
+
+    /** ::BLADERF_RX_GAIN_TAG_LOCKED and/or ::BLADERF_RX_GAIN_TAG_CARRIED */
+    uint8_t flags;
+
+    /** Gain index at the end of each chunk of this message. The number of
+     *  valid entries is ::bladerf_rx_gain_tag::chunks. */
+    uint8_t chunk_gain_index[8];
+
+    /** Reserved for future use; currently zero */
+    uint8_t reserved[4];
+};
 
 /** @} (End of STREAMING_FORMAT_METADATA) */
 

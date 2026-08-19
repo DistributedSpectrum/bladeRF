@@ -219,6 +219,16 @@ struct sync_meta {
                 uint8_t idx_max;  /* Max over every chunk seen this call */
                 uint8_t first_chunk[SYNC_GAIN_TAG_CHUNKS];
                 uint16_t count;   /* Number of messages this call */
+
+                /* Per-message capture for the current call, which the summary
+                 * fields above cannot hold: one entry per message that
+                 * contributed samples, in order, tiling what was returned.
+                 * Grown on demand and never shrunk, so a steady-state reader
+                 * allocates once. NULL if allocation failed, in which case the
+                 * summary still works. */
+                struct bladerf_rx_gain_tag_msg *msgs;
+                size_t msgs_cap;  /* Entries allocated */
+                size_t msgs_len;  /* Entries used this call */
             } gain_tag;
         };
 
@@ -276,6 +286,22 @@ int sync_rx(struct bladerf_sync *sync,
             unsigned int num_samples,
             struct bladerf_metadata *metadata,
             unsigned int timeout_ms);
+
+/**
+ * Copy out the per-message RFIC gain profiles captured by the most recent
+ * sync_rx() call.
+ *
+ * @param       sync        Initialized RX sync handle
+ * @param[out]  tags        Array to fill, or NULL to query the count
+ * @param[in]   max_tags    Entries `tags` can hold
+ * @param[out]  num_tags    Entries available, which may exceed max_tags
+ *
+ * @return 0 on success, BLADERF_ERR_* on failure
+ */
+int sync_get_gain_tags(struct bladerf_sync *sync,
+                       struct bladerf_rx_gain_tag_msg *tags,
+                       unsigned int max_tags,
+                       unsigned int *num_tags);
 
 int sync_tx(struct bladerf_sync *sync,
             void const *samples,

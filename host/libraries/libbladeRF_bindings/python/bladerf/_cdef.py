@@ -337,6 +337,17 @@ header = """
     uint16_t num_messages;
     uint8_t chunk_gain_index[8];
   };
+  struct bladerf_rx_gain_tag_msg
+  {
+    bladerf_timestamp timestamp;
+    uint32_t sample_offset;
+    uint32_t sample_count;
+    uint16_t msg_sample_offset;
+    uint8_t gain_index;
+    uint8_t flags;
+    uint8_t chunk_gain_index[8];
+    uint8_t reserved[4];
+  };
   int bladerf_interleave_stream_buffer(bladerf_channel_layout layout,
     bladerf_format format, unsigned int buffer_size, void *samples);
   int bladerf_deinterleave_stream_buffer(bladerf_channel_layout layout,
@@ -668,6 +679,9 @@ header = """
   int bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out);
   int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev, bladerf_channel ch,
     uint8_t gain_index, float *gain_db);
+  int bladerf_get_rx_gain_tags(struct bladerf *dev,
+    struct bladerf_rx_gain_tag_msg *tags, unsigned int max_tags,
+    unsigned int *num_tags);
   typedef enum
   {
     BLADERF_RFIC_RXFIR_BYPASS = 0,

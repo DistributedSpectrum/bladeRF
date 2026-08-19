@@ -1022,6 +1022,50 @@ class BladeRF:
             return None
         return gain_db[0]
 
+    def rx_gain_tags(self, max_tags=None):
+        """Per-message RFIC gain profiles for the most recent sync_rx() call.
+
+        The RxGainTag decoded from meta.reserved summarises the whole call and
+        can only carry chunk_gain_index for the first message. This returns one
+        RxGainTagMsg per message the call consumed, in order, each with its own
+        chunk profile and the slice of the sample buffer it applies to:
+
+            tags = dev.rx_gain_tags()
+            for t in tags:
+                iq[t.sample_offset:t.sample_offset + t.sample_count] ...
+
+        Call it after sync_rx() and before the next one. `max_tags` caps how
+        many are returned; the default retrieves all of them. Returns None when
+        the FPGA supplies no tag (needs v0.17.0 or later, and a metadata RX
+        format).
+        """
+        num = ffi.new("unsigned int *")
+
+        ret = libbladeRF.bladerf_get_rx_gain_tags(self.dev[0], ffi.NULL, 0, num)
+        if ret == -8:  # BLADERF_ERR_UNSUPPORTED
+            return None
+        _check_error(ret)
+
+        avail = num[0] if max_tags is None else min(num[0], max_tags)
+        if avail == 0:
+            return []
+
+        tags = ffi.new("struct bladerf_rx_gain_tag_msg[]", avail)
+        _check_error(libbladeRF.bladerf_get_rx_gain_tags(self.dev[0], tags,
+                                                         avail, num))
+
+        return [RxGainTagMsg(
+                    timestamp=int(t.timestamp),
+                    sample_offset=t.sample_offset,
+                    sample_count=t.sample_count,
+                    msg_sample_offset=t.msg_sample_offset,
+                    gain_index=t.gain_index,
+                    flags=t.flags,
+                    chunk_gain_index=tuple(t.chunk_gain_index),
+                    locked=bool(t.flags & RX_GAIN_TAG_LOCKED),
+                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED))
+                for t in tags]
+
     # Phase Detector/Frequency Synthesizer
 
     def get_pll_lock_state(self):
@@ -1327,6 +1371,15 @@ RX_GAIN_TAG_CHANGED = 1 << 0
 # slow-attack and hybrid it is always clear. Use gain_index_min == gain_index_max
 # with `changed` False to decide whether the gain was steady in any mode.
 RX_GAIN_TAG_LOCKED = 1 << 1
+# Per-message entries only: this message's header was consumed by an earlier
+# sync_rx() call, so its profile was carried over rather than read during the
+# call that produced the entry.
+RX_GAIN_TAG_CARRIED = 1 << 2
+
+RxGainTagMsg = collections.namedtuple(
+    "RxGainTagMsg",
+    "timestamp sample_offset sample_count msg_sample_offset gain_index flags "
+    "chunk_gain_index locked carried")
 
 
 def rx_gain_tag(meta):

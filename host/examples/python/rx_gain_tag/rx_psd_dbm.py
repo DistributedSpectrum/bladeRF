@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Capture contiguous IQ and produce a Welch PSD calibrated in dBm.
 
-Captures N contiguous samples, applies the per-chunk RFIC gain from each packet's
-metadata header, and computes a Welch PSD normalised so that the linear sum of any
-set of bins is the absolute power in those bins. That makes RSSI a sum:
+Captures N contiguous samples in a *single* bladerf_sync_rx() call, applies the
+per-chunk RFIC gain of every packet the call spanned, and computes a Welch PSD
+normalised so that the linear sum of any set of bins is the absolute power in
+those bins. That makes RSSI a sum:
 
     rssi_dbm = 10*log10(sum(P_lin[k] for k in bins_of_interest))
 
@@ -22,6 +23,14 @@ Two things about this are easy to get wrong.
    Then sum(P) == mean(|y|^2). This is scipy's scaling='density' multiplied by
    the bin width, NOT scaling='spectrum' (which normalises by sum(w)^2 so a tone's
    peak bin reads its amplitude, but summing bins does not give total power).
+
+The gain profile for a whole multi-packet read comes from
+bladerf_get_rx_gain_tags() (dev.rx_gain_tags()), which returns one entry per
+packet the call consumed, each with its own four-chunk profile and the slice of
+the sample buffer it applies to. The summary tag overlaid on
+bladerf_metadata.reserved cannot do this job: it has room for only the *first*
+packet's chunk_gain_index, so with one packet per call it is exact and with 129
+packets per call it describes 1/129th of the data.
 
 The gain relation used is the one the tag was built for and validated against:
 
@@ -84,117 +93,153 @@ def rssi_dbm(p_lin, mask):
     return 10.0 * np.log10(total) if total > 0 else float("-inf")
 
 
-def capture(dev, ch, nsamples, want, args):
-    """Contiguous capture. Returns (iq_normalised, gain_db_per_sample, info)."""
+def gain_per_sample(tags, msg_samples, count, gdb):
+    """Per-sample gain in dB across one read, from one tag per packet.
+
+    Chunk boundaries are in *packet payload* coordinates while the output is in
+    buffer coordinates, and the two differ whenever a read starts part way into a
+    packet (msg_sample_offset) -- so each chunk is clipped to the part of its
+    packet the read actually returned, then translated.
+
+    A chunk whose end index differs from its start contains a gain transition at
+    an unknown position. Those are split at the midpoint: the first half takes the
+    gain the chunk started at, the second half the gain it ended at. If the
+    transition is uniformly distributed within the chunk that is the midpoint
+    estimator, halving the expected mis-assigned fraction from 0.50 of the chunk
+    to 0.25 (worst case 1.00 to 0.50). In slow-attack, where a decision moves the
+    gain by at most 2 dB and 4.3% of packets contain one, the residual is under
+    0.01 dB on total power -- so nothing has to be discarded.
+
+    Returns (gain_db, samples_filled, ambiguous_samples). Entries tile the
+    returned samples, so samples_filled == count unless the tag array was
+    truncated.
+    """
+    gain = np.zeros(count, dtype=np.float32)
+    clen = msg_samples // CHUNKS
+    filled = 0
+    ambiguous = 0
+
+    for t in tags:
+        # base index at the packet's first sample, then the index at the end of
+        # each chunk: a CHUNKS+1 point profile across the packet
+        pts = [t.gain_index] + list(t.chunk_gain_index[:CHUNKS])
+        end = t.msg_sample_offset + t.sample_count
+
+        for c in range(CHUNKS):
+            lo = max(c * clen, t.msg_sample_offset)
+            hi = min((c + 1) * clen if c < CHUNKS - 1 else msg_samples, end)
+            if hi <= lo:
+                continue                      # chunk outside this entry's span
+            blo = t.sample_offset + (lo - t.msg_sample_offset)
+            bhi = t.sample_offset + (hi - t.msg_sample_offset)
+
+            if pts[c] == pts[c + 1]:
+                gain[blo:bhi] = gdb(pts[c + 1])
+            else:
+                mid = blo + (bhi - blo) // 2
+                gain[blo:mid] = gdb(pts[c])
+                gain[mid:bhi] = gdb(pts[c + 1])
+                ambiguous += bhi - blo
+            filled += bhi - blo
+
+    return gain, filled, ambiguous
+
+
+def capture(dev, ch, msg_samples, want, args):
+    """One contiguous read of `want` samples.
+
+    Returns (iq_normalised, gain_db_per_sample, info).
+
+    A single sync_rx() call is contiguous by construction: the sync layer walks
+    consecutive packets and, if it ever meets a timestamp discontinuity, stops
+    there and reports BLADERF_META_STATUS_OVERRUN with a short actual_count. So
+    the check is simply "did it return everything asked for", and a short read is
+    retried rather than stitched.
+    """
     import time
     ffi = _bladerf.ffi
-    bufsize = nsamples + 4
     meta = ffi.new("struct bladerf_metadata *")
-    buf = bytearray(4 * bufsize)
+    buf = bytearray(4 * want)
 
     # Let the AGC converge before capturing. Streaming starts at maximum gain, so
     # without this the capture contains the whole ramp down -- and any part the
     # front end compressed at high gain is nonlinear, which no amount of gain
     # correction can undo.
     if args.settle > 0:
+        settle_buf = bytearray(4 * msg_samples)
         t0 = time.monotonic()
         while time.monotonic() - t0 < args.settle:
             meta.flags = 0x80000000
             meta.timestamp = 0
             meta.status = 0
             try:
-                dev.sync_rx(buf, nsamples, 3500, meta)
+                dev.sync_rx(settle_buf, msg_samples, 3500, meta)
             except Exception:
                 break
 
-    npkt = -(-want // nsamples)
-    iq = np.empty(npkt * nsamples, dtype=np.complex64)
-    gain = np.empty(npkt * nsamples, dtype=np.float32)
-
+    # The read itself takes want/fs seconds, so the timeout has to cover that
+    # plus the time the samples spend queued in the buffer pool.
+    timeout_ms = int(1000.0 * want / args.sample_rate) + 3000
     cache = {}
-    next_ts = None
-    got = 0
-    gaps = 0
-    ambiguous = 0
-    prev_ts = None
-    tries = 0
 
-    while got < npkt:
-        if next_ts is None:
-            meta.flags = 0x80000000
-            meta.timestamp = 0
-        else:
-            meta.flags = 0
-            meta.timestamp = next_ts
+    def gdb(idx):
+        """Index -> dB, memoised. In FPGA tuning mode each miss costs a USB round
+        trip to read the LO frequency, and there are only a handful of distinct
+        indices in a capture."""
+        if idx not in cache:
+            g = dev.rx_gain_tag_to_gain_db(ch, idx)
+            if g is None:
+                raise RuntimeError(f"gain index {idx} outside the gain table. Is "
+                                   f"RFIC register 0x035 still 0x16?")
+            cache[idx] = g
+        return cache[idx]
+
+    short = 0
+    for attempt in range(args.max_tries):
+        meta.flags = 0x80000000                    # RX_NOW: start wherever we are
+        meta.timestamp = 0
         meta.status = 0
-        try:
-            dev.sync_rx(buf, nsamples, 3500, meta)
-        except _bladerf.TimePastError:
-            # fell behind; restart the capture so it stays contiguous
-            tries += 1
-            if tries > 20:
-                raise RuntimeError("could not obtain a contiguous capture")
-            next_ts, got, gaps, ambiguous, prev_ts = None, 0, 0, 0, None
-            continue
-        ts = int(meta.timestamp)
-        if prev_ts is not None and ts != prev_ts + nsamples:
-            # discontinuity: the capture would be invalid, start over
-            gaps += 1
-            next_ts, got, ambiguous, prev_ts = None, 0, 0, None
-            continue
-        prev_ts = ts
-        next_ts = ts + nsamples
+        dev.sync_rx(buf, want, timeout_ms, meta)
 
-        tag = _bladerf.rx_gain_tag(meta)
-        if tag is None:
+        if meta.actual_count != want or (meta.status & 0x1):
+            # discontinuity part way through; the capture would be invalid
+            short += 1
+            continue
+
+        tags = dev.rx_gain_tags()
+        if tags is None:
             raise RuntimeError("no gain tag: needs FPGA v0.17.0+ and a metadata "
                                "RX format")
+        if not tags:
+            raise RuntimeError("the read returned no gain tag entries")
 
-        v = np.frombuffer(buf, dtype=np.int16, count=2 * nsamples)
-        sl = slice(got * nsamples, (got + 1) * nsamples)
-        iq[sl] = (v[0::2].astype(np.float32)
-                  + 1j * v[1::2].astype(np.float32)) / FULL_SCALE
+        summary = _bladerf.rx_gain_tag(meta)
+        gain, filled, ambiguous = gain_per_sample(tags, msg_samples, want, gdb)
+        if filled != want:
+            raise RuntimeError(f"gain tags covered {filled} of {want} samples")
 
-        # Per-sample gain, piecewise constant over the packet's chunks. base is
-        # the index at sample 0; chunk_gain_index[i] is the index at the END of
-        # chunk i. A chunk whose end differs from its start contains the
-        # transition somewhere inside, at an unknown position.
-        #
-        # For those, split the chunk at its midpoint: the first half takes the
-        # gain it started at, the second half the gain it ended at. If the
-        # transition is uniformly distributed within the chunk, that is the
-        # midpoint estimator and it halves the expected mis-assigned fraction
-        # from 0.50 of the chunk (assigning it all one value) to 0.25, worst case
-        # 1.00 to 0.50. In slow-attack, where a decision moves the gain by at
-        # most 2 dB and 4.3% of packets contain one, the residual works out below
-        # 0.01 dB on total power -- so nothing has to be discarded.
-        clen = nsamples // CHUNKS
-        pts = [tag.gain_index] + list(tag.chunk_gain_index[:CHUNKS])
+        v = np.frombuffer(buf, dtype=np.int16, count=2 * want)
+        iq = (v[0::2].astype(np.float32)
+              + 1j * v[1::2].astype(np.float32)) / FULL_SCALE
 
-        def gdb(idx):
-            if idx not in cache:
-                g = dev.rx_gain_tag_to_gain_db(ch, idx)
-                if g is None:
-                    raise RuntimeError(f"gain index {idx} outside the table")
-                cache[idx] = g
-            return cache[idx]
+        info = {"packets": len(tags), "restarts": short,
+                "ambiguous_samples": ambiguous,
+                "carried": sum(1 for t in tags if t.carried),
+                # num_messages counts headers read, which can exceed the number
+                # of entries: a header read but contributing no samples -- the
+                # last one before a discontinuity ended the call, or one walked
+                # past while seeking to a requested timestamp -- is counted there
+                # and dropped from the array, which only holds entries that
+                # describe samples.
+                "num_messages": summary.num_messages,
+                "index_min": summary.gain_index_min,
+                "index_max": summary.gain_index_max,
+                "distinct_gains": sorted(set(cache.values()))}
+        return iq, gain, info
 
-        for i in range(CHUNKS):
-            lo = got * nsamples + i * clen
-            hi = lo + clen if i < CHUNKS - 1 else (got + 1) * nsamples
-            if pts[i] == pts[i + 1]:
-                gain[lo:hi] = gdb(pts[i + 1])
-            else:
-                mid = lo + (hi - lo) // 2
-                gain[lo:mid] = gdb(pts[i])
-                gain[mid:hi] = gdb(pts[i + 1])
-                ambiguous += hi - lo
-        got += 1
-
-    info = {"packets": npkt, "restarts": gaps + tries,
-            "ambiguous_samples": ambiguous,
-            "distinct_gains": sorted(set(cache.values()))}
-    return iq[:want], gain[:want], info
+    raise RuntimeError(f"could not obtain {want} contiguous samples in "
+                       f"{args.max_tries} attempts ({short} short reads). Try a "
+                       f"larger --num-buffers, or a smaller -n.")
 
 
 def main():
@@ -222,8 +267,17 @@ def main():
                          "the capture starts at maximum gain and walks down, and "
                          "any samples the front end compressed at high gain "
                          "cannot be rescued by a gain correction")
-    ap.add_argument("--num-buffers", type=int, default=1024)
+    ap.add_argument("--num-buffers", type=int, default=256)
     ap.add_argument("--num-transfers", type=int, default=32)
+    ap.add_argument("--buffer-size", type=int, default=16384, metavar="SAMPLES",
+                    help="samples per USB buffer, rounded up to a whole number "
+                         "of packets (2048 on SuperSpeed). Larger buffers mean "
+                         "fewer USB transfers per second; num_buffers * "
+                         "buffer_size / sample_rate is how long the reader may "
+                         "stall before the capture has to restart")
+    ap.add_argument("--max-tries", type=int, default=20, metavar="N",
+                    help="restart the capture at most N times when a "
+                         "discontinuity truncates it")
     ap.add_argument("--rssi", metavar="LO:HI",
                     help="also report the RSSI between two baseband offsets in "
                          "MHz. Use = for negative values, which argparse would "
@@ -273,9 +327,13 @@ def main():
     speed = dev.get_device_speed()
     nsamples = 2044 if "super" in str(speed).lower() else 1020
 
+    if args.num_transfers >= args.num_buffers:
+        print("--num-transfers must be less than --num-buffers", file=sys.stderr)
+        return 2
+
     dev.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
                     fmt=_bladerf.Format.SC16_Q11_META,
-                    num_buffers=args.num_buffers, buffer_size=nsamples + 4,
+                    num_buffers=args.num_buffers, buffer_size=args.buffer_size,
                     num_transfers=args.num_transfers, stream_timeout=3500)
     dev.enable_module(ch, True)
     try:
@@ -296,10 +354,17 @@ def main():
 
     print(f"FPGA {fpga}, {args.freq/1e6:.3f} MHz, "
           f"{args.sample_rate/1e6:.3f} Msps, {args.gain_mode} AGC")
+    slack_ms = args.num_buffers * args.buffer_size / args.sample_rate * 1e3
     print(f"capture     : 2^{args.log2n} = {want} samples "
-          f"({want/args.sample_rate*1e3:.2f} ms), {info['packets']} packets, "
-          f"contiguous (restarts: {info['restarts']})")
+          f"({want/args.sample_rate*1e3:.2f} ms) in one sync_rx(), "
+          f"{info['packets']} packets, contiguous "
+          f"(restarts: {info['restarts']})")
+    print(f"buffers     : {args.num_buffers} x {args.buffer_size} samples "
+          f"= {slack_ms:.1f} ms of slack; {info['packets']} gain tags, "
+          f"{info['num_messages']} headers read"
+          f"{', 1 carried from the previous call' if info['carried'] else ''}")
     print(f"gain        : {', '.join(f'{g:.2f}' for g in info['distinct_gains'])} dB"
+          f" (index {info['index_min']}..{info['index_max']})"
           f"{'' if calibrated else '  [UNCALIBRATED -- values carry an offset]'}")
     amb = info["ambiguous_samples"]
     print(f"              {amb} samples ({100*amb/want:.2f}%) sit in a chunk "

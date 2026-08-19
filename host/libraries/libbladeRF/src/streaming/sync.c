@@ -375,6 +375,17 @@ void sync_deinit(struct bladerf_sync *sync)
             sync->buf_mgmt.buffer_seq = NULL;
         }
 
+        /* gain_tag shares a union with the TX-only members, so this pointer is
+         * only a pointer on an RX handle. */
+        if ((sync->stream_config.layout & BLADERF_DIRECTION_MASK) ==
+                BLADERF_RX &&
+            sync->meta.gain_tag.msgs != NULL) {
+            free(sync->meta.gain_tag.msgs);
+            sync->meta.gain_tag.msgs     = NULL;
+            sync->meta.gain_tag.msgs_cap = 0;
+            sync->meta.gain_tag.msgs_len = 0;
+        }
+
         MUTEX_DESTROY(&sync->lock);
 
         sync->initialized = false;
@@ -493,15 +504,140 @@ static inline unsigned int timestamp_to_msg(struct bladerf_sync *s, uint64_t t)
  * so a call that consumes no header can still report a gain. */
 static inline void reset_gain_tag(struct bladerf_sync *s)
 {
-    s->meta.gain_tag.seen    = false;
-    s->meta.gain_tag.changed = false;
-    s->meta.gain_tag.base    = 0;
-    s->meta.gain_tag.lock    = false;
-    s->meta.gain_tag.idx_min = 0;
-    s->meta.gain_tag.idx_max = 0;
-    s->meta.gain_tag.count   = 0;
+    s->meta.gain_tag.seen     = false;
+    s->meta.gain_tag.changed  = false;
+    s->meta.gain_tag.base     = 0;
+    s->meta.gain_tag.lock     = false;
+    s->meta.gain_tag.idx_min  = 0;
+    s->meta.gain_tag.idx_max  = 0;
+    s->meta.gain_tag.count    = 0;
+    s->meta.gain_tag.msgs_len = 0;
     memset(s->meta.gain_tag.first_chunk, 0,
            sizeof(s->meta.gain_tag.first_chunk));
+}
+
+/* Make room to capture one entry per message this call can consume.
+ *
+ * A message contributes an entry only if it contributed samples, so the bound is
+ * the number of messages num_samples can span: a partial one at each end plus
+ * whole ones between. Growing only, so a reader that keeps its request size
+ * constant allocates on its first call and never again. Failure is not fatal --
+ * msgs stays NULL and only the per-message detail is lost.
+ */
+static void gain_tag_reserve(struct bladerf_sync *s, unsigned int num_samples)
+{
+    struct bladerf_rx_gain_tag_msg *msgs;
+    size_t need;
+
+    if (!s->meta.gain_tag.supported || s->meta.samples_per_msg == 0) {
+        return;
+    }
+
+    need = (size_t)num_samples / s->meta.samples_per_msg + 2;
+
+    if (need <= s->meta.gain_tag.msgs_cap) {
+        return;
+    }
+
+    msgs = realloc(s->meta.gain_tag.msgs, need * sizeof(msgs[0]));
+    if (msgs == NULL) {
+        log_debug("%s: could not size the gain tag capture to %zu messages. "
+                  "Per-message profiles are unavailable; the summary in "
+                  "bladerf_metadata.reserved is unaffected.\n",
+                  __FUNCTION__, need);
+        return;
+    }
+
+    s->meta.gain_tag.msgs     = msgs;
+    s->meta.gain_tag.msgs_cap = need;
+}
+
+/* Claim the entry that will describe the message being started.
+ *
+ * Reuses the last entry when it never received any samples, which is how
+ * messages that were seeked over or discarded drop out of the array rather than
+ * consuming capacity: the reservation above sizes for messages that contribute,
+ * not for messages that are merely walked past.
+ */
+static struct bladerf_rx_gain_tag_msg *gain_tag_claim(struct bladerf_sync *s)
+{
+    struct bladerf_rx_gain_tag_msg *e;
+
+    if (s->meta.gain_tag.msgs == NULL) {
+        return NULL;
+    }
+
+    if (s->meta.gain_tag.msgs_len > 0 &&
+        s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len - 1].sample_count == 0) {
+        e = &s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len - 1];
+    } else if (s->meta.gain_tag.msgs_len < s->meta.gain_tag.msgs_cap) {
+        e = &s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len++];
+    } else {
+        /* Unreachable given the reservation, but capacity is the invariant that
+         * keeps the writes below in bounds, so check it rather than assume it. */
+        log_debug("%s: gain tag capture full at %zu messages\n", __FUNCTION__,
+                  s->meta.gain_tag.msgs_cap);
+        return NULL;
+    }
+
+    memset(e, 0, sizeof(*e));
+    return e;
+}
+
+/* Timestamp of the first sample of the message being consumed. curr_msg_off is
+ * in samples while a timestamp counts sample periods, hence samples_per_ts. */
+static inline uint64_t gain_tag_msg_start_ts(struct bladerf_sync *s)
+{
+    return s->meta.curr_timestamp -
+           s->meta.curr_msg_off / s->meta.samples_per_ts;
+}
+
+/* Attribute `count` samples, landing at `sample_offset` in the caller's buffer,
+ * to the message they came out of. Call before curr_msg_off advances. */
+static void gain_tag_record_samples(struct bladerf_sync *s,
+                                    unsigned int sample_offset,
+                                    unsigned int count)
+{
+    struct bladerf_rx_gain_tag_msg *e;
+    const uint64_t ts = gain_tag_msg_start_ts(s);
+
+    if (!s->meta.gain_tag.supported || s->meta.gain_tag.msgs == NULL ||
+        count == 0) {
+        return;
+    }
+
+    if (s->meta.gain_tag.msgs_len > 0 &&
+        s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len - 1].timestamp == ts) {
+        e = &s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len - 1];
+    } else {
+        /* No header for this message was consumed during this call, so an
+         * earlier one consumed it. Describe it from the retained profile, so the
+         * array still covers every sample returned. */
+        if (!s->meta.gain_tag.known) {
+            return;
+        }
+
+        e = gain_tag_claim(s);
+        if (e == NULL) {
+            return;
+        }
+
+        e->timestamp  = ts;
+        e->gain_index = s->meta.gain_tag.last_base;
+        e->flags      = BLADERF_RX_GAIN_TAG_CARRIED;
+        if (s->meta.gain_tag.last_lock) {
+            e->flags |= BLADERF_RX_GAIN_TAG_LOCKED;
+        }
+        memcpy(e->chunk_gain_index, s->meta.gain_tag.last_chunk,
+               sizeof(s->meta.gain_tag.last_chunk));
+    }
+
+    if (e->sample_count == 0) {
+        e->sample_offset     = sample_offset;
+        e->msg_sample_offset = (uint16_t)s->meta.curr_msg_off;
+    }
+
+    e->sample_count += count;
 }
 
 /* Fold one message's gain profile into the running summary for this sync_rx()
@@ -509,6 +645,7 @@ static inline void reset_gain_tag(struct bladerf_sync *s)
 static inline void accumulate_gain_tag(struct bladerf_sync *s,
                                        const uint8_t *header)
 {
+    struct bladerf_rx_gain_tag_msg *e;
     struct metadata_gain_tag tag;
     unsigned int i;
 
@@ -565,6 +702,18 @@ static inline void accumulate_gain_tag(struct bladerf_sync *s,
     if (s->meta.gain_tag.count < UINT16_MAX) {
         s->meta.gain_tag.count++;
     }
+
+    /* Open this message's own entry. It stays empty, and is handed back on the
+     * next message, unless samples from this one are actually returned. */
+    e = gain_tag_claim(s);
+    if (e != NULL) {
+        e->timestamp  = s->meta.msg_timestamp;
+        e->gain_index = tag.base;
+        if (tag.lock) {
+            e->flags |= BLADERF_RX_GAIN_TAG_LOCKED;
+        }
+        memcpy(e->chunk_gain_index, tag.chunk, sizeof(tag.chunk));
+    }
 }
 
 /* Publish the accumulated profile into the caller's metadata. Always writes the
@@ -576,6 +725,14 @@ static inline void publish_gain_tag(struct bladerf_sync *s,
     struct bladerf_rx_gain_tag tag;
 
     memset(user_meta->reserved, 0, sizeof(user_meta->reserved));
+
+    /* A trailing message whose header was read but whose samples this call did
+     * not return belongs to the next call, which will re-derive it from the
+     * retained profile. Drop it so every entry describes samples. */
+    if (s->meta.gain_tag.msgs != NULL && s->meta.gain_tag.msgs_len > 0 &&
+        s->meta.gain_tag.msgs[s->meta.gain_tag.msgs_len - 1].sample_count == 0) {
+        s->meta.gain_tag.msgs_len--;
+    }
 
     if (!s->meta.gain_tag.supported || !s->meta.gain_tag.known) {
         return;
@@ -660,6 +817,7 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
             user_meta->status = 0;
             target_timestamp = user_meta->timestamp;
             reset_gain_tag(s);
+            gain_tag_reserve(s, num_samples);
         }
     }
 
@@ -915,6 +1073,9 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
                                         samples2bytes(s, s->meta.curr_msg_off),
                                    samples2bytes(s, samples_to_copy));
 
+                            gain_tag_record_samples(s, samples_returned,
+                                                    samples_to_copy);
+
                             samples_returned += samples_to_copy;
                             s->meta.curr_msg_off += samples_to_copy;
 
@@ -1040,6 +1201,46 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
 out:
     MUTEX_UNLOCK(&s->lock);
 
+    return status;
+}
+
+int sync_get_gain_tags(struct bladerf_sync *sync,
+                       struct bladerf_rx_gain_tag_msg *tags,
+                       unsigned int max_tags,
+                       unsigned int *num_tags)
+{
+    unsigned int avail;
+    int status = 0;
+
+    if (sync == NULL || num_tags == NULL || !sync->initialized) {
+        return BLADERF_ERR_INVAL;
+    }
+
+    if ((sync->stream_config.layout & BLADERF_DIRECTION_MASK) != BLADERF_RX) {
+        return BLADERF_ERR_INVAL;
+    }
+
+    MUTEX_LOCK(&sync->lock);
+
+    if (!sync->meta.gain_tag.supported) {
+        status = BLADERF_ERR_UNSUPPORTED;
+        goto out;
+    }
+
+    avail = (unsigned int)sync->meta.gain_tag.msgs_len;
+
+    if (tags != NULL && max_tags > 0) {
+        const unsigned int n = uint_min(avail, max_tags);
+
+        if (n > 0) {
+            memcpy(tags, sync->meta.gain_tag.msgs, n * sizeof(tags[0]));
+        }
+    }
+
+    *num_tags = avail;
+
+out:
+    MUTEX_UNLOCK(&sync->lock);
     return status;
 }
 
