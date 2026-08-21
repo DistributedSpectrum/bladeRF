@@ -5,6 +5,46 @@ For more detailed information, please see the git change log and issue tracker
 hosted on GitHub: https://github.com/Nuand/bladeRF
 ================================================================================
 
+v2.7.0 (2026-08-21)
+--------------------------------
+
+This version of libbladeRF is intended for use with:
+
+  FX3 Firmware v2.6.0
+  FPGA         v0.17.0
+
+New Features:
+ * bladeRF 2.0: Added bladerf_get_rx_gain_tags(), returning the RFIC gain
+   profile of every packet a bladerf_sync_rx() call consumed, so the gain that
+   applied to each sample of a read of any size can be reconstructed
+ * bladeRF 2.0: Added bladerf_rx_gain_tag_to_gain_db(), converting a tagged
+   gain-table index to dB at the current LO
+ * Added python bindings for both calls, plus examples under
+   host/examples/python/rx_gain_tag
+
+Fixes:
+ * bladeRF 2.0: bladerf_enable_gain_calibration() no longer leaves the channel
+   in manual gain control. It called bladerf_set_gain() with no mode restore,
+   which silently and permanently disabled AGC for any caller that loaded a
+   gain calibration table
+ * bladeRF 2.0: bladerf_enable_gain_calibration() now takes dev->lock and
+   returns BLADERF_ERR_INVAL when no table is loaded, instead of returning
+   success without enabling anything
+ * bladeRF 2.0: bladerf_load_gain_calibration() preserves the commanded gain
+   across the load rather than resetting it to 0 dB
+ * bladeRF 2.0: applying a gain correction on retune is skipped under AGC,
+   where the AD9361 discards the write and libbladeRF could still emit
+   out-of-range warnings for a write that never landed
+ * bladeRF 2.0: bladerf_print_gain_calibration() no longer reports a table as
+   loaded when it is not, and reports the current gain mode
+
+Notes:
+ * Both gain-tag calls require FPGA v0.17.0 or later and return
+   BLADERF_ERR_UNSUPPORTED otherwise. The tag occupies the whole previously
+   reserved RX header word with no in-band marker, so the FPGA version is the
+   only safe discriminator
+ * ABI is unchanged for existing callers; the soname remains libbladeRF.so.2
+
 v2.6.1 (2026-05-04)
 --------------------------------
  * Added automatic LZMA compression for bladeRF1 FPGA autoload writes when
