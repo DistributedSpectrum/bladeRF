@@ -3161,8 +3161,23 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     CHECK_BOARD_STATE(STATE_INITIALIZED);
     NULL_CHECK(gain_db);
 
+    struct bladerf2_board_data *board_data = dev->board_data;
+
     if (BLADERF_CHANNEL_IS_TX(ch)) {
         return BLADERF_ERR_INVAL;
+    }
+
+    /* Gated on the same capability as the tags themselves. An older image has
+     * no gain index to convert, so any value reaching here came from somewhere
+     * else and would be turned into a plausible-looking dB figure. */
+    if (!have_cap(board_data->capabilities, BLADERF_CAP_FPGA_RX_GAIN_TAG)) {
+        log_debug("This FPGA version (%u.%u.%u) does not tag RX packets with "
+                  "the RFIC gain index.\n",
+                  board_data->fpga_version.major,
+                  board_data->fpga_version.minor,
+                  board_data->fpga_version.patch);
+
+        return BLADERF_ERR_UNSUPPORTED;
     }
 
     WITH_MUTEX(&dev->lock, {

@@ -203,6 +203,12 @@ int CALL_CONV bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out);
  *        the LO frequency, so it is not free to call per received buffer. The
  *        result only changes when the gain index or the tuned frequency does.
  *
+ * @note  Requires FPGA v0.17.0 or later (::BLADERF_CAP_FPGA_RX_GAIN_TAG), the
+ *        same gate as bladerf_get_rx_gain_tags(). An older image supplies no
+ *        gain index, so anything reaching here came from elsewhere and would be
+ *        converted into a plausible-looking figure; ::BLADERF_ERR_UNSUPPORTED
+ *        is returned instead.
+ *
  * @see   bladerf_load_gain_calibration(), bladerf_get_gain()
  *
  * @param      dev         Device handle
