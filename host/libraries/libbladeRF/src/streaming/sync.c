@@ -877,7 +877,6 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
 
     b = &s->buf_mgmt;
     samples_per_buffer = s->stream_config.samples_per_buffer;
-    log_verbose("%s: stream format=%d state=%d\n", __FUNCTION__, (int)s->stream_config.format, (int)s->state);
 
     log_verbose("%s: Requests %u samples.\n", __FUNCTION__, num_samples);
 
@@ -1082,7 +1081,6 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
                         assert(!"Invalid stream format");
                         status = BLADERF_ERR_UNEXPECTED;
                 }
-                log_verbose("%s: BUFFER_READY -> state=%d (format=%d)\n", __FUNCTION__, (int)s->state, (int)s->stream_config.format);
 
                 MUTEX_UNLOCK(&b->lock);
                 break;
@@ -1398,20 +1396,8 @@ out:
     return status;
 }
 
-/* Try to ship the buffer the worker callback was told to ship, and take
- * submission duty back if that works.
- *
- * Assumes the buffer lock is held. Drops it around the submission, the same
- * way advance_tx_buffer() does, because submitting takes the stream lock.
- */
-/* Oldest buffer the callback still owes a submission for, or INVALID.
- *
- * cons_i alone is not enough. When transfers are cancelled - a teardown, an
- * error, a timeout - libusb returns them through its own callback path, which
- * never runs the sync callback, so cons_i keeps pointing at a buffer that has
- * already been marked IN_FLIGHT and will never come back. The data waiting to
- * go out is in the FULL buffers behind it.
- */
+static unsigned int oldest_full_buffer(struct buffer_mgmt *b);
+
 /* Is submission parked on a callback with data waiting behind it?
  *
  * Submission duty is handed to the worker callback when every transfer is
@@ -1420,13 +1406,11 @@ out:
  * cancellation path never reaches it. So the ring can end up with buffers
  * FULL, the duty with the callback, and nothing able to move either.
  *
- * ⛔ Buffer status is not a reliable count of live transfers: IN_FLIGHT is
- * only cleared in the sync callback, so a cancelled transfer leaves its
- * buffer marked IN_FLIGHT forever. Which is exactly why this asks whether
- * anything is waiting, not how many transfers are out.
+ * Note that buffer status is not a reliable count of live transfers:
+ * IN_FLIGHT is only cleared in the sync callback, so a cancelled transfer
+ * leaves its buffer marked IN_FLIGHT forever. Which is exactly why this asks
+ * whether anything is waiting, not how many transfers are out.
  */
-static unsigned int oldest_full_buffer(struct buffer_mgmt *b);
-
 static bool tx_submission_parked(struct buffer_mgmt *b)
 {
     if (b->submitter == SYNC_TX_SUBMITTER_CALLBACK) {
@@ -1446,6 +1430,14 @@ static bool tx_submission_parked(struct buffer_mgmt *b)
            oldest_full_buffer(b) != BUFFER_MGMT_INVALID_INDEX;
 }
 
+/* Oldest buffer the callback still owes a submission for, or INVALID.
+ *
+ * cons_i alone is not enough. When transfers are cancelled - a teardown, an
+ * error, a timeout - libusb returns them through its own callback path, which
+ * never runs the sync callback, so cons_i keeps pointing at a buffer that has
+ * already been marked IN_FLIGHT and will never come back. The data waiting to
+ * go out is in the FULL buffers behind it.
+ */
 static unsigned int oldest_full_buffer(struct buffer_mgmt *b)
 {
     unsigned int i, idx;
@@ -1466,6 +1458,12 @@ static unsigned int oldest_full_buffer(struct buffer_mgmt *b)
     return BUFFER_MGMT_INVALID_INDEX;
 }
 
+/* Try to ship the buffer the worker callback was told to ship, and take
+ * submission duty back if that works.
+ *
+ * Assumes the buffer lock is held. Drops it around the submission, the same
+ * way advance_tx_buffer() does, because submitting takes the stream lock.
+ */
 static int reclaim_tx_submission(struct bladerf_sync *s, struct buffer_mgmt *b)
 {
     const unsigned int idx = oldest_full_buffer(b);
@@ -1789,32 +1787,25 @@ int sync_tx(struct bladerf_sync *s,
                 if (b->status[b->prod_i] == SYNC_BUFFER_EMPTY) {
                     s->state = SYNC_STATE_BUFFER_READY;
                 } else {
-                    /* Submission may have been handed to the worker callback
-                     * back when every transfer was busy. The callback only
-                     * runs when a transfer completes, so if none ever does,
-                     * nothing hands submission back and this wait can never
-                     * be satisfied: the ring stays full, sync_tx() times out,
-                     * and only tearing the stream down clears it.
-                     *
-                     * Try the deferred buffer ourselves first. The attempt is
-                     * non-blocking, so it only succeeds if a transfer really
-                     * is free - if they are all still busy this changes
-                     * nothing and we wait exactly as before.
-                     */
                     /* Do not start waiting while the ring is in a state no
                      * callback can get it out of. Submission duty sits with
                      * the callback, buffers are waiting to go out, and the
                      * callback only runs when a transfer completes - so if
-                     * none can, waiting just burns the timeout. Try the
-                     * submission here first; the attempt is non-blocking, so
-                     * when transfers really are busy nothing changes and we
-                     * wait exactly as before. */
-                    /* Loop: one submission is not enough. Each buffer still
-                     * FULL behind the first would need its own callback to be
-                     * shipped, and the callbacks that would have run were
-                     * consumed by the cancellation path. Keep going while the
-                     * backend accepts buffers - WOULD_BLOCK leaves the ring
-                     * untouched, which ends the loop. */
+                     * none can, waiting just burns the timeout: the ring
+                     * stays full, sync_tx() times out, and only tearing the
+                     * stream down clears it.
+                     *
+                     * Try the submission here first. The attempt is
+                     * non-blocking, so when transfers really are busy nothing
+                     * changes and we wait exactly as before.
+                     *
+                     * It has to loop: one submission is not enough. Each
+                     * buffer still FULL behind the first would need its own
+                     * callback to be shipped, and the callbacks that would
+                     * have run were consumed by the cancellation path. Keep
+                     * going while the backend accepts buffers - WOULD_BLOCK
+                     * leaves the ring untouched, which ends the loop.
+                     */
                     while (status == 0 && tx_submission_parked(b)) {
                         const unsigned int before = b->cons_i;
 
