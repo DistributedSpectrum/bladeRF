@@ -10,7 +10,7 @@ _bladerf_device() {
   # Try to get device serials dynamically
   if (( $+commands[bladeRF-cli] )); then
     local serials
-    serials=(${(f)"$(bladeRF-cli -p 2>/dev/null | grep -E '^\s*Serial:' | awk '{print $2}')"})
+    serials=(${(f)"$(bladeRF-cli -p 2>/dev/null | grep -E '^[[:space:]]*Serial:' | awk '{print $2}')"})
     
     if [[ ${#serials} -gt 0 ]]; then
       # Build device specs with actual serial numbers

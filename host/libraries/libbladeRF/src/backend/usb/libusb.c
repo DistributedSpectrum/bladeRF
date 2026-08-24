@@ -1518,7 +1518,7 @@ static int lusb_stream(void *driver, struct bladerf_stream *stream,
         MUTEX_LOCK(&stream->lock);
         if (stream->state == STREAM_SHUTTING_DOWN) {
             if (stream_data->num_avail == stream_data->num_transfers) {
-                stream->state = STREAM_DONE;
+                mark_stream_done(stream);
             } else {
                 cancel_all_transfers(stream);
             }
