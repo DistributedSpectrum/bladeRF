@@ -127,6 +127,7 @@ int async_init_stream(struct bladerf_stream **stream,
         return BLADERF_ERR_INVAL;
     }
 
+#if BLADERF_OS_LINUX
     /* Reject configurations that cannot fit in the kernel's usbfs memory
      * budget. Every in-flight transfer is pinned by the kernel, so the
      * stream needs num_transfers * buffer_size_bytes available at once.
@@ -140,6 +141,7 @@ int async_init_stream(struct bladerf_stream **stream,
     if (status != 0) {
         return status;
     }
+#endif
 
     /* Create a stream and populate it with the appropriate information */
     lstream = malloc(sizeof(struct bladerf_stream));
