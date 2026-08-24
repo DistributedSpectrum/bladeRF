@@ -63,12 +63,17 @@ static int usbfs_budget_check(size_t num_transfers, size_t buffer_size_bytes)
     }
 #endif
 
+    if (buffer_size_bytes != 0 && num_transfers > SIZE_MAX / buffer_size_bytes) {
+        log_error("Stream configuration is too large: %zu transfers x %zu bytes overflows size_t\n",
+                  num_transfers, buffer_size_bytes);
+        return BLADERF_ERR_INVAL;
+    }
+
     needed = num_transfers * buffer_size_bytes;
     budget = (size_t)(limit_mb * 1024 * 1024 * USBFS_BUDGET_FRACTION);
 
     if (needed > budget) {
         size_t max_transfers = budget / buffer_size_bytes;
-
         log_error("Stream needs %zu MiB of in-flight USB buffers "
                   "(%zu transfers x %zu bytes), but usbfs_memory_mb is %zu. "
                   "Use at most %zu transfers, or raise the limit with "
