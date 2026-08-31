@@ -247,6 +247,69 @@ class ClockSelect(enum.Enum):
         return self.name
 
 
+# Retune immediately, rather than at a sample timestamp. Mirrors
+# BLADERF_RETUNE_NOW.
+RETUNE_NOW = 0
+
+# Fastlock profile slots on the bladeRF 2.0. The Nios holds the profiles; the
+# RFIC slots are scratch the Nios recalls into, and a pipelined sweep has to
+# rotate through them. Mirrors NUM_{BBP,RFFE}_FASTLOCK_PROFILES.
+NUM_BBP_FASTLOCK_PROFILES = 256
+NUM_RFFE_FASTLOCK_PROFILES = 8
+
+
+class QuickTune:
+    """A captured tuning state, replayable with BladeRF.schedule_retune().
+
+    Wraps "struct bladerf_quick_tune". The bladeRF 2.0 fields (nios_profile,
+    rffe_profile, port, spdt) and the bladeRF 1 fields (freqsel, vcocap, nint,
+    nfrac, flags, xb_gpio) are a union in C and are exposed here as plain
+    attributes; read the set that matches your board.
+
+    rffe_profile is writable because a caller scheduling several retunes at
+    once must spread them across the RFIC's scratch slots -- see
+    BladeRF.get_quick_tune().
+    """
+
+    _BLADERF2_FIELDS = ("nios_profile", "rffe_profile", "port", "spdt")
+    _BLADERF1_FIELDS = ("freqsel", "vcocap", "nint", "nfrac", "flags",
+                        "xb_gpio")
+
+    def __init__(self):
+        self._struct = ffi.new("struct bladerf_quick_tune *")
+
+    def __getattr__(self, name):
+        if name in QuickTune._BLADERF2_FIELDS or \
+                name in QuickTune._BLADERF1_FIELDS:
+            return getattr(self._struct, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name == "_struct":
+            object.__setattr__(self, name, value)
+        elif name in QuickTune._BLADERF2_FIELDS or \
+                name in QuickTune._BLADERF1_FIELDS:
+            setattr(self._struct, name, value)
+        else:
+            raise AttributeError(name)
+
+    def copy(self):
+        """An independent QuickTune holding the same values.
+
+        Useful when the same tuning is scheduled into more than one RFIC
+        scratch slot.
+        """
+        other = QuickTune()
+        ffi.memmove(other._struct, self._struct,
+                    ffi.sizeof("struct bladerf_quick_tune"))
+        return other
+
+    def __repr__(self):
+        return ("<QuickTune nios_profile={} rffe_profile={} port=0x{:02x} "
+                "spdt=0x{:02x}>").format(self.nios_profile, self.rffe_profile,
+                                         self.port, self.spdt)
+
+
 class RSSI(collections.namedtuple("RSSI", ["preamble", "symbol"])):
     def __str__(self):
         return ("RSSI\n" +
@@ -786,6 +849,52 @@ class BladeRF:
                                                      _range_ptr)
         _check_error(ret)
         return Range.from_struct(_range_ptr[0])
+
+    # Scheduled tuning
+
+    def get_quick_tune(self, ch):
+        """Capture the current tuning as a QuickTune for later replay.
+
+        The channel must already be tuned to the frequency you want captured,
+        so the usual shape is set_frequency() then get_quick_tune().
+
+        On the bladeRF 2.0 this stores a fastlock profile in the RFIC and
+        copies it into one of the Nios' NUM_BBP_FASTLOCK_PROFILES slots. The
+        Nios slot is what holds the frequency; QuickTune.rffe_profile only
+        names the RFIC scratch slot the Nios recalls into, of which there are
+        just NUM_RFFE_FASTLOCK_PROFILES. Callers pipelining several retunes at
+        once must therefore rotate rffe_profile so a pending recall is not
+        overwritten before it fires.
+
+        Acquiring a quick tune is not cheap -- it retunes for real -- so build
+        the whole plan once and replay it.
+        """
+        qt = QuickTune()
+        ret = libbladeRF.bladerf_get_quick_tune(self.dev[0], ch, qt._struct)
+        _check_error(ret)
+        return qt
+
+    def schedule_retune(self, ch, timestamp, frequency=0, quick_tune=None):
+        """Retune at a sample timestamp, optionally from a cached QuickTune.
+
+        `timestamp` is the channel's sample counter, as returned by
+        get_timestamp(); RETUNE_NOW means immediately. With `quick_tune` given,
+        `frequency` is ignored and the cached profile is replayed, which is the
+        fast path -- no synthesiser programming at retune time.
+
+        Requires sync_config() with a metadata format so the stream has
+        timestamps.
+        """
+        qt = ffi.NULL if quick_tune is None else quick_tune._struct
+        ret = libbladeRF.bladerf_schedule_retune(self.dev[0], ch,
+                                                 int(timestamp),
+                                                 int(frequency), qt)
+        _check_error(ret)
+
+    def cancel_scheduled_retunes(self, ch):
+        """Drop every retune queued on this channel but not yet fired."""
+        ret = libbladeRF.bladerf_cancel_scheduled_retunes(self.dev[0], ch)
+        _check_error(ret)
 
     # RF Ports
 

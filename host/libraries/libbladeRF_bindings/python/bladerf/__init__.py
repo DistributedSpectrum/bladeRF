@@ -48,6 +48,11 @@ TX = _bladerf.TX
 CHANNEL_RX = _bladerf.CHANNEL_RX
 CHANNEL_TX = _bladerf.CHANNEL_TX
 
+QuickTune = _bladerf.QuickTune
+RETUNE_NOW = _bladerf.RETUNE_NOW
+NUM_BBP_FASTLOCK_PROFILES = _bladerf.NUM_BBP_FASTLOCK_PROFILES
+NUM_RFFE_FASTLOCK_PROFILES = _bladerf.NUM_RFFE_FASTLOCK_PROFILES
+
 rx_gain_tag = _bladerf.rx_gain_tag
 RxGainTag = _bladerf.RxGainTag
 RxGainTagMsg = _bladerf.RxGainTagMsg
@@ -62,6 +67,8 @@ main = _tool.main
 __all__ = ['BladeRF', 'get_bootloader_list', 'get_device_list',
            'load_fw_from_bootloader', 'set_verbosity', 'version', 'RX', 'TX',
            'CHANNEL_RX', 'CHANNEL_TX', 'main',
+           'QuickTune', 'RETUNE_NOW', 'NUM_BBP_FASTLOCK_PROFILES',
+           'NUM_RFFE_FASTLOCK_PROFILES',
            'rx_gain_tag', 'RxGainTag', 'RxGainTagMsg',
            'RX_GAIN_TAG_CARRIED', 'RX_GAIN_TAG_VERSION_NONE',
            'RX_GAIN_TAG_VERSION_1', 'RX_GAIN_TAG_CHANGED',
