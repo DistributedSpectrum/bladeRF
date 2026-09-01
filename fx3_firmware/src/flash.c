@@ -31,12 +31,20 @@
 
 static CyU3PReturnStatus_t FlashReadStatus(uint8_t *val)
 {
-    int status;
+    CyU3PReturnStatus_t status;
     uint8_t read_status = 0x05; /* RDSTATUS */
+
+    /* Report the first failure rather than whichever status the last call left
+     * behind: a caller that polls on *val needs to know it was never written. */
     status = CyU3PSpiSetSsnLine (CyFalse);
-    status = CyU3PSpiTransmitWords (&read_status, 1);
-    status = CyU3PSpiReceiveWords(val, 1);
-    status = CyU3PSpiSetSsnLine (CyTrue);
+    if (status == CY_U3P_SUCCESS) {
+        status = CyU3PSpiTransmitWords (&read_status, 1);
+    }
+    if (status == CY_U3P_SUCCESS) {
+        status = CyU3PSpiReceiveWords(val, 1);
+    }
+    /* Deassert regardless, so a failure does not leave the bus held. */
+    CyU3PSpiSetSsnLine (CyTrue);
 
     return status;
 }
@@ -139,7 +147,6 @@ static CyU3PReturnStatus_t NuandLockOtpRenesas() {
     CyU3PReturnStatus_t status = CY_U3P_SUCCESS;
     uint8_t cmd[4];
     uint8_t lock_val = 0x00;
-    uint8_t sr;
 
     cmd[0] = 0x06; /* Write Enable */
     status = CyU3PSpiSetSsnLine(CyFalse);
@@ -153,15 +160,18 @@ static CyU3PReturnStatus_t NuandLockOtpRenesas() {
 
     status = CyU3PSpiSetSsnLine(CyFalse);
     status = CyU3PSpiTransmitWords(cmd, 4);
-    status = CyU3PSpiTransmitWords(&lock_val, 1);
-    status = CyU3PSpiSetSsnLine(CyTrue);
+    if (status == CY_U3P_SUCCESS) {
+        status = CyU3PSpiTransmitWords(&lock_val, 1);
+    }
+    CyU3PSpiSetSsnLine(CyTrue);
+
+    /* Nothing was programmed, so there is no completion to wait on. */
+    if (status != CY_U3P_SUCCESS) {
+        return status;
+    }
 
     /* Poll SR1 bit 0 until programming completes */
-    do {
-        FlashReadStatus(&sr);
-    } while (sr & 0x01);
-
-    return status;
+    return FlashWaitUntilReady();
 }
 
 CyU3PReturnStatus_t NuandLockOtp() {
@@ -283,7 +293,6 @@ CyU3PReturnStatus_t NuandWriteOtp(size_t offset, size_t size, void *buf) {
 
     if (NuandGetSPIManufacturer() == 0x1F) {
         uint8_t cmd[4];
-        uint8_t sr;
         /* Cap at 127 bytes; byte 127 is the lock byte */
         size_t write_len = size < 127 ? size : 127;
 
@@ -298,16 +307,19 @@ CyU3PReturnStatus_t NuandWriteOtp(size_t offset, size_t size, void *buf) {
         cmd[3] = 0x80; /* A[7]=1 (reg 1), A[6:0]=0 */
 
         CyU3PSpiSetSsnLine(CyFalse);
-        CyU3PSpiTransmitWords(cmd, 4);
-        status = CyU3PSpiTransmitWords(buf, write_len);
+        status = CyU3PSpiTransmitWords(cmd, 4);
+        if (status == CY_U3P_SUCCESS) {
+            status = CyU3PSpiTransmitWords(buf, write_len);
+        }
         CyU3PSpiSetSsnLine(CyTrue);
 
-        /* Poll SR1 bit 0 until programming completes */
-        do {
-            FlashReadStatus(&sr);
-        } while (sr & 0x01);
+        /* Nothing was programmed, so there is no completion to wait on. */
+        if (status != CY_U3P_SUCCESS) {
+            return status;
+        }
 
-        return status;
+        /* Poll SR1 bit 0 until programming completes */
+        return FlashWaitUntilReady();
     }
 
     if (NuandGetSPIManufacturer() == 0xEF) {
