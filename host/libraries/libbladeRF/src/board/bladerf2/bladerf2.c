@@ -1571,8 +1571,16 @@ static int bladerf2_schedule_retune(struct bladerf *dev,
      * Immediate scheduling is the only case handled here. A retune
      * scheduled for a future timestamp completes inside the FPGA long
      * after this call returns, so the exit has to happen there instead.
+     *
+     * board_data->phy is only valid under BLADERF_TUNING_MODE_HOST --
+     * bladerf2_set_tuning_mode(FPGA) deinitializes the host RFIC control
+     * and nulls it out, since the Nios core owns the AD9361 SPI bus
+     * directly in that mode. A scheduled retune is the normal way to
+     * apply FPGA-recalled quick-tune profiles, which requires FPGA
+     * tuning mode, so skip this host-SPI workaround when phy is NULL
+     * rather than dereferencing it.
      */
-    if (BLADERF_RETUNE_NOW == timestamp) {
+    if (BLADERF_RETUNE_NOW == timestamp && NULL != board_data->phy) {
         CHECK_AD936X(ad9361_fastlock_exit_foreign(
             board_data->phy, BLADERF_CHANNEL_IS_TX(ch)));
     }
