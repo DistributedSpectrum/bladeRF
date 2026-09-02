@@ -36,6 +36,7 @@
 #include "backend/usb/usb.h"
 #include "streaming/async.h"
 #include "helpers/timeout.h"
+#include "helpers/wallclock.h"
 
 #include "bladeRF.h"
 
@@ -68,12 +69,43 @@ struct lusb_stream_data {
     struct libusb_transfer **transfers; /* Array of transfer metadata */
     transfer_status *transfer_status;   /* Status of each transfer */
 
+    /* # of transfers that completed with a full buffer on this stream.
+     * Reported when a transfer fails: zero means the device never produced
+     * anything, nonzero means it stopped after having worked. */
+    size_t num_complete;
+
    /* Warn the first time we get a transfer callback out of order.
     * This shouldn't happen normally, but we've seen it intermittently on
     * libusb 1.0.19 for Windows. Further investigation required...
     */
     bool out_of_order_event;
+
+    /* Completion flag for libusb_handle_events_timeout_completed(). libusb
+     * re-checks it under its own event lock, which is what makes the wait safe
+     * when RX and TX both handle events on one context. Set wherever the
+     * stream reaches STREAM_DONE. */
+    int done_flag;
+
+    /* When an in-flight TX transfer may no longer be given time to finish on
+     * its own. Zero until a shutdown starts. */
+    uint64_t cancel_deadline_ns;
 };
+
+/* Finish a stream and wake anyone waiting on libusb events for it.
+ *
+ * The state and the completion flag have to move together: a waiter inside
+ * libusb only re-checks the flag, so setting the state alone leaves it
+ * sleeping until its timeout expires.
+ */
+static inline void mark_stream_done(struct bladerf_stream *stream)
+{
+    struct lusb_stream_data *stream_data = stream->backend_data;
+
+    stream->state = STREAM_DONE;
+    if (stream_data != NULL) {
+        stream_data->done_flag = 1;
+    }
+}
 
 static inline struct bladerf_lusb * lusb_backend(struct bladerf *dev)
 {
@@ -1003,13 +1035,55 @@ static inline void cancel_all_transfers(struct bladerf_stream *stream)
     int status;
     struct lusb_stream_data *stream_data = stream->backend_data;
 
+    /* Cancelling a TX transfer that is already moving ends it wherever it
+     * happens to be, and the device cannot use a partial buffer.
+     *
+     * Measured on the wire against a bladeRF 2.0 micro: cancelled OUT
+     * transfers come back having moved 1024, 3072, 5120, 6144, 8192, 13312
+     * and 27648 bytes - all multiples of the 1024-byte SuperSpeed packet,
+     * none a multiple of the 32768-byte buffer. The FX3 TX channel is
+     * CY_U3P_DMA_TYPE_AUTO over 8192-byte buffers, so it assembles whole
+     * buffers; the cut leaves it holding an unfinished one and later
+     * submissions have nowhere to complete. What follows is every transfer
+     * sitting for a full stream timeout while the RX endpoint keeps
+     * completing normally.
+     *
+     * So let an in-flight TX transfer finish on its own. The event loop calls
+     * this on every iteration while shutting down, so returning here means
+     * trying again shortly; each transfer carries its own timeout, which
+     * bounds the wait. Cancel once that deadline has passed, since by then
+     * the transfer is not going to complete anyway.
+     *
+     * Transfers that never started are unaffected: they complete immediately
+     * either way.
+     */
+    if ((stream->layout & BLADERF_DIRECTION_MASK) == BLADERF_TX &&
+        stream->transfer_timeout != 0) {
+        const uint64_t now = wallclock_get_current_nsec();
+
+        if (stream_data->cancel_deadline_ns == 0) {
+            stream_data->cancel_deadline_ns =
+                now + (uint64_t)stream->transfer_timeout * 1000000u;
+        }
+        if (now < stream_data->cancel_deadline_ns) {
+            return;
+        }
+    }
+
     for (i = 0; i < stream_data->num_transfers; i++) {
         if (stream_data->transfer_status[i] == TRANSFER_IN_FLIGHT) {
             status = libusb_cancel_transfer(stream_data->transfers[i]);
-            if (status < 0 && status != LIBUSB_ERROR_NOT_FOUND) {
+            if (status < 0 && status != LIBUSB_ERROR_NOT_FOUND &&
+                status != LIBUSB_ERROR_NO_DEVICE) {
                 log_error("Error canceling transfer (%d): %s\n",
                         status, libusb_error_name(status));
             } else {
+                /* LIBUSB_ERROR_NO_DEVICE is expected when the device has
+                 * been unplugged or reset: the transfer cannot be cancelled
+                 * because the device is gone. libusb still delivers the
+                 * completion callback, so mark it pending like any other
+                 * cancellation instead of logging an error per transfer.
+                 */
                 stream_data->transfer_status[i] = TRANSFER_CANCEL_PENDING;
             }
         }
@@ -1057,6 +1131,11 @@ static void LIBUSB_CALL lusb_stream_cb(struct libusb_transfer *transfer)
         COND_SIGNAL(&stream->can_submit_buffer);
     }
 
+    if (transfer->status == LIBUSB_TRANSFER_COMPLETED &&
+        transfer->actual_length == (int)transfer->length) {
+        stream_data->num_complete++;
+    }
+
     /* Check to see if the transfer has been cancelled or errored */
     if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
         /* Errored out for some reason .. */
@@ -1086,9 +1165,19 @@ static void LIBUSB_CALL lusb_stream_cb(struct libusb_transfer *transfer)
                 break;
 
             case LIBUSB_TRANSFER_TIMED_OUT:
-                log_error("Transfer timed out for %s buffer %p\n\r",
+                /* How much of the buffer arrived, and whether anything ever
+                 * arrived on this stream, separates two very different
+                 * faults that both surface as BLADERF_ERR_TIMEOUT: a device
+                 * that never started producing, and one that stopped
+                 * mid-stream. Without these numbers the caller only sees
+                 * "timed out" and has to instrument the library to tell them
+                 * apart. */
+                log_error("Transfer timed out for %s buffer %p: %d of %d "
+                          "bytes, %u transfer(s) completed on this stream\n\r",
                           (stream->layout & BLADERF_DIRECTION_MASK) == BLADERF_TX ? "TX" : "RX",
-                          transfer->buffer);
+                          transfer->buffer, transfer->actual_length,
+                          (int)transfer->length,
+                          (unsigned)stream_data->num_complete);
                 stream->error_code = BLADERF_ERR_TIMEOUT;
                 break;
 
@@ -1145,7 +1234,7 @@ static void LIBUSB_CALL lusb_stream_cb(struct libusb_transfer *transfer)
         /* We know we're done when all of our transfers have returned to their
          * "available" states */
         if (stream_data->num_avail == stream_data->num_transfers) {
-            stream->state = STREAM_DONE;
+            mark_stream_done(stream);
         } else {
             cancel_all_transfers(stream);
         }
@@ -1267,6 +1356,9 @@ static int lusb_init_stream(void *driver, struct bladerf_stream *stream,
     stream_data->num_avail = 0;
     stream_data->i = 0;
     stream_data->out_of_order_event = false;
+    stream_data->num_complete = 0;
+    stream_data->done_flag = 0;
+    stream_data->cancel_deadline_ns = 0;
 
     stream_data->transfers =
         malloc(num_transfers * sizeof(struct libusb_transfer *));
@@ -1359,7 +1451,7 @@ static int lusb_stream(void *driver, struct bladerf_stream *stream,
                 } else {
                     /* No transfers have been shipped out yet so we can
                      * simply enter our "done" state */
-                    stream->state = STREAM_DONE;
+                    mark_stream_done(stream);
                 }
 
                 /* In either of the above we don't want to attempt to
@@ -1389,15 +1481,49 @@ static int lusb_stream(void *driver, struct bladerf_stream *stream,
     }
     MUTEX_UNLOCK(&stream->lock);
 
-    /* This loop is required so libusb can do callbacks and whatnot */
+    /* This loop is required so libusb can do callbacks and whatnot.
+     *
+     * RX and TX each run this loop on the same libusb context, so two threads
+     * compete for event handling. libusb allows that, but only one thread
+     * actually handles events while the others wait inside it, and a waiter
+     * that entered the wait before the state it is waiting on changed keeps
+     * waiting until its timeout expires. Checking stream->state outside the
+     * event lock, which a plain handle_events_timeout() call forces, is
+     * exactly the lost-wakeup pattern that
+     * libusb_handle_events_timeout_completed() exists to close.
+     *
+     * Pass the completion flag instead: libusb re-checks it under its own
+     * event lock and returns immediately if it is already set.
+     */
     while (stream->state != STREAM_DONE) {
-        status = libusb_handle_events_timeout(lusb->context, &tv);
+        status = libusb_handle_events_timeout_completed(
+            lusb->context, &tv, &stream_data->done_flag);
 
-        if (status < 0 && status != LIBUSB_ERROR_INTERRUPTED) {
+        if (status < 0 && status != LIBUSB_ERROR_INTERRUPTED &&
+            status != LIBUSB_ERROR_TIMEOUT) {
             log_warning("unexpected value from events processing: "
                         "%d: %s\n", status, libusb_error_name(status));
             status = error_conv(status);
         }
+
+        /* Finish a shutdown that has nothing left to complete.
+         *
+         * The SHUTTING_DOWN -> DONE transition normally happens in
+         * lusb_stream_cb(), so it needs a transfer to come back. When a
+         * shutdown is requested while nothing is in flight - a stopped TX
+         * feed, for instance - no callback ever runs and this loop would spin
+         * until the worker is cancelled. Cancel here and settle it once every
+         * transfer is accounted for.
+         */
+        MUTEX_LOCK(&stream->lock);
+        if (stream->state == STREAM_SHUTTING_DOWN) {
+            if (stream_data->num_avail == stream_data->num_transfers) {
+                mark_stream_done(stream);
+            } else {
+                cancel_all_transfers(stream);
+            }
+        }
+        MUTEX_UNLOCK(&stream->lock);
     }
 
     return status;
@@ -1413,7 +1539,7 @@ int lusb_submit_stream_buffer(void *driver, struct bladerf_stream *stream,
 
     if (buffer == BLADERF_STREAM_SHUTDOWN) {
         if (stream_data->num_avail == stream_data->num_transfers) {
-            stream->state = STREAM_DONE;
+            mark_stream_done(stream);
         } else {
             stream->state = STREAM_SHUTTING_DOWN;
         }

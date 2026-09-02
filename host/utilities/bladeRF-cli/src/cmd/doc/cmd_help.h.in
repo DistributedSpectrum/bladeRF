@@ -260,7 +260,7 @@
   "written to stdout.\n" \
   "\n" \
 
-#define CLI_CMD_HELPTEXT_gain_calibration_load \
+#define CLI_CMD_HELPTEXT_load_gain \
 "Usage: load_gain <rx|tx> <filename>\n" \
 "\n" \
 "Load a .tbl file for either RX or TX gain table calibration.\n" \

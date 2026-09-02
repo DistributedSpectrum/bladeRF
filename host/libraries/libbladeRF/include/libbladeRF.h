@@ -51,7 +51,7 @@
  *
  *  https://github.com/Nuand/bladeRF/blob/master/doc/development/versioning.md
  */
-#define LIBBLADERF_API_VERSION (0x02060100)
+#define LIBBLADERF_API_VERSION (0x02070000)
 
 #ifdef __cplusplus
 extern "C" {
@@ -2543,10 +2543,237 @@ struct bladerf_metadata {
     unsigned int actual_count;
 
     /**
-     * Reserved for future use. This is not used by any functions. It is
-     * recommended that users zero out this field.
+     * Reserved for future use. It is recommended that users zero out this
+     * field.
+     *
+     * On RX with ::BLADERF_FORMAT_SC16_Q11_META or ::BLADERF_FORMAT_SC8_Q7_META,
+     * bladerf_sync_rx() overlays a ::bladerf_rx_gain_tag on the first
+     * `sizeof(struct bladerf_rx_gain_tag)` bytes of this field and zeroes the
+     * remainder. Older FPGA images report
+     * ::BLADERF_RX_GAIN_TAG_VERSION_NONE in the `version` field.
      */
     uint8_t reserved[32];
+};
+
+/**
+ * @brief Per-receive summary of the RFIC's automatic gain control state.
+ *
+ * Overlaid on ::bladerf_metadata::reserved by bladerf_sync_rx() when receiving
+ * in a metadata format. It reports the RX gain the AD9361's AGC actually applied
+ * to the samples being returned, which is what makes it possible to turn IQ
+ * magnitude into absolute power (for example, the RSSI of a signal within some
+ * bandwidth).
+ *
+ * The FPGA divides each message into `chunks` equal spans and records the gain
+ * index at the end of each, so the gain profile travels with the IQ instead of
+ * having to be polled asynchronously with bladerf_get_gain(). Requires FPGA
+ * v0.17.0 or later and RX1.
+ *
+ * Specified for AGC gain modes (::BLADERF_GAIN_SLOWATTACK_AGC by default). The
+ * index has also been observed to track commanded manual gain, but AD9361
+ * UG-570 documents these bits for AGC modes only, so do not depend on it in
+ * ::BLADERF_GAIN_MGC.
+ *
+ * To get absolute power, pass an index through
+ * bladerf_rx_gain_tag_to_gain_db() and subtract:
+ *
+ * @code
+ *     power_dbm = power_dbfs - gain_db;
+ * @endcode
+ *
+ * That conversion needs a gain calibration table loaded and enabled for the
+ * channel (bladerf_load_gain_calibration()) to be an absolute reference.
+ *
+ * @note **This profile covers one message; a call can span many.** The metadata
+ *       header, and therefore this profile, is per *message* -- not per buffer
+ *       and not per call. A message holds 2044 samples on SuperSpeed and 1020 on
+ *       Hi-Speed. Two ways to keep the full resolution:
+ *
+ *       - Request exactly 2044 samples (1020 on Hi-Speed) per
+ *         bladerf_sync_rx(). Each call then consumes exactly one header,
+ *         `num_messages` is 1, and `chunk_gain_index` describes precisely the
+ *         samples returned. This is independent of `buffer_size`, which only
+ *         needs to be a whole number of messages -- bladerf_sync_config() rounds
+ *         it up to one -- and is better left large so the USB transfer rate
+ *         stays low.
+ *       - Request as much as you like and call bladerf_get_rx_gain_tags()
+ *         afterwards, which returns one ::bladerf_rx_gain_tag_msg per message
+ *         the call consumed, each with its own `chunk_gain_index` and its
+ *         position within the returned buffer.
+ *
+ *       Reading more than one message per call *without* doing the latter is
+ *       what loses resolution: the messages collapse into the summary fields
+ *       below and `chunk_gain_index` then describes only the first of them.
+ *
+ * When `gain_index_min == gain_index_max` and ::BLADERF_RX_GAIN_TAG_CHANGED is
+ * clear, one gain applied to every returned sample and the conversion is exact.
+ * Otherwise the gain moved: `chunk_gain_index` localises it within the first
+ * message, and the min/max pair bounds it across all of them.
+ *
+ * @note **How much to trust `chunk_gain_index` depends on the gain mode.** A
+ *       single AGC decision changes the index by at most 2, so what governs the
+ *       profile is how many decisions fit in one chunk, and that follows the
+ *       gain update interval:
+ *
+ *       - ::BLADERF_GAIN_SLOWATTACK_AGC (1000 us) admits at most one decision
+ *         per message, so the profile is an exact description. Measured at
+ *         20 Msps: 95.7% of messages flat, and no message ever contained two
+ *         transitions.
+ *       - ::BLADERF_GAIN_FASTATTACK_AGC (1 us) admits roughly 25 decisions per
+ *         chunk at 20 Msps. Since each chunk records only the value at its
+ *         *end*, intermediate gains are lost. Measured over 292k messages:
+ *         85.8% flat, 8.6% with more than one transition, and a largest
+ *         excursion of 29 indices within one message -- 21 of those inside a
+ *         single chunk.
+ *
+ *       So in slow-attack the profile can be read literally, while in
+ *       fast-attack treat it as a bound: use `gain_index_min` /
+ *       `gain_index_max`, and discard messages with
+ *       ::BLADERF_RX_GAIN_TAG_CHANGED set rather than assuming the four values
+ *       describe the message.
+ *
+ * @note Deltas are stored in 6 signed bits and clamp at -32/+31 rather than
+ *       wrapping. Unreachable in slow-attack; fast-attack has been measured at
+ *       29. Note the margin shrinks as the sample rate *falls*, because a chunk
+ *       then spans more time and so more gain decisions.
+ */
+struct bladerf_rx_gain_tag {
+    /** Format version, or ::BLADERF_RX_GAIN_TAG_VERSION_NONE if no tag was
+     *  available. Always check this before reading other fields. */
+    uint8_t version;
+
+    /** Bitwise OR of ::BLADERF_RX_GAIN_TAG_CHANGED and
+     *  ::BLADERF_RX_GAIN_TAG_LOCKED. Note the latter is only ever set in
+     *  fast-attack AGC. */
+    uint8_t flags;
+
+    /** RX1 full gain-table index at the first sample returned */
+    uint8_t gain_index;
+
+    /** Lowest gain index across the returned samples */
+    uint8_t gain_index_min;
+
+    /** Highest gain index across the returned samples */
+    uint8_t gain_index_max;
+
+    /** Number of chunks per message, i.e. valid entries in
+     *  `chunk_gain_index` */
+    uint8_t chunks;
+
+    /** Number of message headers read. Zero means no header was consumed by
+     *  this call and the fields describe the message an earlier call started.
+     *
+     *  This can be one higher than the number of entries
+     *  bladerf_get_rx_gain_tags() returns: a header can be read and still
+     *  contribute no samples -- the last one before a discontinuity ended the
+     *  call, or one walked past while seeking to a requested timestamp. Those
+     *  are counted here and omitted there, since an entry always describes
+     *  samples. */
+    uint16_t num_messages;
+
+    /** Gain index at the end of each chunk of the first message returned.
+     *  Together with `gain_index` this is a `chunks`+1 point profile across that
+     *  message. Only the first `chunks` entries are meaningful. */
+    uint8_t chunk_gain_index[8];
+};
+
+/** No gain tag was available; every other field is zero */
+#define BLADERF_RX_GAIN_TAG_VERSION_NONE 0
+
+/** Current gain tag format version */
+#define BLADERF_RX_GAIN_TAG_VERSION_1 1
+
+/** The gain moved partway through the returned samples */
+#define BLADERF_RX_GAIN_TAG_CHANGED (1 << 0)
+
+/** The AGC reported its gain as locked.
+ *
+ * Only ::BLADERF_GAIN_FASTATTACK_AGC ever sets this. The AD9361 drives its gain
+ * lock signal from the fast-attack state machine, and UG-570 states it "applies
+ * only to fast AGC mode", so in slow-attack and hybrid modes the bit is always
+ * clear and says nothing about whether the gain is steady. To judge that in any
+ * mode, use `gain_index_min == gain_index_max` together with
+ * ::BLADERF_RX_GAIN_TAG_CHANGED being clear -- a stronger statement anyway,
+ * since it is derived from the gain index actually applied to these samples.
+ */
+#define BLADERF_RX_GAIN_TAG_LOCKED (1 << 1)
+
+/** This entry's message header was consumed by an earlier bladerf_sync_rx()
+ *  call, so its profile was carried over rather than read from a header during
+ *  the call that produced it.
+ *
+ *  Only ever set in ::bladerf_rx_gain_tag_msg::flags. It appears on at most the
+ *  first entry, and only when a call began part way into a message.
+ */
+#define BLADERF_RX_GAIN_TAG_CARRIED (1 << 2)
+
+/**
+ * @brief One message's gain profile, positioned within a receive.
+ *
+ * ::bladerf_rx_gain_tag summarizes a whole bladerf_sync_rx() call and can only
+ * carry `chunk_gain_index` for the *first* message, because it has to fit in
+ * ::bladerf_metadata::reserved. When a call spans several messages -- which any
+ * request larger than 2044 samples (1020 on Hi-Speed) does -- retrieve the full
+ * per-message profile with bladerf_get_rx_gain_tags() instead.
+ *
+ * Entries are in receive order and tile the samples the call returned: entry
+ * `i` describes `sample_count` samples starting at `sample_offset` in the
+ * caller's buffer, and
+ *
+ * @code
+ *     tags[i].sample_offset + tags[i].sample_count == tags[i+1].sample_offset
+ * @endcode
+ *
+ * holds across the whole array, with the last entry ending at
+ * ::bladerf_metadata::actual_count. Messages the call skipped over (seeking to a
+ * requested timestamp, or discarding after an overrun) contribute no entry, so
+ * a gap in `timestamp` between adjacent entries marks a discontinuity that
+ * ::BLADERF_META_STATUS_OVERRUN also reports.
+ *
+ * Chunk boundaries are in *message payload* coordinates, not buffer
+ * coordinates. Chunk `c` of a message covers payload samples
+ * `[c*L, (c+1)*L)` where `L = samples_per_message / chunks`, and this entry's
+ * samples begin at payload offset `msg_sample_offset`. So the chunk that
+ * applies to buffer sample `s` is
+ *
+ * @code
+ *     c = (msg_sample_offset + (s - sample_offset)) / L;
+ * @endcode
+ *
+ * `msg_sample_offset` is zero for every entry except, possibly, the first.
+ *
+ * @see bladerf_get_rx_gain_tags()
+ */
+struct bladerf_rx_gain_tag_msg {
+    /** Timestamp of the first sample of the *message*, which is
+     *  `msg_sample_offset` samples before the first sample this entry
+     *  describes */
+    bladerf_timestamp timestamp;
+
+    /** Index into the caller's sample buffer of the first sample this entry
+     *  describes */
+    uint32_t sample_offset;
+
+    /** Number of samples this entry describes. Always nonzero. */
+    uint32_t sample_count;
+
+    /** Offset within the message payload of the first sample this entry
+     *  describes. Nonzero only on a first entry whose message was already
+     *  partly consumed. */
+    uint16_t msg_sample_offset;
+
+    /** RX1 full gain-table index at the message's first sample */
+    uint8_t gain_index;
+
+    /** ::BLADERF_RX_GAIN_TAG_LOCKED and/or ::BLADERF_RX_GAIN_TAG_CARRIED */
+    uint8_t flags;
+
+    /** Gain index at the end of each chunk of this message. The number of
+     *  valid entries is ::bladerf_rx_gain_tag::chunks. */
+    uint8_t chunk_gain_index[8];
+
+    /** Reserved for future use; currently zero */
+    uint8_t reserved[4];
 };
 
 /** @} (End of STREAMING_FORMAT_METADATA) */
@@ -2764,6 +2991,14 @@ int CALL_CONV bladerf_get_timestamp(struct bladerf *dev,
  * @param[in]   num_transfers   The number of active USB transfers that may be
  *                              in-flight at any given time. If unsure of what
  *                              to use here, try values of 4, 8, or 16.
+ *
+ *                              Each in-flight transfer is pinned by the
+ *                              kernel, so `num_transfers * buffer_size` must
+ *                              fit within the usbfs memory limit (16 MiB by
+ *                              default on Linux, see
+ *                              /sys/module/usbcore/parameters/usbfs_memory_mb).
+ *                              Configurations that exceed it are rejected
+ *                              with ::BLADERF_ERR_INVAL.
  * @param[in]   stream_timeout  Timeout (milliseconds) for transfers in the
  *                              underlying data stream.
  *

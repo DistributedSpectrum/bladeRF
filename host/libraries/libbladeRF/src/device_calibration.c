@@ -28,6 +28,7 @@
 #include "helpers/version.h"
 #include "device_calibration.h"
 #include "log.h"
+#include "conversions.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -198,9 +199,13 @@ int gain_cal_csv_to_bin(struct bladerf *dev, const char *csv_path, const char *b
     if (!csvFile || !binaryFile) {
         status = BLADERF_ERR_NO_FILE;
         if (getcwd(current_dir, sizeof(current_dir)) != NULL) {
-            log_error("Error opening calibration file: %s\n", strcat(current_dir, csv_path));
+            /* strcat() here appends a caller-supplied path of arbitrary
+             * length to a buffer already holding the working directory,
+             * overflowing it for long paths. Print the two parts instead. */
+            log_error("Error opening calibration file: %s/%s\n",
+                      current_dir, csv_path);
         } else {
-            log_error("Error opening calibration file\n");
+            log_error("Error opening calibration file: %s\n", csv_path);
         }
         goto error;
     }
@@ -319,7 +324,7 @@ static int gain_cal_tbl_init(struct bladerf_gain_cal_tbl *tbl, uint32_t num_entr
     tbl->n_entries = num_entries;
     tbl->start_freq = 0;
     tbl->stop_freq = 0;
-    tbl->file_path_len = 4;
+    tbl->file_path_len = PATH_MAX;
 
     tbl->entries = malloc(num_entries * sizeof(struct bladerf_gain_cal_entry));
     if (tbl->entries == NULL) {
@@ -369,8 +374,7 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
         return BLADERF_ERR_MEM;
     }
 
-    bladerf_gain current_gain;
-    size_t entry_counter = 0;
+    size_t entry_counter;
     int status = 0;
 
     struct bladerf_image *image = NULL;
@@ -382,12 +386,6 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
     if (!binaryFile) {
         log_error("Error opening binary file.\n");
         status = BLADERF_ERR_NO_FILE;
-        goto error;
-    }
-
-    status = dev->board->get_gain(dev, ch, &current_gain);
-    if (status != 0) {
-        log_error("Failed to get gain: %s\n", bladerf_strerror(status));
         goto error;
     }
 
@@ -465,7 +463,9 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
     gain_tbls[ch].ch = ch;
     gain_tbls[ch].state = BLADERF_GAIN_CAL_LOADED;
     gain_tbls[ch].enabled = true;
-    gain_tbls[ch].gain_target = current_gain;
+    /* Carry the caller's commanded gain across the load. Resetting it to 0 here made loading a
+     * table a silent 0 dB gain change, since the load path then re-commands this value. */
+    gain_tbls[ch].gain_target = dev->gain_tbls[ch].gain_target;
     strncpy(gain_tbls[ch].file_path, binary_path, gain_tbls[ch].file_path_len);
 
     gain_cal_tbl_free(&dev->gain_tbls[ch]);
@@ -567,7 +567,6 @@ int get_gain_correction(struct bladerf *dev, bladerf_frequency freq, bladerf_cha
 
 int apply_gain_correction(struct bladerf *dev, bladerf_channel ch, bladerf_frequency frequency) {
     struct bladerf_range const *gain_range = NULL;
-    bladerf_frequency current_frequency;
     bladerf_gain gain_compensated;
 
     if (dev->gain_tbls[ch].enabled == false) {
@@ -575,8 +574,22 @@ int apply_gain_correction(struct bladerf *dev, bladerf_channel ch, bladerf_frequ
         return BLADERF_ERR_UNEXPECTED;
     }
 
+    /* A commanded gain only lands in manual gain control: ad9361_set_rx_gain() returns without
+     * writing anything unless the mode is RX_GAIN_CTL_MGC, and it returns success, so this
+     * would look like it worked. Under AGC the new band's correction is carried by whatever
+     * gain the AGC picks, so there is nothing to command -- and commanding one anyway could
+     * warn about clamping a value that was never applied. */
+    if (BLADERF_CHANNEL_IS_TX(ch) == false) {
+        bladerf_gain_mode mode;
+        CHECK_STATUS(dev->board->get_gain_mode(dev, ch, &mode));
+        if (mode != BLADERF_GAIN_MGC) {
+            log_debug("Gain correction not commanded: %s is under automatic gain control\n",
+                      channel2str(ch));
+            return 0;
+        }
+    }
+
     CHECK_STATUS(dev->board->get_gain_range(dev, ch, &gain_range));
-    CHECK_STATUS(dev->board->get_frequency(dev, ch, &current_frequency));
     CHECK_STATUS(get_gain_correction(dev, frequency, ch, &gain_compensated));
 
     if (gain_compensated > gain_range->max || gain_compensated < gain_range->min) {
@@ -586,7 +599,7 @@ int apply_gain_correction(struct bladerf *dev, bladerf_channel ch, bladerf_frequ
         log_warning("Gain clamped to: %i\n", gain_compensated);
     }
 
-    CHECK_STATUS(dev->board->set_gain(dev, ch, gain_compensated););
+    CHECK_STATUS(dev->board->set_gain(dev, ch, gain_compensated));
 
     return 0;
 }

@@ -204,6 +204,7 @@ class Correction(enum.Enum):
 
 class Format(enum.Enum):
     SC16_Q11 = libbladeRF.BLADERF_FORMAT_SC16_Q11
+    SC16_Q11_PACKED = libbladeRF.BLADERF_FORMAT_SC16_Q11_PACKED
     SC16_Q11_META = libbladeRF.BLADERF_FORMAT_SC16_Q11_META
     PACKET_META = libbladeRF.BLADERF_FORMAT_PACKET_META
     SC8_Q7 = libbladeRF.BLADERF_FORMAT_SC8_Q7
@@ -244,6 +245,69 @@ class ClockSelect(enum.Enum):
 
     def __str__(self):
         return self.name
+
+
+# Retune immediately, rather than at a sample timestamp. Mirrors
+# BLADERF_RETUNE_NOW.
+RETUNE_NOW = 0
+
+# Fastlock profile slots on the bladeRF 2.0. The Nios holds the profiles; the
+# RFIC slots are scratch the Nios recalls into, and a pipelined sweep has to
+# rotate through them. Mirrors NUM_{BBP,RFFE}_FASTLOCK_PROFILES.
+NUM_BBP_FASTLOCK_PROFILES = 256
+NUM_RFFE_FASTLOCK_PROFILES = 8
+
+
+class QuickTune:
+    """A captured tuning state, replayable with BladeRF.schedule_retune().
+
+    Wraps "struct bladerf_quick_tune". The bladeRF 2.0 fields (nios_profile,
+    rffe_profile, port, spdt) and the bladeRF 1 fields (freqsel, vcocap, nint,
+    nfrac, flags, xb_gpio) are a union in C and are exposed here as plain
+    attributes; read the set that matches your board.
+
+    rffe_profile is writable because a caller scheduling several retunes at
+    once must spread them across the RFIC's scratch slots -- see
+    BladeRF.get_quick_tune().
+    """
+
+    _BLADERF2_FIELDS = ("nios_profile", "rffe_profile", "port", "spdt")
+    _BLADERF1_FIELDS = ("freqsel", "vcocap", "nint", "nfrac", "flags",
+                        "xb_gpio")
+
+    def __init__(self):
+        self._struct = ffi.new("struct bladerf_quick_tune *")
+
+    def __getattr__(self, name):
+        if name in QuickTune._BLADERF2_FIELDS or \
+                name in QuickTune._BLADERF1_FIELDS:
+            return getattr(self._struct, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name == "_struct":
+            object.__setattr__(self, name, value)
+        elif name in QuickTune._BLADERF2_FIELDS or \
+                name in QuickTune._BLADERF1_FIELDS:
+            setattr(self._struct, name, value)
+        else:
+            raise AttributeError(name)
+
+    def copy(self):
+        """An independent QuickTune holding the same values.
+
+        Useful when the same tuning is scheduled into more than one RFIC
+        scratch slot.
+        """
+        other = QuickTune()
+        ffi.memmove(other._struct, self._struct,
+                    ffi.sizeof("struct bladerf_quick_tune"))
+        return other
+
+    def __repr__(self):
+        return ("<QuickTune nios_profile={} rffe_profile={} port=0x{:02x} "
+                "spdt=0x{:02x}>").format(self.nios_profile, self.rffe_profile,
+                                         self.port, self.spdt)
 
 
 class RSSI(collections.namedtuple("RSSI", ["preamble", "symbol"])):
@@ -608,6 +672,18 @@ class BladeRF:
         _check_error(ret)
 
     # Gain
+    def get_timestamp(self, direction):
+        """Current sample counter for the given direction.
+
+        Useful for telling which samples predate a retune: samples with a
+        timestamp below the value read just after bladerf_set_frequency() were
+        captured at the previous frequency.
+        """
+        ts = ffi.new("bladerf_timestamp *")
+        ret = libbladeRF.bladerf_get_timestamp(self.dev[0], direction.value, ts)
+        _check_error(ret)
+        return ts[0]
+
     def set_gain_calibration(self, ch, path):
         ret = libbladeRF.bladerf_load_gain_calibration(self.dev[0], ch, path.encode())
         _check_error(ret)
@@ -618,11 +694,21 @@ class BladeRF:
         _check_error(ret)
         return ret
     
-    def get_gain_calibration(self, ch):
+    def get_gain_target(self, ch):
+        """The gain that was asked for, in dB.
+
+        With a calibration table enabled this is not what set_gain() commanded: the command
+        carries (target - gain_corr) so the hardware lands on the target, and get_gain() reports
+        that commanded value. This adds the correction back, so it is the one that round-trips
+        with set_gain().
+        """
         gain = ffi.new("int *")
         ret = libbladeRF.bladerf_get_gain_target(self.dev[0], ch, gain)
         _check_error(ret)
         return gain[0]
+
+    # Kept because callers use this name; it never returned a calibration table.
+    get_gain_calibration = get_gain_target
     def print_gain_calibration(self, ch, with_entries):
         ret = libbladeRF.bladerf_print_gain_calibration(self.dev[0], ch, with_entries)
         _check_error(ret)
@@ -763,6 +849,52 @@ class BladeRF:
                                                      _range_ptr)
         _check_error(ret)
         return Range.from_struct(_range_ptr[0])
+
+    # Scheduled tuning
+
+    def get_quick_tune(self, ch):
+        """Capture the current tuning as a QuickTune for later replay.
+
+        The channel must already be tuned to the frequency you want captured,
+        so the usual shape is set_frequency() then get_quick_tune().
+
+        On the bladeRF 2.0 this stores a fastlock profile in the RFIC and
+        copies it into one of the Nios' NUM_BBP_FASTLOCK_PROFILES slots. The
+        Nios slot is what holds the frequency; QuickTune.rffe_profile only
+        names the RFIC scratch slot the Nios recalls into, of which there are
+        just NUM_RFFE_FASTLOCK_PROFILES. Callers pipelining several retunes at
+        once must therefore rotate rffe_profile so a pending recall is not
+        overwritten before it fires.
+
+        Acquiring a quick tune is not cheap -- it retunes for real -- so build
+        the whole plan once and replay it.
+        """
+        qt = QuickTune()
+        ret = libbladeRF.bladerf_get_quick_tune(self.dev[0], ch, qt._struct)
+        _check_error(ret)
+        return qt
+
+    def schedule_retune(self, ch, timestamp, frequency=0, quick_tune=None):
+        """Retune at a sample timestamp, optionally from a cached QuickTune.
+
+        `timestamp` is the channel's sample counter, as returned by
+        get_timestamp(); RETUNE_NOW means immediately. With `quick_tune` given,
+        `frequency` is ignored and the cached profile is replayed, which is the
+        fast path -- no synthesiser programming at retune time.
+
+        Requires sync_config() with a metadata format so the stream has
+        timestamps.
+        """
+        qt = ffi.NULL if quick_tune is None else quick_tune._struct
+        ret = libbladeRF.bladerf_schedule_retune(self.dev[0], ch,
+                                                 int(timestamp),
+                                                 int(frequency), qt)
+        _check_error(ret)
+
+    def cancel_scheduled_retunes(self, ch):
+        """Drop every retune queued on this channel but not yet fired."""
+        ret = libbladeRF.bladerf_cancel_scheduled_retunes(self.dev[0], ch)
+        _check_error(ret)
 
     # RF Ports
 
@@ -994,6 +1126,64 @@ class BladeRF:
 
     rfic_ctrl_out = property(get_rfic_ctrl_out,
                              doc="RFIC CTRL_OUT status pins")
+
+    def rx_gain_tag_to_gain_db(self, ch, gain_index):
+        """Convert an RX gain-table index into the achieved conversion gain, dB.
+
+        Intended for the indices in an RxGainTag. Returns None if the device
+        rejects the index, which usually means the RFIC's CTRL_OUT is not
+        pointed at the gain index.
+        """
+        gain_db = ffi.new("float *")
+        ret = libbladeRF.bladerf_rx_gain_tag_to_gain_db(self.dev[0], ch,
+                                                       gain_index, gain_db)
+        if ret < 0:
+            return None
+        return gain_db[0]
+
+    def rx_gain_tags(self, max_tags=None):
+        """Per-message RFIC gain profiles for the most recent sync_rx() call.
+
+        The RxGainTag decoded from meta.reserved summarises the whole call and
+        can only carry chunk_gain_index for the first message. This returns one
+        RxGainTagMsg per message the call consumed, in order, each with its own
+        chunk profile and the slice of the sample buffer it applies to:
+
+            tags = dev.rx_gain_tags()
+            for t in tags:
+                iq[t.sample_offset:t.sample_offset + t.sample_count] ...
+
+        Call it after sync_rx() and before the next one. `max_tags` caps how
+        many are returned; the default retrieves all of them. Returns None when
+        the FPGA supplies no tag (needs v0.17.0 or later, and a metadata RX
+        format).
+        """
+        num = ffi.new("unsigned int *")
+
+        ret = libbladeRF.bladerf_get_rx_gain_tags(self.dev[0], ffi.NULL, 0, num)
+        if ret == -8:  # BLADERF_ERR_UNSUPPORTED
+            return None
+        _check_error(ret)
+
+        avail = num[0] if max_tags is None else min(num[0], max_tags)
+        if avail == 0:
+            return []
+
+        tags = ffi.new("struct bladerf_rx_gain_tag_msg[]", avail)
+        _check_error(libbladeRF.bladerf_get_rx_gain_tags(self.dev[0], tags,
+                                                         avail, num))
+
+        return [RxGainTagMsg(
+                    timestamp=int(t.timestamp),
+                    sample_offset=t.sample_offset,
+                    sample_count=t.sample_count,
+                    msg_sample_offset=t.msg_sample_offset,
+                    gain_index=t.gain_index,
+                    flags=t.flags,
+                    chunk_gain_index=tuple(t.chunk_gain_index),
+                    locked=bool(t.flags & RX_GAIN_TAG_LOCKED),
+                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED))
+                for t in tags]
 
     # Phase Detector/Frequency Synthesizer
 
@@ -1285,3 +1475,57 @@ class BladeRF:
         See help(bladerf.BladeRF._Channel) or help(rx) for more information.
         """
         return self._Channel(self, ch)
+
+
+RxGainTag = collections.namedtuple(
+    "RxGainTag",
+    "version flags gain_index gain_index_min gain_index_max chunks "
+    "num_messages chunk_gain_index changed locked")
+
+RX_GAIN_TAG_VERSION_NONE = 0
+RX_GAIN_TAG_VERSION_1 = 1
+RX_GAIN_TAG_CHANGED = 1 << 0
+# Only fast-attack AGC ever sets this: the AD9361 drives gain lock from the
+# fast-attack state machine, and UG-570 says it applies only to that mode. In
+# slow-attack and hybrid it is always clear. Use gain_index_min == gain_index_max
+# with `changed` False to decide whether the gain was steady in any mode.
+RX_GAIN_TAG_LOCKED = 1 << 1
+# Per-message entries only: this message's header was consumed by an earlier
+# sync_rx() call, so its profile was carried over rather than read during the
+# call that produced the entry.
+RX_GAIN_TAG_CARRIED = 1 << 2
+
+RxGainTagMsg = collections.namedtuple(
+    "RxGainTagMsg",
+    "timestamp sample_offset sample_count msg_sample_offset gain_index flags "
+    "chunk_gain_index locked carried")
+
+
+def rx_gain_tag(meta):
+    """Decode the RFIC gain profile that bladerf_sync_rx() overlays on
+    bladerf_metadata.reserved.
+
+    `meta` is the cffi "struct bladerf_metadata *" passed to sync_rx.
+
+    Returns an RxGainTag, or None when the FPGA did not supply one (needs
+    v0.17.0 or later, and a metadata RX format).
+
+    Note `locked` is meaningful in fast-attack AGC only; see
+    RX_GAIN_TAG_LOCKED.
+    """
+    tag = ffi.new("struct bladerf_rx_gain_tag *")
+    ffi.memmove(tag, meta.reserved, ffi.sizeof("struct bladerf_rx_gain_tag"))
+    if tag.version == RX_GAIN_TAG_VERSION_NONE:
+        return None
+    n = min(tag.chunks, len(tag.chunk_gain_index))
+    return RxGainTag(version=tag.version,
+                     flags=tag.flags,
+                     gain_index=tag.gain_index,
+                     gain_index_min=tag.gain_index_min,
+                     gain_index_max=tag.gain_index_max,
+                     chunks=tag.chunks,
+                     num_messages=tag.num_messages,
+                     chunk_gain_index=tuple(tag.chunk_gain_index[i]
+                                            for i in range(n)),
+                     changed=bool(tag.flags & RX_GAIN_TAG_CHANGED),
+                     locked=bool(tag.flags & RX_GAIN_TAG_LOCKED))

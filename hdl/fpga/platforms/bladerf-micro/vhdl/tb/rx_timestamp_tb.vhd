@@ -299,12 +299,12 @@ begin
         );
 
     -- Generate phase-shifted PLL clock
-    U_fx3_pll : entity rtl_work.fx3_pll
+    U_fx3_pll : entity nuand.fx3_pll
         port map (
-            inclk0   =>  fx3_pclk,
-            areset   =>  pll_reset,
-            c0       =>  fx3_pclk_pll,
-            locked   =>  pll_locked
+            refclk   => fx3_pclk,
+            rst      => pll_reset,
+            outclk_0 => fx3_pclk_pll,
+            locked   => pll_locked
         );
 
     tx_clock    <= not tx_clock  after TX_HALF_PERIOD ;
@@ -388,7 +388,11 @@ begin
     -- RX Submodule
     U_rx : entity work.rx
         generic map (
-            NUM_STREAMS            => adc_controls'length
+            NUM_STREAMS            => adc_controls'length,
+            -- Exercise the deferred (tail-of-message) metadata commit: the
+            -- inter-header timestamp delta asserted below is what proves the
+            -- message length is still exactly GPIF_BUF_SIZE - HEADER_LEN.
+            ENABLE_GAIN_TAG        => true
         )
         port map (
             rx_reset               => rx_reset,

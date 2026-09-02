@@ -168,6 +168,131 @@ API_EXPORT
 int CALL_CONV bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out);
 
 /**
+ * Convert an RX gain-table index into the conversion gain, in dB, that the
+ * receive chain actually achieved.
+ *
+ * Intended for the `gain_index` fields of ::bladerf_rx_gain_tag, so that a gain
+ * the FPGA sampled alongside the IQ can be used to turn a measured power into
+ * an absolute one:
+ *
+ * @code
+ *     power_dbm = power_dbfs - gain_db;
+ * @endcode
+ *
+ * The LO frequency of `ch` selects both the gain-table band and the calibration
+ * point. When a gain calibration table is loaded and enabled for the channel
+ * (bladerf_load_gain_calibration()), its frequency-interpolated correction is
+ * included, which is what makes the result an absolute reference rather than a
+ * nominal gain. Without one, the return value is only the nominal gain and the
+ * dBm figure above will carry an uncalibrated offset.
+ *
+ * @note  Valid in both AGC and manual gain modes. Under AGC nothing
+ *        pre-compensates the commanded gain, so the index carries the raw
+ *        nominal gain; under MGC with calibration enabled bladerf_set_gain()
+ *        already folded the correction into what it commanded, and the two
+ *        cancel to the gain that was requested. Either way the return value is
+ *        the figure to subtract.
+ *
+ * @note  Assumes the RFIC is using the full gain table with digital gain
+ *        disabled, which is how libbladeRF configures it. Returns
+ *        ::BLADERF_ERR_INVAL for an index outside that table, which usually
+ *        means CTRL_OUT is not pointed at the gain index (RFIC register 0x035
+ *        != 0x16).
+ *
+ * @note  In ::BLADERF_TUNING_MODE_FPGA this call costs a USB round trip to read
+ *        the LO frequency, so it is not free to call per received buffer. The
+ *        result only changes when the gain index or the tuned frequency does.
+ *
+ * @note  Requires FPGA v0.17.0 or later (::BLADERF_CAP_FPGA_RX_GAIN_TAG), the
+ *        same gate as bladerf_get_rx_gain_tags(). An older image supplies no
+ *        gain index, so anything reaching here came from elsewhere and would be
+ *        converted into a plausible-looking figure; ::BLADERF_ERR_UNSUPPORTED
+ *        is returned instead.
+ *
+ * @see   bladerf_load_gain_calibration(), bladerf_get_gain()
+ *
+ * @param      dev         Device handle
+ * @param[in]  ch          RX channel the index came from
+ * @param[in]  gain_index  Full gain-table index
+ * @param[out] gain_db     Pointer for storing the gain, in dB
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
+                                             bladerf_channel ch,
+                                             uint8_t gain_index,
+                                             float *gain_db);
+
+/**
+ * Retrieve the per-message RFIC gain profiles for the most recent
+ * bladerf_sync_rx() call on this device.
+ *
+ * ::bladerf_rx_gain_tag, overlaid on ::bladerf_metadata::reserved, has room for
+ * only one message's `chunk_gain_index`, so a call that spans several messages
+ * summarizes the rest into `gain_index_min` / `gain_index_max` /
+ * ::BLADERF_RX_GAIN_TAG_CHANGED. This returns the full set: one
+ * ::bladerf_rx_gain_tag_msg per message the call consumed, in receive order,
+ * each carrying its own chunk profile and the range of the caller's sample
+ * buffer it applies to. Nothing else is needed to attribute a gain to every
+ * sample of an arbitrarily large receive.
+ *
+ * Call it from the same thread that called bladerf_sync_rx(), before the next
+ * bladerf_sync_rx(), which discards the capture and starts a new one.
+ *
+ * @code
+ *     unsigned int i, n;
+ *     struct bladerf_rx_gain_tag_msg tags[N];
+ *
+ *     status = bladerf_sync_rx(dev, samples, num_samples, &meta, timeout);
+ *     status = bladerf_get_rx_gain_tags(dev, tags, N, &n);
+ *     if (n > N) {
+ *         // more messages than tags[] could hold; the first N were written
+ *     }
+ *     for (i = 0; i < n && i < N; i++) {
+ *         apply_gain(samples + tags[i].sample_offset, tags[i].sample_count,
+ *                    &tags[i]);
+ *     }
+ * @endcode
+ *
+ * Sizing `tags[]`: a call returning `num_samples` samples can span at most
+ * `num_samples / 2044 + 2` messages on SuperSpeed (`/ 1020` on Hi-Speed), or
+ * more precisely `num_samples / samples_per_message + 2`, where
+ * `samples_per_message` is the message payload for the negotiated USB speed.
+ *
+ * @note `*num_tags` is the count to trust, not ::bladerf_rx_gain_tag::num_messages,
+ *       which counts headers *read* and so can be one higher -- a header that
+ *       contributed no samples is counted there and has no entry here.
+ *
+ * @note `*num_tags` reports how many entries were *available*, which can exceed
+ *       `max_tags`; at most `max_tags` are written. Zero means no samples were
+ *       attributed -- either the call returned none, or it returned only samples
+ *       from a message whose header a call preceding it consumed and the retained
+ *       profile in ::bladerf_metadata::reserved is the one that applies.
+ *
+ * @note Only ::BLADERF_FORMAT_SC16_Q11_META and ::BLADERF_FORMAT_SC8_Q7_META
+ *       carry the tag, and it requires FPGA v0.17.0 or later
+ *       (::BLADERF_CAP_FPGA_RX_GAIN_TAG). Otherwise this returns
+ *       ::BLADERF_ERR_UNSUPPORTED, exactly the case in which
+ *       ::bladerf_rx_gain_tag::version reads
+ *       ::BLADERF_RX_GAIN_TAG_VERSION_NONE.
+ *
+ * @see bladerf_rx_gain_tag_to_gain_db(), ::bladerf_rx_gain_tag_msg
+ *
+ * @param      dev       Device handle
+ * @param[out] tags      Array to fill, or NULL to query the count only
+ * @param[in]  max_tags  Number of entries `tags` can hold
+ * @param[out] num_tags  Number of entries available
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_get_rx_gain_tags(struct bladerf *dev,
+                                       struct bladerf_rx_gain_tag_msg *tags,
+                                       unsigned int max_tags,
+                                       unsigned int *num_tags);
+
+/**
  * RFIC RX FIR filter choices
  */
 typedef enum {

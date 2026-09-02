@@ -173,6 +173,22 @@ architecture arch of sample_stream_tb is
 
     signal rx_packet_ready         :   std_logic;
     signal tx_packet_ready         :   std_logic;
+
+    -- RFIC gain tag. Layout must match fifo_writer:
+    --   31:25 base index, 24 lock, 23:18/17:12/11:6/5:0 chunk deltas (signed).
+    constant GAIN_TAG_CHUNKS       :   natural := 4;
+    constant GAIN_TAG_DELTA_BITS   :   natural := 6;
+
+    -- Gain indices the stimulus walks through, as CTRL_OUT bytes (bit 7 = lock).
+    constant GAIN_A                :   std_logic_vector(7 downto 0) := x"28"; -- 40
+    constant GAIN_B                :   std_logic_vector(7 downto 0) := x"34"; -- 52
+    constant GAIN_C                :   std_logic_vector(7 downto 0) := x"B4"; -- 52 + lock
+
+    signal rfic_ctrl_out           :   std_logic_vector(7 downto 0) := GAIN_A;
+    signal rfic_ctrl_out_valid     :   std_logic := '0';
+    signal gain_tags_checked        :   natural := 0;
+    signal gain_tags_skipped        :   natural := 0;
+    signal gain_deltas_seen         :   natural := 0;
 begin
 
     usb_speed <= '0' ;
@@ -263,7 +279,8 @@ begin
     -- RX Submodule
     U_rx : entity work.rx
         generic map (
-            NUM_STREAMS            => adc_controls'length
+            NUM_STREAMS            => adc_controls'length,
+            ENABLE_GAIN_TAG        => true
         )
         port map (
             rx_reset               => rx_reset,
@@ -299,6 +316,10 @@ begin
 
             -- Mini expansion signals
             mini_exp               => "00",
+
+            -- RFIC CTRL_OUT, tagged into the metadata header
+            rfic_ctrl_out          => rfic_ctrl_out,
+            rfic_ctrl_out_valid    => rfic_ctrl_out_valid,
 
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_clock,
@@ -449,6 +470,117 @@ begin
         end loop ;
     end process ;
 
+    -- Walk the RFIC gain index the way an AGC would. Atomicity of the byte is
+    -- ctrl_out_xfer's job and is covered by its own testbench, so this drives
+    -- rx_clock-domain values directly.
+    ctrl_out_stimulus : process
+    begin
+        rfic_ctrl_out       <= GAIN_A;
+        rfic_ctrl_out_valid <= '0';
+        nop( rx_clock, 20 );
+        rfic_ctrl_out_valid <= '1';
+
+        -- Hold long enough for several whole messages at one gain, so the
+        -- checker sees flat profiles (every delta zero).
+        wait for 300 us;
+
+        -- Step mid-stream: some message must show a non-zero delta.
+        nop( rx_clock, 1 );
+        rfic_ctrl_out <= GAIN_B;
+        wait for 300 us;
+
+        -- Same index, gain lock asserted.
+        nop( rx_clock, 1 );
+        rfic_ctrl_out <= GAIN_C;
+        wait for 300 us;
+
+        nop( rx_clock, 1 );
+        rfic_ctrl_out <= GAIN_A;
+        wait;
+    end process;
+
+    -- Drain the RX metadata FIFO and check the gain profile in each header.
+    --
+    -- The meta FIFO is 128 bits wide on the write side and 32 on the read side,
+    -- so each header comes out as four words with the reserved word first. Reads
+    -- start from empty, so counting words keeps us aligned to that boundary.
+    -- LPM_SHOWAHEAD is ON, meaning rdata already presents the head of the queue
+    -- and rreq pops it -- so the word consumed at an edge is the rdata visible
+    -- during the cycle in which rreq is high.
+    rx_meta_reader : process( fx3_clock, reset )
+        variable word_idx : natural range 0 to 3 := 0;
+        variable tag      : std_logic_vector(31 downto 0);
+        variable base     : integer;
+        variable delta    : integer;
+        variable absolute : integer;
+        variable nonzero  : boolean;
+    begin
+        if( reset = '1' ) then
+            rx_meta_fifo.rreq <= '0';
+            word_idx          := 0;
+        elsif( rising_edge(fx3_clock) ) then
+            if( rx_meta_fifo.rreq = '1' ) then
+                if( word_idx = 0 ) then
+                    tag  := rx_meta_fifo.rdata;
+                    base := to_integer(unsigned(tag(31 downto 25)));
+
+                    if( base = 0 ) then
+                        -- The cross-domain byte had not produced a settled value
+                        -- when this message started, so fifo_writer held its
+                        -- post-reset base. The stimulus never drives index 0, so
+                        -- this is unambiguous. Only expected at start of stream.
+                        gain_tags_skipped <= gain_tags_skipped + 1;
+                    else
+                        -- The stimulus only ever drives indices 40 and 52.
+                        assert( base = 40 or base = 52 )
+                            report "gain tag base is not an index the stimulus " &
+                                   "drove: " & integer'image(base) & " (word " &
+                                   to_hstring(tag) & ")"
+                            severity failure;
+
+                        nonzero := false;
+                        for i in 0 to GAIN_TAG_CHUNKS-1 loop
+                            delta := to_integer(signed(
+                                tag((GAIN_TAG_CHUNKS-1-i)*GAIN_TAG_DELTA_BITS +
+                                    GAIN_TAG_DELTA_BITS-1 downto
+                                    (GAIN_TAG_CHUNKS-1-i)*GAIN_TAG_DELTA_BITS)));
+                            absolute := base + delta;
+
+                            if( delta /= 0 ) then
+                                nonzero := true;
+                            end if;
+
+                            -- Every reconstructed index must still be one the
+                            -- stimulus drove; a mis-packed or mis-signed field
+                            -- shows up here.
+                            assert( absolute = 40 or absolute = 52 )
+                                report "chunk " & integer'image(i) &
+                                       " of gain tag " & to_hstring(tag) &
+                                       " reconstructs to " &
+                                       integer'image(absolute) &
+                                       ", which the stimulus never drove"
+                                severity failure;
+                        end loop;
+
+                        if( nonzero ) then
+                            gain_deltas_seen <= gain_deltas_seen + 1;
+                        end if;
+
+                        gain_tags_checked <= gain_tags_checked + 1;
+                    end if;
+                end if;
+
+                if( word_idx = 3 ) then
+                    word_idx := 0;
+                else
+                    word_idx := word_idx + 1;
+                end if;
+            end if;
+
+            rx_meta_fifo.rreq <= not rx_meta_fifo.rempty;
+        end if;
+    end process;
+
     -- Testbench
     tb : process
     begin
@@ -462,6 +594,19 @@ begin
         rx_enable <= '1' ;
         tx_enable <= '1' ;
         nop( fx3_clock, 2000000 ) ;
+        -- Guard against the gain tag checker silently never running
+        assert( gain_tags_checked > 0 )
+            report "no RX metadata headers were checked for a gain tag"
+            severity failure ;
+        -- The base alone would pass even if the delta fields were dead, so
+        -- require that at least one message straddled the gain step.
+        assert( gain_deltas_seen > 0 )
+            report "no gain tag carried a non-zero chunk delta, so the delta " &
+                   "path is untested"
+            severity failure ;
+        report "-- Gain tags checked: " & integer'image(gain_tags_checked) &
+               ", with deltas: " & integer'image(gain_deltas_seen) &
+               ", skipped (pre-valid): " & integer'image(gain_tags_skipped) ;
         report "-- End of Simulation --" ;
         stop(2) ;
         wait ;

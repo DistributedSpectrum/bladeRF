@@ -195,8 +195,18 @@ AD9361_InitParam bladerf2_rfic_init_params = {
 
     /* Control Out Setup */
     /* See https://wiki.analog.com/resources/tools-software/linux-drivers/iio-transceiver/ad9361-customization#control_output_setup */
+    /* Row 0x16 of UG-570 Table 44 puts CH1 Gain Lock on CTRL_OUT[7] and the CH1 full
+     * gain-table index on CTRL_OUT[6:0], in real time. All 8 CTRL_OUT pins are wired to
+     * the FPGA, which snapshots them into the RX metadata header (see fifo_writer.vhd)
+     * so the host can convert IQ magnitude to absolute power. Only complete because
+     * we use the full gain table with digital gain disabled
+     * (split_gain_table_mode_enable = 0, gc_dig_gain_enable = 0 above).
+     *
+     * UG-570 specifies these bits for AGC modes only. In practice they were also
+     * observed to track commanded manual gain exactly on a 5CEBA4 part, but that
+     * is undocumented behaviour and should not be relied on. */
     0xFF,           // Enable all CTRL_OUT bits                                         // ctrl_outs_enable_mask *** adi,ctrl-outs-enable-mask
-    0,              // CTRL_OUT index is 0                                              // ctrl_outs_index *** adi,ctrl-outs-index
+    0x16,           // CH1 Gain Lock + CH1 Rx Gain[6:0]                                 // ctrl_outs_index *** adi,ctrl-outs-index
 
     /* External LNA Control */
     /* bladeRF Micro: GPO_0 is TP3, GPO_1 is TP4 */
@@ -483,8 +493,18 @@ AD9361_InitParam bladerf2_rfic_init_params_fastagc_burst = {
 
     /* Control Out Setup */
     /* See https://wiki.analog.com/resources/tools-software/linux-drivers/iio-transceiver/ad9361-customization#control_output_setup */
+    /* Row 0x07: CH1 overloads + CH1 AGC state machine + CH1 Gain Lock. This profile
+     * monitors the fast-attack AGC state machine, so it does not get the per-packet
+     * gain tag that row 0x16 provides for the slow-attack profile above.
+     *
+     * Were it pointed at row 0x16, note that fast-attack's 1 us gain update
+     * interval (below) fits ~25 gain decisions into one 511-dword chunk at
+     * 20 Msps, against at most one per packet for slow-attack. The per-chunk
+     * profile only records each chunk's final value, so it bounds the gain in
+     * fast-attack rather than describing it. Measured excursions reached 29 of
+     * the 32 representable indices. */
     0xFF,           // Enable all CTRL_OUT bits                                         // ctrl_outs_enable_mask *** adi,ctrl-outs-enable-mask
-    7,              // CTRL_OUT index is 0                                              // ctrl_outs_index *** adi,ctrl-outs-index
+    7,              // CH1 overloads + CH1 AGC SM[2:0] + CH1 Gain Lock                  // ctrl_outs_index *** adi,ctrl-outs-index
 
     /* External LNA Control */
     /* bladeRF Micro: GPO_0 is TP3, GPO_1 is TP4 */

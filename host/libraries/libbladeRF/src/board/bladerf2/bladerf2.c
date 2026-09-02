@@ -51,6 +51,7 @@
 #include "streaming/sync.h"
 
 #include "conversions.h"
+#include "device_calibration.h"
 #include "devinfo.h"
 #include "helpers/file.h"
 #include "helpers/version.h"
@@ -1439,19 +1440,34 @@ static int bladerf2_get_quick_tune(struct bladerf *dev,
     pm = _get_band_port_map_by_freq(ch, freq);
 
     if (BLADERF_CHANNEL_IS_TX(ch)) {
-        if (board_data->quick_tune_tx_profile < NUM_BBP_FASTLOCK_PROFILES) {
-            /* Assign Nios and RFFE profile numbers */
-            quick_tune->nios_profile = board_data->quick_tune_tx_profile++;
-            log_verbose("Quick tune assigned Nios TX fast lock index: %u\n",
-                        quick_tune->nios_profile);
-            quick_tune->rffe_profile =
-                quick_tune->nios_profile % NUM_RFFE_FASTLOCK_PROFILES;
-            log_verbose("Quick tune assigned RFFE TX fast lock index: %u\n",
-                        quick_tune->rffe_profile);
-        } else {
-            log_error("Reached maximum number of TX quick tune profiles.");
-            return BLADERF_ERR_UNEXPECTED;
-        }
+        /* Profile indices wrap instead of running out.
+         *
+         * The counter only ever incremented, and was reset in exactly one
+         * place: board initialisation. An application that keeps asking for
+         * quick tunes therefore had a hard budget of 256 for the lifetime of
+         * the device handle, after which every further call failed with
+         * BLADERF_ERR_UNEXPECTED and no way to recover short of reopening.
+         *
+         * That budget is not a hardware limit on how many retune targets may
+         * exist over time. The RFIC holds NUM_RFFE_FASTLOCK_PROFILES slots
+         * and the Nios holds NUM_BBP_FASTLOCK_PROFILES; both are caches that
+         * the code already overwrites - the RFFE index is assigned modulo the
+         * slot count, so profile 8 has always overwritten profile 0. Letting
+         * the Nios index wrap in the same way makes the two consistent and
+         * keeps a long-running sweep working.
+         *
+         * Measured on a bladeRF 2.0 micro xA4 sweeping 70 MHz - 6 GHz with
+         * 4700 stops: the counter reached 256 after roughly 165-229 s and
+         * every subsequent retune to a new frequency failed.
+         */
+        quick_tune->nios_profile =
+            board_data->quick_tune_tx_profile++ % NUM_BBP_FASTLOCK_PROFILES;
+        log_verbose("Quick tune assigned Nios TX fast lock index: %u\n",
+                    quick_tune->nios_profile);
+        quick_tune->rffe_profile =
+            quick_tune->nios_profile % NUM_RFFE_FASTLOCK_PROFILES;
+        log_verbose("Quick tune assigned RFFE TX fast lock index: %u\n",
+                    quick_tune->rffe_profile);
 
         /* Create a fast lock profile in the RFIC */
         CHECK_STATUS(
@@ -1468,19 +1484,15 @@ static int bladerf2_get_quick_tune(struct bladerf *dev,
         quick_tune->spdt = (pm->spdt << 6) | (pm->spdt << 4);
 
     } else {
-        if (board_data->quick_tune_rx_profile < NUM_BBP_FASTLOCK_PROFILES) {
-            /* Assign Nios and RFFE profile numbers */
-            quick_tune->nios_profile = board_data->quick_tune_rx_profile++;
-            log_verbose("Quick tune assigned Nios RX fast lock index: %u\n",
-                        quick_tune->nios_profile);
-            quick_tune->rffe_profile =
-                quick_tune->nios_profile % NUM_RFFE_FASTLOCK_PROFILES;
-            log_verbose("Quick tune assigned RFFE RX fast lock index: %u\n",
-                        quick_tune->rffe_profile);
-        } else {
-            log_error("Reached maximum number of RX quick tune profiles.");
-            return BLADERF_ERR_UNEXPECTED;
-        }
+        /* Profile indices wrap instead of running out; see the TX branch. */
+        quick_tune->nios_profile =
+            board_data->quick_tune_rx_profile++ % NUM_BBP_FASTLOCK_PROFILES;
+        log_verbose("Quick tune assigned Nios RX fast lock index: %u\n",
+                    quick_tune->nios_profile);
+        quick_tune->rffe_profile =
+            quick_tune->nios_profile % NUM_RFFE_FASTLOCK_PROFILES;
+        log_verbose("Quick tune assigned RFFE RX fast lock index: %u\n",
+                    quick_tune->rffe_profile);
 
         /* Create a fast lock profile in the RFIC */
         CHECK_STATUS(
@@ -1533,9 +1545,47 @@ static int bladerf2_schedule_retune(struct bladerf *dev,
         return BLADERF_ERR_UNSUPPORTED;
     }
 
-    return dev->backend->retune2(dev, ch, timestamp, quick_tune->nios_profile,
-                                 quick_tune->rffe_profile, quick_tune->port,
-                                 quick_tune->spdt);
+    CHECK_STATUS(dev->backend->retune2(dev, ch, timestamp,
+                                       quick_tune->nios_profile,
+                                       quick_tune->rffe_profile,
+                                       quick_tune->port, quick_tune->spdt));
+
+    /* The Nios recalls the profile by writing the RFIC directly, which
+     * leaves the part in fastlock mode with FORCE_ALC_ENABLE asserted.
+     * ad9361_fastlock_prepare() cannot undo that on its own: it is gated
+     * on this driver's own bookkeeping, and a recall performed by the
+     * FPGA never touches it. Ownership of the RFPLL therefore returns to
+     * host tuning with forced controls still active.
+     *
+     * Measured on a bladeRF 2.0 micro xA4, interleaving a recall with
+     * ordinary tuning every fifth stop of a 242-point sweep:
+     *
+     *   without this exit   49 lock failures in 643 tunes, first at 280
+     *   with it              1 lock failure  in 702 tunes, first at 495
+     *
+     * Without the exit the failures form a series that never recovers,
+     * and 0x247 reads 0x40 throughout: the charge pump has saturated
+     * low. Three runs with it in place gave zero consecutive failures,
+     * and confirmed the leak occurs on every recall without exception.
+     *
+     * Immediate scheduling is the only case handled here. A retune
+     * scheduled for a future timestamp completes inside the FPGA long
+     * after this call returns, so the exit has to happen there instead.
+     *
+     * board_data->phy is only valid under BLADERF_TUNING_MODE_HOST --
+     * bladerf2_set_tuning_mode(FPGA) deinitializes the host RFIC control
+     * and nulls it out, since the Nios core owns the AD9361 SPI bus
+     * directly in that mode. A scheduled retune is the normal way to
+     * apply FPGA-recalled quick-tune profiles, which requires FPGA
+     * tuning mode, so skip this host-SPI workaround when phy is NULL
+     * rather than dereferencing it.
+     */
+    if (BLADERF_RETUNE_NOW == timestamp && NULL != board_data->phy) {
+        CHECK_AD936X(ad9361_fastlock_exit_foreign(
+            board_data->phy, BLADERF_CHANNEL_IS_TX(ch)));
+    }
+
+    return 0;
 }
 
 static int bladerf2_cancel_scheduled_retunes(struct bladerf *dev,
@@ -3149,6 +3199,115 @@ int bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out)
     });
 
     return 0;
+}
+
+int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
+                                   bladerf_channel ch,
+                                   uint8_t gain_index,
+                                   float *gain_db)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+    NULL_CHECK(gain_db);
+
+    struct bladerf2_board_data *board_data = dev->board_data;
+
+    if (BLADERF_CHANNEL_IS_TX(ch)) {
+        return BLADERF_ERR_INVAL;
+    }
+
+    /* Gated on the same capability as the tags themselves. An older image has
+     * no gain index to convert, so any value reaching here came from somewhere
+     * else and would be turned into a plausible-looking dB figure. */
+    if (!have_cap(board_data->capabilities, BLADERF_CAP_FPGA_RX_GAIN_TAG)) {
+        log_debug("This FPGA version (%u.%u.%u) does not tag RX packets with "
+                  "the RFIC gain index.\n",
+                  board_data->fpga_version.major,
+                  board_data->fpga_version.minor,
+                  board_data->fpga_version.patch);
+
+        return BLADERF_ERR_UNSUPPORTED;
+    }
+
+    WITH_MUTEX(&dev->lock, {
+        bladerf_frequency frequency = 0;
+        float offset;
+        float total;
+        bool ok;
+        int rfic_gain;
+
+        CHECK_STATUS_LOCKED(dev->board->get_frequency(dev, ch, &frequency));
+        CHECK_STATUS_LOCKED(get_gain_offset(dev, ch, &offset));
+
+        rfic_gain = ad936x_gain_index_to_gain_db(gain_index, frequency, &ok);
+        if (!ok) {
+            log_warning("Gain index %u is outside the RX gain table for "
+                        "%" BLADERF_PRIuFREQ " Hz. Is RFIC register 0x035 "
+                        "still 0x16?\n",
+                        gain_index, frequency);
+            MUTEX_UNLOCK(__lock);
+            return BLADERF_ERR_INVAL;
+        }
+
+        /* Nominal gain, composed the way bladerf2_get_gain() composes it */
+        total = (float)rfic_gain + offset;
+
+        /* Fold in the gain calibration table, which turns the nominal gain into
+         * the conversion the hardware actually achieves at this frequency.
+         *
+         * Each RX entry is gain_corr = dBFS_measured - dBm_in, swept at a
+         * commanded gain of 0 (see load_gain_cal_entries_from_image), so the
+         * system obeys
+         *
+         *     dBFS = dBm_in + G + gain_corr(freq)
+         *
+         * and (G + gain_corr) is exactly the figure to subtract from a measured
+         * dBFS power to recover dBm.
+         *
+         * This holds in both gain modes, so there is no need to branch on one. The
+         * reason is the RFIC's own rule, not the library's: ad9361_set_rx_gain()
+         * discards a commanded gain unless the mode is MGC, so under AGC nothing can
+         * pre-compensate what the AGC selects and G is the raw nominal gain. Under MGC
+         * with calibration enabled, the commanded gain was (target - gain_corr), so G
+         * already carries the -gain_corr and the sum collapses back to the requested
+         * target. (Do not justify this with "bladerf_set_gain() forces MGC": the
+         * retune path applies a correction through the board layer directly, which
+         * skips that forcing.) */
+        if (dev->gain_tbls[ch].enabled) {
+            struct bladerf_gain_cal_entry entry;
+
+            CHECK_STATUS_LOCKED(
+                get_gain_cal_entry(&dev->gain_tbls[ch], frequency, &entry));
+
+            total += (float)entry.gain_corr;
+        }
+
+        *gain_db = total;
+    });
+
+    return 0;
+}
+
+int bladerf_get_rx_gain_tags(struct bladerf *dev,
+                             struct bladerf_rx_gain_tag_msg *tags,
+                             unsigned int max_tags,
+                             unsigned int *num_tags)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+    NULL_CHECK(num_tags);
+
+    struct bladerf2_board_data *board_data = dev->board_data;
+
+    if (!board_data->sync[BLADERF_RX].initialized) {
+        RETURN_INVAL("rx gain tags", "sync rx not initialized");
+    }
+
+    /* Deliberately not under dev->lock: this reads state that belongs to the
+     * last bladerf_sync_rx(), which does not take that lock either, and it must
+     * not be made to wait behind an unrelated control transfer. */
+    return sync_get_gain_tags(&board_data->sync[BLADERF_RX], tags, max_tags,
+                              num_tags);
 }
 
 int bladerf_get_rfic_rx_fir(struct bladerf *dev, bladerf_rfic_rxfir *rxfir)

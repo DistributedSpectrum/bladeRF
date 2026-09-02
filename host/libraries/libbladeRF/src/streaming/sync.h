@@ -52,6 +52,11 @@ typedef enum {
 #define SYNC_RX_MAX_REORDER 256
 #endif
 
+/* Chunks per message in the RFIC gain tag. Kept independent of metadata.h so
+ * this header stays usable without host_config.h having been included first;
+ * sync.c static-asserts that the two agree. */
+#define SYNC_GAIN_TAG_CHUNKS 4
+
 struct rx_reorder_entry {
     uint32_t seq;
     unsigned int buf_idx;
@@ -91,6 +96,21 @@ struct buffer_mgmt {
      * how many more transfers should be considered invalid and require
      * resubmission */
     unsigned int resubmit_count;
+
+    /* Set by the RX worker when it detects an overrun, cleared once the
+     * condition has been reported to a bladerf_sync_rx() caller. The worker
+     * recovers by resubmitting buffers, so the sample stream has a gap that
+     * is otherwise invisible to the caller. */
+    bool overrun_pending;
+
+    /* Also set by the RX worker on an overrun, cleared once the consumer
+     * has dropped the buffers that were already full at that moment. Those
+     * buffers hold the OLDEST samples: everything the hardware produced
+     * after the ring filled was discarded, so on resume the consumer would
+     * read history first - up to (num_buffers - num_transfers) buffers of
+     * it. With a metadata format the timestamps expose this; without one
+     * the stale prefix is indistinguishable from live data. */
+    bool stale_pending;
 
     /* Applicable to TX only. Denotes which context is responsible for
      * submitting full buffers to the underlying async system */
@@ -173,6 +193,11 @@ typedef enum {
 struct sync_meta {
     sync_meta_state state; /* State of metadata processing */
 
+    bool have_timestamp;   /* curr_timestamp holds a value read from a
+                            * message header. Until then there is nothing to
+                            * compare against, so the first header of a
+                            * stream must not be treated as a discontinuity. */
+
     uint8_t *curr_msg;            /* Points to current message in the buffer */
     size_t curr_msg_off;          /* Offset into current message (samples),
                                    * ignoring the 4-samples worth of metadata */
@@ -189,6 +214,42 @@ struct sync_meta {
             uint64_t
                 msg_timestamp;  /* Timestamp contained in the current message */
             uint32_t msg_flags; /* Flags for the current message */
+
+            /* RFIC gain profile, accumulated over every message consumed by
+             * the current sync_rx() call. One call can span many messages but
+             * returns a single bladerf_metadata, so the per-message profiles
+             * have to be summarized. See metadata.h for the wire format. */
+            struct {
+                bool supported;   /* FPGA advertises the tag at all */
+
+                /* Most recent message's profile, persisting across calls. A
+                 * caller reading less than a message at a time consumes no
+                 * header on most calls and still needs to be told a gain. */
+                bool known;
+                uint8_t last_base;
+                bool last_lock;
+                uint8_t last_chunk[SYNC_GAIN_TAG_CHUNKS];
+
+                /* Reset at the start of each sync_rx() call */
+                bool seen;        /* A header was consumed this call */
+                bool changed;     /* Gain moved within the returned samples */
+                uint8_t base;     /* Base of the first message this call */
+                bool lock;        /* Lock bit of the first message this call */
+                uint8_t idx_min;  /* Min over every chunk seen this call */
+                uint8_t idx_max;  /* Max over every chunk seen this call */
+                uint8_t first_chunk[SYNC_GAIN_TAG_CHUNKS];
+                uint16_t count;   /* Number of messages this call */
+
+                /* Per-message capture for the current call, which the summary
+                 * fields above cannot hold: one entry per message that
+                 * contributed samples, in order, tiling what was returned.
+                 * Grown on demand and never shrunk, so a steady-state reader
+                 * allocates once. NULL if allocation failed, in which case the
+                 * summary still works. */
+                struct bladerf_rx_gain_tag_msg *msgs;
+                size_t msgs_cap;  /* Entries allocated */
+                size_t msgs_len;  /* Entries used this call */
+            } gain_tag;
         };
 
         /* Used only for TX */
@@ -245,6 +306,22 @@ int sync_rx(struct bladerf_sync *sync,
             unsigned int num_samples,
             struct bladerf_metadata *metadata,
             unsigned int timeout_ms);
+
+/**
+ * Copy out the per-message RFIC gain profiles captured by the most recent
+ * sync_rx() call.
+ *
+ * @param       sync        Initialized RX sync handle
+ * @param[out]  tags        Array to fill, or NULL to query the count
+ * @param[in]   max_tags    Entries `tags` can hold
+ * @param[out]  num_tags    Entries available, which may exceed max_tags
+ *
+ * @return 0 on success, BLADERF_ERR_* on failure
+ */
+int sync_get_gain_tags(struct bladerf_sync *sync,
+                       struct bladerf_rx_gain_tag_msg *tags,
+                       unsigned int max_tags,
+                       unsigned int *num_tags);
 
 int sync_tx(struct bladerf_sync *sync,
             void const *samples,

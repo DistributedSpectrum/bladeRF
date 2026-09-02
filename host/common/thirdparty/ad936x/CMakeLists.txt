@@ -19,8 +19,18 @@ set(LIBAD936X_PATCH_DIR "${LIBAD936X_LOCAL_DIR}/patches")
 # Platform files
 set(LIBAD936X_PLATFORM_DIR "${LIBAD936X_LOCAL_DIR}/platform_bladerf2")
 
-# Upstream source (clean)
-set(LIBAD936X_UPSTREAM_DIR "${LIBAD936X_LOCAL_DIR}/../no-OS/ad9361/sw")
+# Upstream source (clean), vendored in-tree.
+#
+# This used to be ${LIBAD936X_LOCAL_DIR}/../no-OS/ad9361/sw, i.e. the no-OS submodule. That
+# submodule was pinned to a commit that exists only in working copies: six ad9361 patches (fastlock
+# entry/exit, signed temperature read, PLL lock bound, SPI failure reporting, gain-table row delay)
+# were committed locally and never pushed to analogdevicesinc/no-OS, so GitHub cannot serve the
+# revision and a clean checkout -- or any CI runner -- fails to fetch it.
+#
+# Only the eight files in LIBAD936X_UPSTREAM_FILES below are ever used, so they are vendored here
+# instead, carrying those patches with them. The submodule is gone; the HDL tree no longer has a
+# no-OS to build against, which is a deliberate trade for a repository that clones.
+set(LIBAD936X_UPSTREAM_DIR "${LIBAD936X_LOCAL_DIR}/ad9361_sw")
 # Upstream source (patched)
 set(LIBAD936X_UPSTREAM_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -109,30 +119,11 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     target_include_directories(ad936x PUBLIC /usr/include/malloc)
 endif()
 
-# If the submodule hasn't been initialized/updated, do so
+# The upstream sources are vendored (see LIBAD936X_UPSTREAM_DIR above), so there is no submodule
+# to initialise. Kept as a plain existence check: if this fails the checkout is incomplete.
 if(NOT IS_DIRECTORY ${LIBAD936X_UPSTREAM_DIR})
-    message(STATUS "libad936x: Attempting to initialize missing submodule")
-
-    find_package(Git)
-
-    if(GIT_FOUND)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} submodule init
-            WORKING_DIRECTORY ${LIBAD936X_BLADERF_ROOT}
-        )
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} submodule update
-            WORKING_DIRECTORY ${LIBAD936X_BLADERF_ROOT}
-        )
-    endif()
-endif()
-
-# Then, re-check for submodule...
-if(NOT IS_DIRECTORY ${LIBAD936X_UPSTREAM_DIR})
-    message(FATAL_ERROR "Directory ${LIBAD936X_UPSTREAM_DIR} was not found. "
-                        "It appears that this submodule has not been properly "
-                        "initialized. Please run 'git submodule init' and "
-                        "'git submodule update', and then re-run cmake.")
+    message(FATAL_ERROR "Directory ${LIBAD936X_UPSTREAM_DIR} was not found. The vendored ad9361 "
+                        "sources are missing from this checkout.")
 endif()
 
 

@@ -213,7 +213,7 @@ static struct cmd const cmd_table[] = {
         FIELD_INIT(.names, cmd_names_gain_calibration_load),
         FIELD_INIT(.exec, cmd_gain_calibration_load),
         FIELD_INIT(.desc, "Load gain calibration table to allow RX or TX to have exact pwr"),
-        FIELD_INIT(.help, CLI_CMD_HELPTEXT_gain_calibration_load),
+        FIELD_INIT(.help, CLI_CMD_HELPTEXT_load_gain),
         FIELD_INIT(.requires_device, true),
         FIELD_INIT(.requires_fpga, true),
         FIELD_INIT(.allow_while_streaming, false),

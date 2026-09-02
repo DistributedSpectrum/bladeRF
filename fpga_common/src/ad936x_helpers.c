@@ -124,8 +124,33 @@ int set_ad9361_port_by_freq(struct ad9361_rf_phy *phy,
     struct band_port_map const *port_map = NULL;
     int status;
 
+    /* Leave the RFIC port alone when the direction is being disabled.
+     *
+     * The shutdown entry in the band port map exists for the RF SPDT
+     * switches, which have a genuine "no connection" state
+     * (RFFE_CONTROL_SPDT_SHUTDOWN == 0x0). The RFIC port field has no such
+     * state: every value in that enum is a real input, and the 0 that the
+     * shutdown entry carries is AD936X_A_BALANCED, the high-band input.
+     *
+     * So disabling an RX channel tuned to, say, 915 MHz used to move the
+     * RFIC input from B_BALANCED to A_BALANCED, and re-enabling moved it
+     * back. That round trip is not free: measured on a TX1 -> 50 dB pad ->
+     * RX1 loopback at 915 MHz with manual gain control, the received level
+     * of an unchanged tone spread 0.48 dB (sigma 0.161) over 20
+     * disable/enable cycles, with REG_INPUT_SELECT observed toggling
+     * 0x43 <-> 0x4C each time and the reported gain staying at exactly
+     * 40.0 dB throughout.
+     *
+     * Keeping the port as-is costs nothing while disabled -- the direction
+     * is off and the SPDT is already disconnected -- and removes the
+     * level jitter on re-enable.
+     */
+    if (!enabled) {
+        return 0;
+    }
+
     /* Look up the port configuration for this frequency */
-    port_map = _get_band_port_map_by_freq(ch, enabled ? freq : 0);
+    port_map = _get_band_port_map_by_freq(ch, freq);
 
     if (NULL == port_map) {
         return BLADERF_ERR_INVAL;
@@ -191,6 +216,56 @@ bladerf_gain_mode gainmode_ad9361_to_bladerf(enum rf_gain_ctrl_mode gainmode,
     }
 
     return 0;
+}
+
+int ad936x_gain_index_to_gain_db(uint8_t gain_index,
+                                 bladerf_frequency rx_lo_hz,
+                                 bool *ok)
+{
+    /* Per-band parameters of the Analog Devices default RX full gain tables,
+     * matching ad9361_init_gain_tables() in the RFIC driver. Gain is affine in
+     * the table index once past idx_step_offset. */
+    struct {
+        bladerf_frequency max_freq;
+        int starting_gain_db;
+        int gain_step_db;
+        int idx_step_offset;
+        int max_gain_db;
+    } const bands[] = {
+        { 1300000000ULL, 1, 1, 0, 77 },  /* TBL_200_1300_MHZ */
+        { 4000000000ULL, -4, 1, 1, 71 }, /* TBL_1300_4000_MHZ */
+        { UINT64_MAX, -10, 1, 4, 62 },   /* TBL_4000_6000_MHZ */
+    };
+
+    size_t i;
+    int gain_db;
+
+    for (i = 0; i < ARRAY_SIZE(bands) - 1; ++i) {
+        if (rx_lo_hz <= bands[i].max_freq) {
+            break;
+        }
+    }
+
+    if (gain_index > bands[i].idx_step_offset) {
+        gain_db = bands[i].starting_gain_db +
+                  (gain_index - bands[i].idx_step_offset) *
+                      bands[i].gain_step_db;
+    } else {
+        gain_db = bands[i].starting_gain_db;
+    }
+
+    /* An index past the end of the table is not a gain index at all -- most
+     * likely CTRL_OUT is pointed at some row other than 0x16. Clamp, but tell
+     * the caller not to trust the result. */
+    if (NULL != ok) {
+        *ok = (gain_db <= bands[i].max_gain_db);
+    }
+
+    if (gain_db > bands[i].max_gain_db) {
+        gain_db = bands[i].max_gain_db;
+    }
+
+    return gain_db;
 }
 
 #endif  // !defined(BLADERF_NIOS_BUILD) || defined(BLADERF_NIOS_LIBAD936X)

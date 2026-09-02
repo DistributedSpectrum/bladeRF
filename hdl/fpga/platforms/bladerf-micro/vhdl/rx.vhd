@@ -28,7 +28,11 @@ library work;
 
 entity rx is
     generic (
-        NUM_STREAMS          : natural := 2
+        NUM_STREAMS          : natural := 2;
+
+        -- Tag the RX metadata header with a snapshot of rfic_ctrl_out. Only
+        -- enable this where that port is actually wired to the RFIC pins.
+        ENABLE_GAIN_TAG      : boolean := false
     );
     port (
         rx_reset               : in    std_logic;
@@ -69,6 +73,12 @@ entity rx is
 
         -- Mini expansion signals
         mini_exp               : in    std_logic_vector(1 downto 0);
+
+        -- RFIC CTRL_OUT, already transferred into rx_clock atomically by
+        -- ctrl_out_xfer. Tagged into the RX metadata header. Defaulted so top
+        -- levels that do not care need not wire it up.
+        rfic_ctrl_out          : in    std_logic_vector(7 downto 0) := (others => '0');
+        rfic_ctrl_out_valid    : in    std_logic := '0';
 
         -- Metadata to host via FX3
         meta_fifo_rclock       : in    std_logic;
@@ -230,7 +240,8 @@ begin
             FIFO_USEDW_WIDTH      => sample_fifo.wused'length,
             FIFO_DATA_WIDTH       => sample_fifo.wdata'length,
             META_FIFO_USEDW_WIDTH => meta_fifo.wused'length,
-            META_FIFO_DATA_WIDTH  => meta_fifo.wdata'length
+            META_FIFO_DATA_WIDTH  => meta_fifo.wdata'length,
+            ENABLE_GAIN_TAG       => ENABLE_GAIN_TAG
         )
         port map (
             clock               =>  rx_clock,
@@ -242,6 +253,8 @@ begin
             packet_en           =>  packet_en,
             timestamp           =>  rx_timestamp,
             mini_exp            =>  mini_exp,
+            rfic_ctrl_out       =>  rfic_ctrl_out,
+            rfic_ctrl_out_valid =>  rfic_ctrl_out_valid,
 
             fifo_full           =>  sample_fifo.wfull,
             fifo_usedw          =>  sample_fifo.wused,
