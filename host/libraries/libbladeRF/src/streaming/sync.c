@@ -1154,6 +1154,7 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
 
                         user_meta->status |= s->meta.msg_flags &
                            (BLADERF_META_FLAG_RX_HW_UNDERFLOW |
+                              BLADERF_META_FLAG_RX_HW_TIME_MARK |
                               BLADERF_META_FLAG_RX_HW_MINIEXP1 |
                               BLADERF_META_FLAG_RX_HW_MINIEXP2);
 

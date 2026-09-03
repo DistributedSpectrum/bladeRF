@@ -611,3 +611,59 @@ int set_biastee(struct cli_state *state, int argc, char **argv)
 out:
     return rv;
 }
+
+/* time_marker */
+int print_time_marker(struct cli_state *state, int argc, char **argv)
+{
+    int rv   = CLI_RET_OK;
+    int *err = &state->last_lib_error;
+    int status;
+    bool value;
+
+    status = bladerf_get_rx_time_marker(state->dev, &value);
+    if (status < 0) {
+        *err = status;
+        rv   = CLI_RET_LIBBLADERF;
+        goto out;
+    }
+
+    printf("  RX time marker:  %u\n", value ? 1 : 0);
+
+out:
+    return rv;
+}
+
+int set_time_marker(struct cli_state *state, int argc, char **argv)
+{
+    /* Usage: set time_marker <0|1> */
+    int rv   = CLI_RET_OK;
+    int *err = &state->last_lib_error;
+    int status;
+    bool value;
+
+    if (argc != 3) {
+        printf("Usage: set time_marker <bool>\n");
+        rv = CLI_RET_NARGS;
+        goto out;
+    }
+
+    status = str2bool(argv[2], &value);
+    if (status < 0) {
+        cli_err_nnl(state, argv[0], "Invalid time_marker value (%s)\n",
+                    argv[2]);
+        rv = CLI_RET_INVPARAM;
+        goto out;
+    }
+
+    status = bladerf_set_rx_time_marker(state->dev, value);
+    if (status < 0) {
+        *err = status;
+        rv   = CLI_RET_LIBBLADERF;
+        goto out;
+    }
+
+    rv = print_time_marker(state, 2, argv);
+
+out:
+    return rv;
+}

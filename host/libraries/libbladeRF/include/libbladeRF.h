@@ -51,7 +51,7 @@
  *
  *  https://github.com/Nuand/bladeRF/blob/master/doc/development/versioning.md
  */
-#define LIBBLADERF_API_VERSION (0x02070000)
+#define LIBBLADERF_API_VERSION (0x02080000)
 
 #ifdef __cplusplus
 extern "C" {
@@ -2489,6 +2489,19 @@ const char * CALL_CONV bladerf_format_to_string(bladerf_format format);
  * expansion IO pin 2 is asserted.
  */
 #define BLADERF_META_FLAG_RX_HW_MINIEXP2 (1 << 17)
+
+/**
+ * This flag in bladerf_metadata.status mirrors the RX time marker the host
+ * last wrote with bladerf_set_rx_time_marker(), as the FPGA latched it at the
+ * head of the message. When a bladerf_sync_rx() call spans several messages
+ * the status word is the OR of all of them, so read one message per call to
+ * locate the first header carrying a new value.
+ *
+ * Requires FPGA v0.18.0 or later; earlier images always report it clear.
+ *
+ * @see bladerf_set_rx_time_marker()
+ */
+#define BLADERF_META_FLAG_RX_HW_TIME_MARK (1 << 4)
 
 /**
  * Sample metadata

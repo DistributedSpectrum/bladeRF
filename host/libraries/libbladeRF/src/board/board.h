@@ -170,6 +170,15 @@
 #define BLADERF_CAP_FPGA_RX_GAIN_TAG (((uint64_t)1) << 40)
 
 /**
+ * FPGA v0.18.0 echoes a host-set marker bit in bit 4 of every RX metadata
+ * header's flags word (::BLADERF_META_FLAG_RX_HW_TIME_MARK), latched at the
+ * head of the message, and accepts it through Nios 8x32 target RX_TIME_MARK.
+ * Older images read 0 there, so unlike the gain tag a missing echo is
+ * self-evident; this capability only saves the caller from waiting for it.
+ */
+#define BLADERF_CAP_FPGA_RX_TIME_MARK (((uint64_t)1) << 41)
+
+/**
  * Max number of gain calibration tables associated to max number of channels
  */
 #define NUM_GAIN_CAL_TBLS 4

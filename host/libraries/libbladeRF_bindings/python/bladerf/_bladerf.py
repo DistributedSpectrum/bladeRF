@@ -1185,6 +1185,28 @@ class BladeRF:
                     carried=bool(t.flags & RX_GAIN_TAG_CARRIED))
                 for t in tags]
 
+    def set_rx_time_marker(self, value):
+        """Set the RX time marker bit the FPGA echoes in meta.status as
+        META_FLAG_RX_HW_TIME_MARK, latched at the head of every RX message.
+
+        Read time.clock_gettime(CLOCK_REALTIME) before and after this call,
+        then sync_rx() one message at a time until the flag carries the new
+        value: that header's timestamp lies in
+        [ts(before), ts(after) + samples_per_message]. Needs FPGA v0.18.0 or
+        later; raises BladeRFError(UNSUPPORTED) otherwise.
+        """
+        _check_error(libbladeRF.bladerf_set_rx_time_marker(self.dev[0],
+                                                           bool(value)))
+
+    def get_rx_time_marker(self):
+        """Current RX time marker value, or None if the FPGA lacks it."""
+        value = ffi.new("bool *")
+        ret = libbladeRF.bladerf_get_rx_time_marker(self.dev[0], value)
+        if ret == -8:  # BLADERF_ERR_UNSUPPORTED
+            return None
+        _check_error(ret)
+        return bool(value[0])
+
     # Phase Detector/Frequency Synthesizer
 
     def get_pll_lock_state(self):
@@ -1481,6 +1503,9 @@ RxGainTag = collections.namedtuple(
     "RxGainTag",
     "version flags gain_index gain_index_min gain_index_max chunks "
     "num_messages chunk_gain_index changed locked")
+
+# bladerf_metadata.status bit mirroring the RX time marker (FPGA >= v0.18.0).
+META_FLAG_RX_HW_TIME_MARK = 1 << 4
 
 RX_GAIN_TAG_VERSION_NONE = 0
 RX_GAIN_TAG_VERSION_1 = 1

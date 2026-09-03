@@ -106,5 +106,9 @@ uint64_t bladerf2_get_fpga_capabilities(
         capabilities |= BLADERF_CAP_FPGA_RX_GAIN_TAG;
     }
 
+    if (version_fields_greater_or_equal(fpga_version, 0, 18, 0)) {
+        capabilities |= BLADERF_CAP_FPGA_RX_TIME_MARK;
+    }
+
     return capabilities;
 }
