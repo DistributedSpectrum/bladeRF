@@ -315,6 +315,7 @@ int main(int argc, char **argv)
     for (i = 0; i < o.exchanges; i++) {
         struct exchange *e = &ex[i];
         bool target = !cur;
+        bool overran = false;
         int64_t t0, t1;
         unsigned int w;
 
@@ -339,25 +340,30 @@ int main(int argc, char **argv)
                 goto out;
             }
             if (meta.status & BLADERF_META_STATUS_OVERRUN) {
-                /* Samples were dropped somewhere before this header; the
-                 * message-count bound no longer holds for this exchange. */
-                fprintf(stderr, "  overrun during exchange %u, discarding it\n", i);
-                w = MAX_WAIT_MSGS;
-                break;
+                /* Samples were dropped somewhere before this header, so the
+                 * message-count bound no longer holds. Keep reading until the
+                 * echo arrives so the next exchange starts from a clean
+                 * stream, but do not record this one. */
+                if (!overran) {
+                    fprintf(stderr, "  overrun during exchange %u, discarding it\n", i);
+                }
+                overran = true;
             }
 
             flag = (meta.status & BLADERF_META_FLAG_RX_HW_TIME_MARK) != 0;
             if (flag == target) {
                 e->ts_m   = meta.timestamp;
                 e->waited = w;
-                e->valid  = true;
+                e->valid  = !overran;
                 break;
             }
         }
 
         if (!e->valid) {
-            fprintf(stderr, "  exchange %u: marker %u never echoed within %u messages\n",
-                    i, target ? 1 : 0, MAX_WAIT_MSGS);
+            if (!overran) {
+                fprintf(stderr, "  exchange %u: marker %u never echoed within %u messages\n",
+                        i, target ? 1 : 0, MAX_WAIT_MSGS);
+            }
         } else {
             double bound_us = (e->rtt_ns / 2) / 1e3 + 1e6 * spm / actual_rate;
             printf("%4u  %8.1f  %6u  %16" PRIu64 "  %10.1f\n", i, e->rtt_ns / 1e3,
@@ -365,8 +371,22 @@ int main(int argc, char **argv)
         }
 
         cur = target;
+
+        /* Space the exchanges out by continuing to read, not by sleeping: a
+         * pause with the stream running overruns the buffer pool (at 10 Msps
+         * the 16 x 8192-sample pool is 130 ms deep) and the next exchange
+         * inherits the discontinuity. This is also how a real receiver would
+         * use the marker -- interleaved with its normal reads. */
         if (o.interval_ms) {
-            usleep(o.interval_ms * 1000);
+            unsigned int drain = (unsigned int)((double)o.interval_ms * 1e-3 *
+                                                actual_rate / spm);
+            for (w = 0; w < drain; w++) {
+                status = rx_one_msg(dev, buf, spm, &meta);
+                if (status != 0) {
+                    fprintf(stderr, "sync_rx (drain): %s\n", bladerf_strerror(status));
+                    goto out;
+                }
+            }
         }
     }
 
