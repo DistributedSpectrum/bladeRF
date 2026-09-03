@@ -69,11 +69,13 @@ struct opts {
     unsigned int interval_ms;
     unsigned int num_buffers;
     unsigned int num_transfers;
+    unsigned int read_samples;      /* 0 = one message */
     bladerf_log_level verbosity;
 };
 
 struct exchange {
     int64_t t_mid_ns;       /* CLOCK_REALTIME midpoint of the write */
+    int64_t m_mid_ns;       /* CLOCK_MONOTONIC_RAW midpoint, immune to NTP slew */
     int64_t rtt_ns;         /* T_after - T_before */
     uint64_t ts_m;          /* timestamp of the first header carrying the new value */
     unsigned int waited;    /* messages read before it showed up */
@@ -97,6 +99,9 @@ static void usage(const char *argv0)
     printf("  -i <ms>         Pause between exchanges (default: 200)\n");
     printf("  -b <count>      Stream buffers, each 4 messages (default: 16)\n");
     printf("  -t <count>      Transfers in flight (default: buffers / 2)\n");
+    printf("  -r <samples>    Samples per sync_rx read (default: one message).\n");
+    printf("                  Larger reads locate the echo through the per-message\n");
+    printf("                  gain-tag array (BLADERF_RX_GAIN_TAG_TIME_MARK)\n");
     printf("  -v <level>      libbladeRF verbosity 0-6 (default: 3)\n");
     printf("  -h              This text\n");
 }
@@ -112,9 +117,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
     o->interval_ms = 200;
     o->num_buffers = DEFAULT_NUM_BUFFERS;
     o->num_transfers = 0;
+    o->read_samples = 0;
     o->verbosity   = BLADERF_LOG_LEVEL_INFO;
 
-    while ((c = getopt(argc, argv, "d:f:s:n:i:b:t:v:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:f:s:n:i:b:t:r:v:h")) != -1) {
         switch (c) {
             case 'd': o->devstr      = optarg; break;
             case 'f': o->freq_hz     = strtod(optarg, NULL); break;
@@ -123,6 +129,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
             case 'i': o->interval_ms = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 'b': o->num_buffers = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 't': o->num_transfers = (unsigned int)strtoul(optarg, NULL, 0); break;
+            case 'r': o->read_samples = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 'v': o->verbosity   = (bladerf_log_level)strtoul(optarg, NULL, 0); break;
             case 'h': usage(argv[0]); return 1;
             default:  usage(argv[0]); return -1;
@@ -167,16 +174,64 @@ static unsigned int guess_samples_per_msg(struct bladerf *dev)
     return 508;
 }
 
-static int rx_one_msg(struct bladerf *dev, int16_t *buf, unsigned int spm,
+static int rx_one_msg(struct bladerf *dev, int16_t *buf, unsigned int count,
                       struct bladerf_metadata *meta)
 {
     memset(meta, 0, sizeof(*meta));
     meta->flags = BLADERF_META_FLAG_RX_NOW;
-    return bladerf_sync_rx(dev, buf, spm, meta, TIMEOUT_MS);
+    return bladerf_sync_rx(dev, buf, count, meta, TIMEOUT_MS);
+}
+
+/* Find the first message in the last read whose latched marker equals
+ * `target`. For a one-message read the status word is enough; for a larger
+ * read walk the per-message gain-tag array, which carries the marker per
+ * message together with that message's timestamp. Returns 1 and fills *ts
+ * and *idx when found, 0 when not, negative on error. */
+static int find_echo(struct bladerf *dev, const struct bladerf_metadata *meta,
+                     unsigned int read_samples, unsigned int spm, bool target,
+                     struct bladerf_rx_gain_tag_msg *tags, unsigned int max_tags,
+                     uint64_t *ts, unsigned int *idx)
+{
+    unsigned int n, i;
+    int status;
+
+    if (read_samples == spm) {
+        bool flag = (meta->status & BLADERF_META_FLAG_RX_HW_TIME_MARK) != 0;
+        if (flag == target) {
+            *ts  = meta->timestamp;
+            *idx = 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    status = bladerf_get_rx_gain_tags(dev, tags, max_tags, &n);
+    if (status != 0) {
+        return status;
+    }
+    if (n > max_tags) {
+        n = max_tags;
+    }
+
+    for (i = 0; i < n; i++) {
+        bool flag = (tags[i].flags & BLADERF_RX_GAIN_TAG_TIME_MARK) != 0;
+        if (flag == target) {
+            *ts  = tags[i].timestamp;
+            *idx = i;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static inline int64_t wall_of(const struct exchange *e, bool raw)
+{
+    return raw ? e->m_mid_ns : e->t_mid_ns;
 }
 
 /* Least-squares wall = a + b * ticks over the valid exchanges. */
-static void fit(const struct exchange *ex, unsigned int n, double fs,
+static void fit(const struct exchange *ex, unsigned int n, double fs, bool raw,
                 double *a_ns, double *b_ns_per_tick, double *rms_ns,
                 double *max_abs_ns, unsigned int *used)
 {
@@ -190,11 +245,11 @@ static void fit(const struct exchange *ex, unsigned int n, double fs,
         if (!ex[i].valid) continue;
         if (!have_origin) {
             x0 = (double)ex[i].ts_m;
-            y0 = (double)ex[i].t_mid_ns;
+            y0 = (double)wall_of(&ex[i], raw);
             have_origin = true;
         }
         double x = (double)ex[i].ts_m - x0;
-        double y = (double)ex[i].t_mid_ns - y0;
+        double y = (double)wall_of(&ex[i], raw) - y0;
         sx += x; sy += y; sxx += x * x; sxy += x * y;
         m++;
     }
@@ -213,7 +268,7 @@ static void fit(const struct exchange *ex, unsigned int n, double fs,
     for (i = 0; i < n; i++) {
         if (!ex[i].valid) continue;
         double x = (double)ex[i].ts_m - x0;
-        double y = (double)ex[i].t_mid_ns - y0;
+        double y = (double)wall_of(&ex[i], raw) - y0;
         double r = y - (a + b * x);
         ss += r * r;
         if (fabs(r) > mx) mx = fabs(r);
@@ -225,6 +280,52 @@ static void fit(const struct exchange *ex, unsigned int n, double fs,
     *max_abs_ns    = mx;
 }
 
+/* Print one clock's fit, its residuals split into thirds of the run (does the
+ * scatter grow with time?), and how many exchanges fell outside their own
+ * bound. Returns that count. */
+static unsigned int report_fit(const char *clock_name, const struct exchange *ex,
+                               unsigned int n, double fs, bool raw,
+                               unsigned int spm)
+{
+    double a, b, rms, mx;
+    unsigned int used, i, failed = 0, first = 0, last = 0;
+    double nominal = 1e9 / fs;
+    double msg_us  = 1e6 * spm / fs;
+    double ss[3] = {0, 0, 0}, mx3[3] = {0, 0, 0};
+    unsigned int cnt[3] = {0, 0, 0};
+
+    fit(ex, n, fs, raw, &a, &b, &rms, &mx, &used);
+    printf("\n[%s]\n", clock_name);
+    if (used < 2) {
+        printf("  not enough valid exchanges to fit\n");
+        return 0;
+    }
+
+    for (i = 0; i < n; i++) if (ex[i].valid) { first = i; break; }
+    for (i = n; i-- > 0;)  if (ex[i].valid) { last = i; break; }
+
+    printf("  fit: wall_ns = %.0f + %.6f * ticks\n", a, b);
+    printf("  skew vs nominal %.3f ns/tick: %+.3f ppm\n", nominal,
+           (b / nominal - 1.0) * 1e6);
+    printf("  residual rms %.1f us, max %.1f us\n", rms / 1e3, mx / 1e3);
+
+    for (i = 0; i < n; i++) {
+        if (!ex[i].valid) continue;
+        double r    = (double)wall_of(&ex[i], raw) - (a + b * (double)ex[i].ts_m);
+        double half = ex[i].rtt_ns / 2.0 + msg_us * 1e3;
+        unsigned int seg = (last > first) ? (unsigned int)((3ULL * (i - first)) / (last - first + 1)) : 0;
+        if (seg > 2) seg = 2;
+        ss[seg] += r * r; cnt[seg]++;
+        if (fabs(r) > mx3[seg]) mx3[seg] = fabs(r);
+        if (fabs(r) > half) failed++;
+    }
+    printf("  residual rms by third of run: %.1f / %.1f / %.1f us  (max %.1f / %.1f / %.1f)\n",
+           cnt[0] ? sqrt(ss[0] / cnt[0]) / 1e3 : 0, cnt[1] ? sqrt(ss[1] / cnt[1]) / 1e3 : 0,
+           cnt[2] ? sqrt(ss[2] / cnt[2]) / 1e3 : 0, mx3[0] / 1e3, mx3[1] / 1e3, mx3[2] / 1e3);
+    printf("  %u exchange(s) with residual outside their own bound\n", failed);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     struct opts o;
@@ -232,8 +333,10 @@ int main(int argc, char **argv)
     struct bladerf_version fpga;
     struct bladerf_metadata meta;
     struct exchange *ex = NULL;
+    struct bladerf_rx_gain_tag_msg *tags = NULL;
     int16_t *buf = NULL;
-    unsigned int spm, buf_samples, i, n_tags;
+    unsigned int spm, buf_samples, i, n_tags, read_samples, max_tags;
+    int64_t run_start_ns;
     bladerf_sample_rate actual_rate;
     bool marker, cur;
     int status, ret = 1;
@@ -288,6 +391,11 @@ int main(int argc, char **argv)
     spm = guess_samples_per_msg(dev);
     buf_samples = (spm + 4) * 4;    /* four whole messages, a multiple of 1024 */
 
+    read_samples = o.read_samples ? o.read_samples : spm;
+    /* Enough entries for every message a read can touch, plus the partial
+     * ones at either end. */
+    max_tags = read_samples / spm + 3;
+
     status = bladerf_sync_config(dev, BLADERF_RX_X1, BLADERF_FORMAT_SC16_Q11_META,
                                  o.num_buffers, buf_samples, o.num_transfers,
                                  TIMEOUT_MS);
@@ -296,9 +404,10 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    buf = malloc(sizeof(int16_t) * 2 * spm);
-    ex  = calloc(o.exchanges, sizeof(*ex));
-    if (buf == NULL || ex == NULL) {
+    buf  = malloc(sizeof(int16_t) * 2 * read_samples);
+    ex   = calloc(o.exchanges, sizeof(*ex));
+    tags = calloc(max_tags, sizeof(*tags));
+    if (buf == NULL || ex == NULL || tags == NULL) {
         fprintf(stderr, "Out of memory\n");
         goto out;
     }
@@ -309,8 +418,8 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    /* Prime the stream and confirm one read == one message, using the gain
-     * tag message count as the witness. */
+    /* Prime the stream with one-message reads and confirm one read == one
+     * message, using the gain tag message count as the witness. */
     for (i = 0; i < 8; i++) {
         status = rx_one_msg(dev, buf, spm, &meta);
         if (status != 0) {
@@ -325,35 +434,42 @@ int main(int argc, char **argv)
     }
 
     printf("Sample rate %u Hz, %u samples per message (%.1f us), "
-           "%u buffers x %u samples, %u transfers\n\n",
+           "%u buffers x %u samples, %u transfers, %u samples per read (%.1f msgs)\n\n",
            actual_rate, spm, 1e6 * spm / actual_rate, o.num_buffers, buf_samples,
-           o.num_transfers);
-    printf("%4s  %8s  %6s  %16s  %10s\n", "#", "rtt_us", "msgs", "ts_m", "bound_us");
+           o.num_transfers, read_samples, (double)read_samples / spm);
+    run_start_ns = now_ns(CLOCK_MONOTONIC_RAW);
+    printf("%4s  %7s  %8s  %6s  %16s  %10s\n", "#", "t_s", "rtt_us", "msgs", "ts_m", "bound_us");
 
     cur = marker;
     for (i = 0; i < o.exchanges; i++) {
         struct exchange *e = &ex[i];
         bool target = !cur;
         bool overran = false;
-        int64_t t0, t1;
-        unsigned int w;
+        int64_t t0, t1, m0, m1;
+        unsigned int w, reads, max_reads;
 
+        m0 = now_ns(CLOCK_MONOTONIC_RAW);
         t0 = now_ns(CLOCK_REALTIME);
         status = bladerf_set_rx_time_marker(dev, target);
         t1 = now_ns(CLOCK_REALTIME);
+        m1 = now_ns(CLOCK_MONOTONIC_RAW);
         if (status != 0) {
             fprintf(stderr, "set_rx_time_marker: %s\n", bladerf_strerror(status));
             goto out;
         }
 
         e->t_mid_ns = t0 + (t1 - t0) / 2;
+        e->m_mid_ns = m0 + (m1 - m0) / 2;
         e->rtt_ns   = t1 - t0;
         e->valid    = false;
 
-        for (w = 0; w < MAX_WAIT_MSGS; w++) {
-            bool flag;
+        max_reads = MAX_WAIT_MSGS / (read_samples / spm) + 1;
+        w = 0;
+        for (reads = 0; reads < max_reads; reads++) {
+            unsigned int idx = 0;
+            uint64_t ts = 0;
 
-            status = rx_one_msg(dev, buf, spm, &meta);
+            status = rx_one_msg(dev, buf, read_samples, &meta);
             if (status != 0) {
                 fprintf(stderr, "sync_rx: %s\n", bladerf_strerror(status));
                 goto out;
@@ -369,13 +485,19 @@ int main(int argc, char **argv)
                 overran = true;
             }
 
-            flag = (meta.status & BLADERF_META_FLAG_RX_HW_TIME_MARK) != 0;
-            if (flag == target) {
-                e->ts_m   = meta.timestamp;
-                e->waited = w;
+            status = find_echo(dev, &meta, read_samples, spm, target, tags,
+                               max_tags, &ts, &idx);
+            if (status < 0) {
+                fprintf(stderr, "get_rx_gain_tags: %s\n", bladerf_strerror(status));
+                goto out;
+            }
+            if (status == 1) {
+                e->ts_m   = ts;
+                e->waited = w + idx;
                 e->valid  = !overran;
                 break;
             }
+            w += read_samples / spm;
         }
 
         if (!e->valid) {
@@ -385,7 +507,8 @@ int main(int argc, char **argv)
             }
         } else {
             double bound_us = (e->rtt_ns / 2) / 1e3 + 1e6 * spm / actual_rate;
-            printf("%4u  %8.1f  %6u  %16" PRIu64 "  %10.1f\n", i, e->rtt_ns / 1e3,
+            printf("%4u  %7.1f  %8.1f  %6u  %16" PRIu64 "  %10.1f\n", i,
+                   (e->m_mid_ns - run_start_ns) / 1e9, e->rtt_ns / 1e3,
                    e->waited, e->ts_m, bound_us);
         }
 
@@ -398,9 +521,9 @@ int main(int argc, char **argv)
          * use the marker -- interleaved with its normal reads. */
         if (o.interval_ms) {
             unsigned int drain = (unsigned int)((double)o.interval_ms * 1e-3 *
-                                                actual_rate / spm);
+                                                actual_rate / read_samples);
             for (w = 0; w < drain; w++) {
-                status = rx_one_msg(dev, buf, spm, &meta);
+                status = rx_one_msg(dev, buf, read_samples, &meta);
                 if (status != 0) {
                     fprintf(stderr, "sync_rx (drain): %s\n", bladerf_strerror(status));
                     goto out;
@@ -410,34 +533,22 @@ int main(int argc, char **argv)
     }
 
     {
-        double a, b, rms, mx;
-        unsigned int used;
-        double nominal = 1e9 / actual_rate;
+        unsigned int used = 0, failed_rt, failed_raw;
+        for (i = 0; i < o.exchanges; i++) if (ex[i].valid) used++;
 
-        fit(ex, o.exchanges, actual_rate, &a, &b, &rms, &mx, &used);
+        printf("\n%u of %u exchanges valid over %.1f s\n", used, o.exchanges,
+               (now_ns(CLOCK_MONOTONIC_RAW) - run_start_ns) / 1e9);
 
-        printf("\n%u of %u exchanges valid\n", used, o.exchanges);
-        if (used >= 2) {
-            double skew_ppm = (b / nominal - 1.0) * 1e6;
-            double msg_us   = 1e6 * spm / actual_rate;
-            unsigned int failed = 0;
+        /* REALTIME is what a consumer wants stamped on the data, but it is
+         * slewed by NTP; MONOTONIC_RAW is the host oscillator itself. If the
+         * residuals grow with time on REALTIME but not on RAW, that is the
+         * host's timekeeping moving, not the bladeRF. */
+        failed_rt  = report_fit("CLOCK_REALTIME", ex, o.exchanges, actual_rate,
+                                false, spm);
+        failed_raw = report_fit("CLOCK_MONOTONIC_RAW", ex, o.exchanges,
+                                actual_rate, true, spm);
 
-            printf("fit: wall_ns = %.0f + %.6f * ticks\n", a, b);
-            printf("     skew vs nominal %.3f ns/tick: %+.3f ppm\n", nominal, skew_ppm);
-            printf("     residual rms %.1f us, max %.1f us\n", rms / 1e3, mx / 1e3);
-
-            /* Every valid exchange's own bound should contain its residual.
-             * The per-exchange half-window is rtt/2 + one message; a fit
-             * residual beyond that means the bound is not honest. */
-            for (i = 0; i < o.exchanges; i++) {
-                if (!ex[i].valid) continue;
-                double r = fabs((double)ex[i].t_mid_ns - (a + b * (double)ex[i].ts_m));
-                double half = ex[i].rtt_ns / 2.0 + msg_us * 1e3;
-                if (r > half) failed++;
-            }
-            printf("     %u exchange(s) with residual outside their own bound\n", failed);
-            ret = (failed == 0) ? 0 : 2;
-        }
+        ret = (used >= 2 && failed_rt == 0 && failed_raw == 0) ? 0 : 2;
     }
 
 out:
