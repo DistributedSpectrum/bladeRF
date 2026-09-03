@@ -1182,7 +1182,8 @@ class BladeRF:
                     flags=t.flags,
                     chunk_gain_index=tuple(t.chunk_gain_index),
                     locked=bool(t.flags & RX_GAIN_TAG_LOCKED),
-                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED))
+                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED),
+                    time_mark=bool(t.flags & RX_GAIN_TAG_TIME_MARK))
                 for t in tags]
 
     def set_rx_time_marker(self, value):
@@ -1519,11 +1520,13 @@ RX_GAIN_TAG_LOCKED = 1 << 1
 # sync_rx() call, so its profile was carried over rather than read during the
 # call that produced the entry.
 RX_GAIN_TAG_CARRIED = 1 << 2
+# The RX time marker as latched at the head of this entry's message (FPGA >= v0.18.0).
+RX_GAIN_TAG_TIME_MARK = 1 << 3
 
 RxGainTagMsg = collections.namedtuple(
     "RxGainTagMsg",
     "timestamp sample_offset sample_count msg_sample_offset gain_index flags "
-    "chunk_gain_index locked carried")
+    "chunk_gain_index locked carried time_mark")
 
 
 def rx_gain_tag(meta):

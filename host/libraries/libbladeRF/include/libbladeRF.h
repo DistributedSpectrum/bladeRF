@@ -2720,6 +2720,14 @@ struct bladerf_rx_gain_tag {
  */
 #define BLADERF_RX_GAIN_TAG_CARRIED (1 << 2)
 
+/** The RX time marker (::BLADERF_META_FLAG_RX_HW_TIME_MARK) as the FPGA latched
+ *  it at the head of this entry's message. Because it is recorded per message
+ *  here, a bladerf_sync_rx() call of any size can still locate the exact
+ *  message whose header first carried a new marker value: its `timestamp` is
+ *  the ts_m of the exchange. Requires FPGA v0.18.0 or later; always clear
+ *  before that. */
+#define BLADERF_RX_GAIN_TAG_TIME_MARK (1 << 3)
+
 /**
  * @brief One message's gain profile, positioned within a receive.
  *
@@ -2778,7 +2786,8 @@ struct bladerf_rx_gain_tag_msg {
     /** RX1 full gain-table index at the message's first sample */
     uint8_t gain_index;
 
-    /** ::BLADERF_RX_GAIN_TAG_LOCKED and/or ::BLADERF_RX_GAIN_TAG_CARRIED */
+    /** Any of ::BLADERF_RX_GAIN_TAG_LOCKED, ::BLADERF_RX_GAIN_TAG_CARRIED and
+     *  ::BLADERF_RX_GAIN_TAG_TIME_MARK */
     uint8_t flags;
 
     /** Gain index at the end of each chunk of this message. The number of

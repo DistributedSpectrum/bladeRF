@@ -672,6 +672,9 @@ static void gain_tag_record_samples(struct bladerf_sync *s,
         if (s->meta.gain_tag.last_lock) {
             e->flags |= BLADERF_RX_GAIN_TAG_LOCKED;
         }
+        if (s->meta.gain_tag.last_time_mark) {
+            e->flags |= BLADERF_RX_GAIN_TAG_TIME_MARK;
+        }
         memcpy(e->chunk_gain_index, s->meta.gain_tag.last_chunk,
                sizeof(s->meta.gain_tag.last_chunk));
     }
@@ -741,6 +744,8 @@ static inline void accumulate_gain_tag(struct bladerf_sync *s,
     s->meta.gain_tag.known     = true;
     s->meta.gain_tag.last_base = tag.base;
     s->meta.gain_tag.last_lock = tag.lock;
+    s->meta.gain_tag.last_time_mark =
+        (s->meta.msg_flags & BLADERF_META_FLAG_RX_HW_TIME_MARK) != 0;
     memcpy(s->meta.gain_tag.last_chunk, tag.chunk, sizeof(tag.chunk));
 
     if (s->meta.gain_tag.count < UINT16_MAX) {
@@ -755,6 +760,9 @@ static inline void accumulate_gain_tag(struct bladerf_sync *s,
         e->gain_index = tag.base;
         if (tag.lock) {
             e->flags |= BLADERF_RX_GAIN_TAG_LOCKED;
+        }
+        if (s->meta.gain_tag.last_time_mark) {
+            e->flags |= BLADERF_RX_GAIN_TAG_TIME_MARK;
         }
         memcpy(e->chunk_gain_index, tag.chunk, sizeof(tag.chunk));
     }
