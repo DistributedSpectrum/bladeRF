@@ -374,6 +374,21 @@ INLINE uint32_t control_reg_read(void);
 INLINE void control_reg_write(uint32_t value);
 
 /**
+ * Read the RX time marker (control register bit 22, echoed into RX metadata
+ * flags bit 4). See NIOS_PKT_8x32_TARGET_RX_TIME_MARK.
+ *
+ * @return 0 or 1
+ */
+INLINE uint32_t rx_time_mark_read(void);
+
+/**
+ * Set the RX time marker without disturbing the rest of the control register.
+ *
+ * @param   value   Bit 0 is the new marker value
+ */
+INLINE void rx_time_mark_write(uint32_t value);
+
+/**
  * Get IQ balance gain value
  *
  * @param m         Which module to query
