@@ -58,9 +58,8 @@
 #include <libbladeRF.h>
 
 #define TIMEOUT_MS      1000
-#define NUM_BUFFERS     16
-#define NUM_TRANSFERS   8
-#define MAX_WAIT_MSGS   4096
+#define DEFAULT_NUM_BUFFERS 16
+#define MAX_WAIT_MSGS       4096
 
 struct opts {
     const char *devstr;
@@ -68,6 +67,8 @@ struct opts {
     double rate_hz;
     unsigned int exchanges;
     unsigned int interval_ms;
+    unsigned int num_buffers;
+    unsigned int num_transfers;
     bladerf_log_level verbosity;
 };
 
@@ -94,6 +95,8 @@ static void usage(const char *argv0)
     printf("  -s <hz>         Sample rate (default: 10e6)\n");
     printf("  -n <count>      Number of exchanges (default: 50)\n");
     printf("  -i <ms>         Pause between exchanges (default: 200)\n");
+    printf("  -b <count>      Stream buffers, each 4 messages (default: 16)\n");
+    printf("  -t <count>      Transfers in flight (default: buffers / 2)\n");
     printf("  -v <level>      libbladeRF verbosity 0-6 (default: 3)\n");
     printf("  -h              This text\n");
 }
@@ -107,15 +110,19 @@ static int parse_opts(int argc, char **argv, struct opts *o)
     o->rate_hz     = 10e6;
     o->exchanges   = 50;
     o->interval_ms = 200;
+    o->num_buffers = DEFAULT_NUM_BUFFERS;
+    o->num_transfers = 0;
     o->verbosity   = BLADERF_LOG_LEVEL_INFO;
 
-    while ((c = getopt(argc, argv, "d:f:s:n:i:v:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:f:s:n:i:b:t:v:h")) != -1) {
         switch (c) {
             case 'd': o->devstr      = optarg; break;
             case 'f': o->freq_hz     = strtod(optarg, NULL); break;
             case 's': o->rate_hz     = strtod(optarg, NULL); break;
             case 'n': o->exchanges   = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 'i': o->interval_ms = (unsigned int)strtoul(optarg, NULL, 0); break;
+            case 'b': o->num_buffers = (unsigned int)strtoul(optarg, NULL, 0); break;
+            case 't': o->num_transfers = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 'v': o->verbosity   = (bladerf_log_level)strtoul(optarg, NULL, 0); break;
             case 'h': usage(argv[0]); return 1;
             default:  usage(argv[0]); return -1;
@@ -125,6 +132,15 @@ static int parse_opts(int argc, char **argv, struct opts *o)
     if (o->exchanges < 2) {
         fprintf(stderr, "Need at least 2 exchanges for a fit.\n");
         return -1;
+    }
+
+    if (o->num_buffers < 2) {
+        fprintf(stderr, "Need at least 2 buffers.\n");
+        return -1;
+    }
+
+    if (o->num_transfers == 0 || o->num_transfers >= o->num_buffers) {
+        o->num_transfers = o->num_buffers / 2;
     }
 
     return 0;
@@ -273,7 +289,8 @@ int main(int argc, char **argv)
     buf_samples = (spm + 4) * 4;    /* four whole messages, a multiple of 1024 */
 
     status = bladerf_sync_config(dev, BLADERF_RX_X1, BLADERF_FORMAT_SC16_Q11_META,
-                                 NUM_BUFFERS, buf_samples, NUM_TRANSFERS, TIMEOUT_MS);
+                                 o.num_buffers, buf_samples, o.num_transfers,
+                                 TIMEOUT_MS);
     if (status != 0) {
         fprintf(stderr, "sync_config: %s\n", bladerf_strerror(status));
         goto out;
@@ -307,8 +324,10 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    printf("Sample rate %u Hz, %u samples per message (%.1f us)\n\n",
-           actual_rate, spm, 1e6 * spm / actual_rate);
+    printf("Sample rate %u Hz, %u samples per message (%.1f us), "
+           "%u buffers x %u samples, %u transfers\n\n",
+           actual_rate, spm, 1e6 * spm / actual_rate, o.num_buffers, buf_samples,
+           o.num_transfers);
     printf("%4s  %8s  %6s  %16s  %10s\n", "#", "rtt_us", "msgs", "ts_m", "bound_us");
 
     cur = marker;
@@ -374,7 +393,7 @@ int main(int argc, char **argv)
 
         /* Space the exchanges out by continuing to read, not by sleeping: a
          * pause with the stream running overruns the buffer pool (at 10 Msps
-         * the 16 x 8192-sample pool is 130 ms deep) and the next exchange
+         * a 16 x 8192-sample pool is 130 ms deep) and the next exchange
          * inherits the discontinuity. This is also how a real receiver would
          * use the marker -- interleaved with its normal reads. */
         if (o.interval_ms) {
