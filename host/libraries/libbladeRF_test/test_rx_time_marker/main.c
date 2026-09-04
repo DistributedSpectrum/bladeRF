@@ -70,6 +70,7 @@ struct opts {
     unsigned int num_buffers;
     unsigned int num_transfers;
     unsigned int read_samples;      /* 0 = one message */
+    const char *csv_path;           /* per-exchange dump, or NULL */
     bladerf_log_level verbosity;
 };
 
@@ -102,6 +103,8 @@ static void usage(const char *argv0)
     printf("  -r <samples>    Samples per sync_rx read (default: one message).\n");
     printf("                  Larger reads locate the echo through the per-message\n");
     printf("                  gain-tag array (BLADERF_RX_GAIN_TAG_TIME_MARK)\n");
+    printf("  -o <file.csv>   Append one line per exchange: realtime_ns, monotonic_raw_ns,\n");
+    printf("                  rtt_ns, ts_m, msgs_waited, valid\n");
     printf("  -v <level>      libbladeRF verbosity 0-6 (default: 3)\n");
     printf("  -h              This text\n");
 }
@@ -118,9 +121,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
     o->num_buffers = DEFAULT_NUM_BUFFERS;
     o->num_transfers = 0;
     o->read_samples = 0;
+    o->csv_path    = NULL;
     o->verbosity   = BLADERF_LOG_LEVEL_INFO;
 
-    while ((c = getopt(argc, argv, "d:f:s:n:i:b:t:r:v:h")) != -1) {
+    while ((c = getopt(argc, argv, "d:f:s:n:i:b:t:r:o:v:h")) != -1) {
         switch (c) {
             case 'd': o->devstr      = optarg; break;
             case 'f': o->freq_hz     = strtod(optarg, NULL); break;
@@ -130,6 +134,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
             case 'b': o->num_buffers = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 't': o->num_transfers = (unsigned int)strtoul(optarg, NULL, 0); break;
             case 'r': o->read_samples = (unsigned int)strtoul(optarg, NULL, 0); break;
+            case 'o': o->csv_path    = optarg; break;
             case 'v': o->verbosity   = (bladerf_log_level)strtoul(optarg, NULL, 0); break;
             case 'h': usage(argv[0]); return 1;
             default:  usage(argv[0]); return -1;
@@ -335,6 +340,7 @@ int main(int argc, char **argv)
     struct exchange *ex = NULL;
     struct bladerf_rx_gain_tag_msg *tags = NULL;
     int16_t *buf = NULL;
+    FILE *csv = NULL;
     unsigned int spm, buf_samples, i, n_tags, read_samples, max_tags;
     int64_t run_start_ns;
     bladerf_sample_rate actual_rate;
@@ -347,6 +353,15 @@ int main(int argc, char **argv)
     }
 
     bladerf_log_set_verbosity(o.verbosity);
+
+    if (o.csv_path != NULL) {
+        csv = fopen(o.csv_path, "a");
+        if (csv == NULL) {
+            fprintf(stderr, "Cannot open %s: %s\n", o.csv_path, strerror(errno));
+            return 1;
+        }
+        fprintf(csv, "# realtime_ns,monotonic_raw_ns,rtt_ns,ts_m,msgs_waited,valid,sample_rate,spm\n");
+    }
 
     status = bladerf_open(&dev, o.devstr);
     if (status != 0) {
@@ -500,6 +515,13 @@ int main(int argc, char **argv)
             w += read_samples / spm;
         }
 
+        if (csv != NULL) {
+            fprintf(csv, "%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRIu64 ",%u,%u,%u,%u\n",
+                    e->t_mid_ns, e->m_mid_ns, e->rtt_ns, e->ts_m, e->waited,
+                    e->valid ? 1 : 0, actual_rate, spm);
+            fflush(csv);
+        }
+
         if (!e->valid) {
             if (!overran) {
                 fprintf(stderr, "  exchange %u: marker %u never echoed within %u messages\n",
@@ -510,6 +532,7 @@ int main(int argc, char **argv)
             printf("%4u  %7.1f  %8.1f  %6u  %16" PRIu64 "  %10.1f\n", i,
                    (e->m_mid_ns - run_start_ns) / 1e9, e->rtt_ns / 1e3,
                    e->waited, e->ts_m, bound_us);
+            fflush(stdout);
         }
 
         cur = target;
@@ -556,7 +579,11 @@ out:
         bladerf_enable_module(dev, BLADERF_CHANNEL_RX(0), false);
         bladerf_close(dev);
     }
+    if (csv != NULL) {
+        fclose(csv);
+    }
     free(buf);
     free(ex);
+    free(tags);
     return ret;
 }
