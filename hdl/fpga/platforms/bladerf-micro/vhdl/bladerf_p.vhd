@@ -312,6 +312,9 @@ package bladerf_p is
         si_clock_sel    : std_logic;
         ufl_clock_oe    : std_logic;
         meta_sync       : std_logic;
+        -- Bit 22. Set by the Nios (NIOS_PKT_8x32_TARGET_RX_TIME_MARK), echoed
+        -- into bit 4 of the RX metadata flags word by fifo_writer.
+        rx_time_marker  : std_logic;
         led_mode        : std_logic;
         leds            : std_logic_vector(3 downto 1);
         adf_chip_enable : std_logic;
@@ -519,6 +522,7 @@ package body bladerf_p is
         variable rv : std_logic_vector(31 downto 0) := (others => 'U');
     begin
         rv(31 downto 30) := x.xb_mode;
+        rv(22)           := x.rx_time_marker;
         rv(21)           := x.highly_packed_en;
         rv(20)           := x.eightbit_en;
         rv(19)           := x.packet_en;
@@ -599,6 +603,7 @@ package body bladerf_p is
         variable rv : nios_gpo_t;
     begin
         rv.xb_mode         := x(31 downto 30);
+        rv.rx_time_marker  := x(22);
         rv.highly_packed_en:= x(21);
         rv.eightbit_en     := x(20);
         rv.packet_en       := x(19);

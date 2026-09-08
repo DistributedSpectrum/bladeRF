@@ -273,6 +273,27 @@ int nios_rffe_fastlock_save(struct bladerf *dev, bool is_tx,
                             uint8_t rffe_profile, uint16_t nios_profile);
 
 /**
+ * Set the RX time marker, which the FPGA echoes in
+ * BLADERF_META_FLAG_RX_HW_TIME_MARK of every RX metadata header.
+ *
+ * @param       dev         Device handle
+ * @param[in]   value       New marker value
+ *
+ * @return 0 on success, BLADERF_ERR_* code on error.
+ */
+int nios_rx_time_mark_write(struct bladerf *dev, bool value);
+
+/**
+ * Read back the RX time marker.
+ *
+ * @param       dev         Device handle
+ * @param[out]  value       Current marker value
+ *
+ * @return 0 on success, BLADERF_ERR_* code on error.
+ */
+int nios_rx_time_mark_read(struct bladerf *dev, bool *value);
+
+/**
  * Write to the AD56X1 VCTCXO trim DAC.
  *
  * @param       dev         Device handle

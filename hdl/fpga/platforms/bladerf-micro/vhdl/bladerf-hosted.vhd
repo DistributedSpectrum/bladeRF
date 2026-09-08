@@ -89,6 +89,8 @@ architecture hosted_bladerf of bladerf is
     signal meta_en_tx             : std_logic;
     signal meta_en_rx             : std_logic;
 
+    signal rx_time_marker_rx      : std_logic;
+
     signal eightbit_en_pclk       : std_logic;
     signal eightbit_en_tx         : std_logic;
     signal eightbit_en_rx         : std_logic;
@@ -670,6 +672,9 @@ begin
             -- Mini expansion signals
             mini_exp               => mini_exp2 & mini_exp1,
 
+            -- Echoed into RX metadata flags bit 4
+            time_marker            => rx_time_marker_rx,
+
             -- Transferred out of sys_clock into rx_clock as one atomic byte by
             -- U_ctrl_out_xfer below.
             rfic_ctrl_out          => rfic_ctrl_out_rx,
@@ -827,6 +832,19 @@ begin
             clock               =>  rx_clock,
             async               =>  nios_gpio.o.meta_sync,
             sync                =>  meta_en_rx
+        );
+
+    -- Host-set RX time marker (control register bit 22, owned by the Nios),
+    -- moved into rx_clock so fifo_writer can latch it at the head of a message.
+    U_sync_rx_time_marker : entity work.synchronizer
+        generic map (
+            RESET_LEVEL         =>  '0'
+        )
+        port map (
+            reset               =>  '0',
+            clock               =>  rx_clock,
+            async               =>  nios_gpio.o.rx_time_marker,
+            sync                =>  rx_time_marker_rx
         );
 
     U_sync_meta_en_tx : entity work.synchronizer

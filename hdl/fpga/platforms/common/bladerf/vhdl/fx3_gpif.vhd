@@ -306,9 +306,12 @@ begin
                     gpif_oe         <= '1';
 
                     if (current.meta_downcount = 0) then
-                        -- this overrites 16 LBSs in the flags field stored in fifo_writer
-                        gpif_out    <= rx_meta_fifo_data(31 downto 16) & x"000" &
-                            -- LSB nibble of the last word
+                        -- Rewrite the low 16 bits of the flags dword assembled
+                        -- in fifo_writer. Bit 4 is the RX time marker and passes
+                        -- through; bits 1:0 are the underrun pair; 15:5 and 3:2
+                        -- read as zero.
+                        gpif_out    <= rx_meta_fifo_data(31 downto 16) & x"00" & "000" &
+                            rx_meta_fifo_data(4) &
                             "00" & (not underrun) & underrun;
                     else
                         gpif_out    <= rx_meta_fifo_data;

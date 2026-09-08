@@ -60,6 +60,10 @@ static inline bool perform_read(uint8_t id, uint8_t addr, uint32_t *data)
             DBG("Read from AD9361 fast lock not supported.\n");
             *data = 0x00;
             return false;
+
+        case NIOS_PKT_8x32_TARGET_RX_TIME_MARK:
+            *data = rx_time_mark_read();
+            break;
 #endif  // BOARD_BLADERF_MICRO
 
         default:
@@ -99,6 +103,10 @@ static inline bool perform_write(uint8_t id, uint8_t addr, uint32_t data)
 #ifdef BOARD_BLADERF_MICRO
         case NIOS_PKT_8x32_TARGET_FASTLOCK:
             adi_fastlock_save( (addr == 1), (data >> 16), (data & 0xff));
+            break;
+
+        case NIOS_PKT_8x32_TARGET_RX_TIME_MARK:
+            rx_time_mark_write(data);
             break;
 #endif  // BOARD_BLADERF_MICRO
 

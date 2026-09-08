@@ -74,6 +74,11 @@ entity rx is
         -- Mini expansion signals
         mini_exp               : in    std_logic_vector(1 downto 0);
 
+        -- Host-set time marker, already synchronized into rx_clock by the top
+        -- level. Echoed into RX metadata flags bit 4 by fifo_writer. Defaulted
+        -- so top levels that do not care need not wire it up.
+        time_marker            : in    std_logic := '0';
+
         -- RFIC CTRL_OUT, already transferred into rx_clock atomically by
         -- ctrl_out_xfer. Tagged into the RX metadata header. Defaulted so top
         -- levels that do not care need not wire it up.
@@ -253,6 +258,7 @@ begin
             packet_en           =>  packet_en,
             timestamp           =>  rx_timestamp,
             mini_exp            =>  mini_exp,
+            time_marker         =>  time_marker,
             rfic_ctrl_out       =>  rfic_ctrl_out,
             rfic_ctrl_out_valid =>  rfic_ctrl_out_valid,
 

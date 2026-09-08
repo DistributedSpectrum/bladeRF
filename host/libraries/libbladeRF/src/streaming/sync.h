@@ -228,6 +228,7 @@ struct sync_meta {
                 bool known;
                 uint8_t last_base;
                 bool last_lock;
+                bool last_time_mark;
                 uint8_t last_chunk[SYNC_GAIN_TAG_CHUNKS];
 
                 /* Reset at the start of each sync_rx() call */

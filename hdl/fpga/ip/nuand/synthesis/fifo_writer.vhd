@@ -54,6 +54,14 @@ entity fifo_writer is
         timestamp           :   in      unsigned(63 downto 0);
         mini_exp            :   in      std_logic_vector(1 downto 0);
 
+        -- Host-set time marker, already synchronized into this clock domain by
+        -- the top level. Latched at the head of each message and emitted in bit
+        -- 4 of the flags word, so a host that brackets its own write with clock
+        -- reads can bound where that write landed in the sample stream. Defaults
+        -- to zero so images that do not wire it up keep emitting the constant 0
+        -- the GPIF has always placed there.
+        time_marker         :   in      std_logic := '0';
+
         -- RFIC CTRL_OUT, already in this clock domain and already transferred
         -- atomically (see ctrl_out_xfer.vhd) -- all eight bits belong to the same
         -- instant, so no filtering is needed here. Snapshotted into the otherwise
@@ -164,6 +172,7 @@ architecture simple of fifo_writer is
         -- committed at the tail.
         held_timestamp  : unsigned(timestamp'range);
         held_mini_exp   : std_logic_vector(mini_exp'range);
+        held_time_marker: std_logic;
         base_gain       : gain_index_t;
         base_lock       : std_logic;
         base_valid      : std_logic;
@@ -180,6 +189,7 @@ architecture simple of fifo_writer is
         meta_written    => '0',
         held_timestamp  => (others => '0'),
         held_mini_exp   => (others => '0'),
+        held_time_marker=> '0',
         base_gain       => (others => '0'),
         base_lock       => '0',
         base_valid      => '0',
@@ -233,6 +243,17 @@ architecture simple of fifo_writer is
 
     signal meta_fifo_used_v_r : unsigned(meta_fifo_usedw'length downto 0) := (others => '0');
     signal fifo_used_v_r      : unsigned(fifo_usedw'length downto 0) := (others => '0');
+
+    -- Low 16 bits of the flags dword. The GPIF (fx3_gpif.vhd) rewrites these on
+    -- the way to the host: bits 15:5 and 3:2 read back as zero, bits 1:0 are
+    -- its underrun pair, and bit 4 -- the time marker -- is the only one it
+    -- passes through from here. The remaining ones are the historical value.
+    function flags_low( marker : std_logic ) return std_logic_vector is
+        variable rv : std_logic_vector(15 downto 0) := (others => '1');
+    begin
+        rv(4) := marker;
+        return rv;
+    end function;
 
 begin
 
@@ -345,7 +366,8 @@ begin
         meta_future            <= meta_current;
 
         meta_future.meta_write <= '0';
-        -- currently the GPIF modules overwrites the bottom 16 bits of the flags field
+        -- The GPIF rewrites the bottom 16 bits of the flags field on the way
+        -- out, passing through only bit 4 -- see flags_low().
         if( packet_en = '0' ) then
            -- The low word is the "reserved" header dword, which the host does not
            -- read in SC16_Q11_META mode. It either keeps its historical constant
@@ -363,7 +385,8 @@ begin
            -- held since the head rather than from the live inputs -- otherwise
            -- the timestamp would be that of the last sample, not the first.
            if( ENABLE_GAIN_TAG ) then
-              meta_future.meta_data  <= x"FFF" & "11" & meta_current.held_mini_exp & x"FFFF" &
+              meta_future.meta_data  <= x"FFF" & "11" & meta_current.held_mini_exp &
+                             flags_low(meta_current.held_time_marker) &
                              std_logic_vector(meta_current.held_timestamp) &
                              meta_current.base_gain & meta_current.base_lock &
                              std_logic_vector(meta_current.deltas(0)) &
@@ -371,11 +394,13 @@ begin
                              std_logic_vector(meta_current.deltas(2)) &
                              std_logic_vector(meta_current.deltas(3));
            else
-              meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & x"FFFF" & std_logic_vector(timestamp) & x"12344321";
+              meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & flags_low(time_marker) &
+                             std_logic_vector(timestamp) & x"12344321";
            end if;
         else
            packet_flags := packet_control.pkt_flags;
-           meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & x"FFFF" & std_logic_vector(timestamp) &
+           meta_future.meta_data  <= x"FFF" & "11" & sync_mini_exp & flags_low(time_marker) &
+                          std_logic_vector(timestamp) &
                           packet_control.pkt_core_id & packet_flags &
                           std_logic_vector(to_unsigned(integer(meta_current.dma_downcount), 16));
         end if;
@@ -423,8 +448,9 @@ begin
                             -- exactly as the packet path already treats it; the
                             -- META_MAX - 4 headroom checked by fifo_enough
                             -- guarantees the slot is still free at the tail.
-                            meta_future.held_timestamp <= timestamp;
-                            meta_future.held_mini_exp  <= sync_mini_exp;
+                            meta_future.held_timestamp   <= timestamp;
+                            meta_future.held_mini_exp    <= sync_mini_exp;
+                            meta_future.held_time_marker <= time_marker;
 
                             -- Hold the previous base if the cross-domain
                             -- transfer has not produced a settled byte yet, so a
