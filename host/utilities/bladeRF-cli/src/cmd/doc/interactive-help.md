@@ -704,6 +704,25 @@ users should open the device with the "`open`" command, and write the
 firmware to flash via "`load fx3 <firmware file>`"
 
 
+reset
+-----
+
+Usage: `reset`
+
+Reset the device, causing the FX3 to reboot from its own SPI flash.
+
+Use this after "`load fx3 <firmware file>`" to bring the device up on the newly
+written firmware without a power cycle. The FX3 re-enumerates on a new USB
+address about a second later.
+
+The reset reaches the FPGA as well. Every FX3 boot drives `nCONFIG` low, which
+deconfigures the FPGA, and the boot then re-runs the SPI autoload only if the
+board holds a valid autoload header. A host-loaded bitstream does not survive.
+The board therefore comes back in the state a power cycle would leave it in.
+
+The device handle is dropped, so open the device again to keep working with it.
+
+
 run
 ---
 

@@ -655,6 +655,26 @@
   "\n" \
 
 
+#define CLI_CMD_HELPTEXT_reset \
+  "Usage: reset\n" \
+  "\n" \
+  "Reset the device, causing the FX3 to reboot from its own SPI flash.\n" \
+  "\n" \
+  "Use this after \"load fx3 <firmware file>\" to bring the device up on\n" \
+  "the newly written firmware without a power cycle. The FX3\n" \
+  "re-enumerates on a new USB address about a second later.\n" \
+  "\n" \
+  "The reset reaches the FPGA as well. Every FX3 boot drives nCONFIG\n" \
+  "low, which deconfigures the FPGA, and the boot then re-runs the SPI\n" \
+  "autoload only if the board holds a valid autoload header. A\n" \
+  "host-loaded bitstream does not survive. The board therefore comes\n" \
+  "back in the state a power cycle would leave it in.\n" \
+  "\n" \
+  "The device handle is dropped, so open the device again to keep\n" \
+  "working with it.\n" \
+  "\n" \
+
+
 #define CLI_CMD_HELPTEXT_run \
   "Usage: run <script>\n" \
   "\n" \

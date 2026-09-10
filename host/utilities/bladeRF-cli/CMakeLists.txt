@@ -210,6 +210,7 @@ set(BLADERF_CLI_SOURCE
         src/cmd/printset_xb.c
         src/cmd/probe.c
         src/cmd/recover.c
+        src/cmd/reset.c
         src/cmd/rx.c
         src/cmd/rxtx.c
         src/cmd/trigger.c

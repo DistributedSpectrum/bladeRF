@@ -56,6 +56,7 @@ DECLARE_CMD(print, "print", "pr", "p");
 DECLARE_CMD(probe, "probe", "pro");
 DECLARE_CMD(quit, "quit", "q", "exit", "x");
 DECLARE_CMD(recover, "recover", "r");
+DECLARE_CMD(reset, "reset");
 DECLARE_CMD(run, "run");
 DECLARE_CMD(rx, "rx", "receive");
 DECLARE_CMD(set, "set", "s");
@@ -289,6 +290,15 @@ static struct cmd const cmd_table[] = {
                           "mode"),
         FIELD_INIT(.help, CLI_CMD_HELPTEXT_recover),
         FIELD_INIT(.requires_device, false),
+        FIELD_INIT(.requires_fpga, false),
+        FIELD_INIT(.allow_while_streaming, false),
+    },
+    {
+        FIELD_INIT(.names, cmd_names_reset),
+        FIELD_INIT(.exec, cmd_reset),
+        FIELD_INIT(.desc, "Reset the FX3, reloading its firmware from flash"),
+        FIELD_INIT(.help, CLI_CMD_HELPTEXT_reset),
+        FIELD_INIT(.requires_device, true),
         FIELD_INIT(.requires_fpga, false),
         FIELD_INIT(.allow_while_streaming, false),
     },
