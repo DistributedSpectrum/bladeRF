@@ -117,6 +117,8 @@ entity bladerf is
     exp_i2c_scl         :   inout   std_logic;
     exp_gpio            :   inout   std_logic_vector(31 downto 0);
 
+    dummy_out : out std_logic;
+    
     -- Mini expansion interface (3.3 V / 2.5 V / 1.8 V)
     mini_exp1           :   inout   std_logic := 'Z';
     mini_exp2           :   inout   std_logic := 'Z';

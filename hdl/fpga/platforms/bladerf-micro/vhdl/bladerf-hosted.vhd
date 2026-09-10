@@ -54,6 +54,12 @@ architecture hosted_bladerf of bladerf is
     signal nios_xb_gpio_out       : std_logic_vector(31 downto 0) := (others => '0');
     signal nios_xb_gpio_oe        : std_logic_vector(31 downto 0) := (others => '0');
 
+    signal gps_uart_rxd : std_logic;
+    signal gps_uart_txd : std_logic;    
+    signal gps_data_out : std_logic_vector(7 downto 0);
+    signal gps_data_out_vld : std_logic;
+
+    
     signal nios_gpio              : nios_gpio_t;
     signal nios_gpo_slv           : std_logic_vector(31 downto 0);
 
@@ -130,10 +136,6 @@ architecture hosted_bladerf of bladerf is
     signal timestamp_ack          : std_logic;
     signal fx3_timestamp          : unsigned(63 downto 0);
 
-    -- AD9361 CTRL_OUT, moved from sys_clock into rx_clock as one atomic byte
-    signal rfic_ctrl_out_rx       : std_logic_vector(7 downto 0);
-    signal rfic_ctrl_out_rx_valid : std_logic;
-
     signal rx_ts_reset            : std_logic;
     signal tx_ts_reset            : std_logic;
 
@@ -185,6 +187,32 @@ architecture hosted_bladerf of bladerf is
     signal wbm_wb_stb_o           : std_logic;
     signal wbm_wb_ack_i           : std_logic;
     signal wbm_wb_cyc_o           : std_logic;
+
+    signal dbg_clk_cnt : unsigned(4 downto 0);
+    signal dbg_clock : std_logic;
+
+    type del_line_ty is array (47 downto 0) of std_logic_vector(7 downto 0);
+    signal gps_shift_reg : del_line_ty;
+
+    type gps_tx_fsm_ty is (Idle, Tx0);
+    signal gps_tx_state : gps_tx_fsm_ty;
+    signal start_cnt : unsigned(9 downto 0);
+    signal gps_data_in : std_logic_vector(7 downto 0);
+    signal gps_data_in_vld : std_logic;
+    signal gps_tx_done : std_logic;
+    signal gps_tx_value : std_logic_vector(7 downto 0);
+
+    type xtract_time_state_ty is (Idle, Pre0, Pre1, Pre2, Pre3, Pre4, Pre5,
+                                  H0, H1, M0, M1, S0, S1,
+                                  NL, CR);
+    signal xtract_time_state : xtract_time_state_ty;
+    signal hour, minute, second : std_logic_vector(15 downto 0);
+    signal gps_rx_time_valid : std_logic;
+    
+    
+    constant C_GSP_DIV_CNT : integer := 4340;
+    --constant C_GSP_DIV_CNT : integer := 128;    
+    --constant C_GSP_DIV_CNT : integer := 520;    
 begin
 
     U_rx_pkt_gen : entity work.rx_packet_generator
@@ -434,6 +462,7 @@ begin
             xb_gpio_in_port                 => nios_xb_gpio_in,
             xb_gpio_out_port                => nios_xb_gpio_out,
             xb_gpio_dir_export              => nios_xb_gpio_oe,
+            
             command_serial_in               => command_serial_in,
             command_serial_out              => command_serial_out,
             oc_i2c_arst_i                   => '0',
@@ -544,9 +573,13 @@ begin
 
     -- Expansion GPIO outputs
     generate_xb_gpio_out : for i in exp_gpio'range generate
+      gen_normal_gpio : if i /=0 and i /= 1 and i /= 2 generate
         exp_gpio(i) <= nios_xb_gpio_out(i) when nios_xb_gpio_oe(i) = '1' else 'Z';
+      end generate;
     end generate;
 
+    exp_gpio(1) <= gps_uart_txd;
+    
     tx_packet_ready <= '1';
 
     -- TX Submodule
@@ -628,8 +661,7 @@ begin
     -- RX Submodule
     U_rx : entity work.rx
         generic map (
-            NUM_STREAMS            => adc_controls'length,
-            ENABLE_GAIN_TAG        => true
+            NUM_STREAMS            => adc_controls'length
         )
         port map (
             rx_reset               => rx_reset,
@@ -670,11 +702,6 @@ begin
             -- Mini expansion signals
             mini_exp               => mini_exp2 & mini_exp1,
 
-            -- Transferred out of sys_clock into rx_clock as one atomic byte by
-            -- U_ctrl_out_xfer below.
-            rfic_ctrl_out          => rfic_ctrl_out_rx,
-            rfic_ctrl_out_valid    => rfic_ctrl_out_rx_valid,
-
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_pclk_pll,
             meta_fifo_raclr        => not rx_enable_pclk,
@@ -698,6 +725,234 @@ begin
             adc_streams            => adc_streams
         );
 
+    p_dbg_clk: process (sys_clock) is
+    begin  -- process p_dbg_clk
+      if (rising_edge(sys_clock)) then  -- rising clock edge
+        dbg_clk_cnt <= (dbg_clk_cnt + 1) mod 32; 
+      end if;
+    end process p_dbg_clk;
+
+    dbg_clock <= dbg_clk_cnt(4);
+
+    p_gps_tx_fsm: process (sys_clock, sys_reset) is
+    begin  -- process p_gps_tx_fsm
+      if (sys_reset = '0') then           -- asynchronous reset (active low)
+        gps_tx_state <= Idle;
+        start_cnt <= to_unsigned(1023,10);
+
+        gps_data_in <= (others => '0');
+        gps_data_in_vld <= '0';
+
+        gps_tx_value <= X"A4";
+      elsif (rising_edge(sys_clock)) then  -- rising clock edge
+        gps_data_in_vld <= '0';
+        
+        case gps_tx_state is
+          when Idle =>
+            start_cnt <= (start_cnt - 1) mod 1024;
+            gps_data_in <= (others => '0');
+
+                         
+            if (start_cnt = 0) then
+              gps_tx_state <= Tx0;
+              gps_data_in <= gps_tx_value;
+              gps_data_in_vld <= '1';
+            end if;
+
+          when Tx0 =>
+            gps_data_in <= (others => '0');
+            
+            if ((gps_tx_done = '1')) then
+              gps_tx_state <= Idle;
+              start_cnt <= to_unsigned(1023,10);
+              gps_tx_value <= not gps_tx_value;
+            end if;
+            
+          when others =>
+            gps_tx_value <= X"A4";
+            gps_tx_state <= Idle;
+            start_cnt <= to_unsigned(1023,10);
+
+            gps_data_in <= (others => '0');
+            gps_data_in_vld <= '0';
+        end case;
+      end if;
+    end process p_gps_tx_fsm;
+    
+    gps_uart_tx_1: entity work.uart_tx
+      generic map (
+        C_DIV_CNT => C_GSP_DIV_CNT)
+      port map (
+        clk         => sys_clock,
+        reset_n     => sys_reset,
+        data_in     => gps_data_in,
+        data_in_vld => gps_data_in_vld,
+        tx_done     => gps_tx_done,
+        txd         => open);
+    
+      gps_uart_rx_1: entity work.uart_rx
+        generic map (
+          C_DIV_CNT => C_GSP_DIV_CNT)
+        port map (
+          clk          => sys_clock,
+          reset_n      => sys_reset,
+          rxd          => gps_uart_rxd,
+          data_out     => gps_data_out,
+          data_out_vld => gps_data_out_vld);
+
+    p_xtract_time: process (sys_clock, sys_reset) is
+    begin  -- process p_xtract_time
+      if (sys_reset = '0') then         -- asynchronous reset (active low)
+        xtract_time_state <= Idle;
+        second <= (others => '0');
+        minute <= (others => '0');
+        hour <= (others => '0');
+
+        gps_rx_time_valid <= '0';
+      elsif (rising_edge(sys_clock)) then  -- rising clock edge
+        gps_rx_time_valid <= '0';
+        
+        case xtract_time_state is
+          when Idle =>
+            -- Wait for '$'
+            if (gps_data_out_vld = '1' and gps_data_out = X"24") then
+              xtract_time_state <= Pre0;
+            end if;
+          when Pre0 =>
+            -- Wait for 'G'
+            if (gps_data_out_vld = '1') then
+              xtract_time_state <= Idle;
+              if (gps_data_out = X"47") then -- 'G'
+                xtract_time_state <= Pre1;
+              end if;
+            end if;
+          when Pre1 =>
+            if (gps_data_out_vld = '1') then            
+              xtract_time_state <= Pre2;
+            end if;
+          when Pre2 =>
+            -- Wait for 'G'
+            if (gps_data_out_vld = '1') then
+              xtract_time_state <= Idle;
+              if (gps_data_out = X"47") then -- 'G'
+                xtract_time_state <= Pre3;
+              end if;
+            end if;
+          when Pre3 =>
+            -- Wait for 'G'
+            if (gps_data_out_vld = '1') then
+              xtract_time_state <= Idle;
+              if (gps_data_out = X"47") then -- 'G'
+                xtract_time_state <= Pre4;
+              end if;
+            end if;
+          when Pre4 =>
+            -- Wait for 'A'
+            if (gps_data_out_vld = '1') then
+              xtract_time_state <= Idle;
+              if (gps_data_out = X"41") then -- 'A'
+                xtract_time_state <= Pre5;
+              end if;
+            end if;
+          when Pre5 =>
+            if (gps_data_out_vld = '1') then
+              xtract_time_state <= Idle;
+              if (gps_data_out = X"2C") then -- ','
+                xtract_time_state <= H0;
+              end if;
+            end if;
+            
+          when H0 =>
+            if (gps_data_out_vld = '1') then
+              hour(15 downto 8) <= gps_data_out;
+              xtract_time_state <= H1;
+            end if;
+          when H1 =>
+            if (gps_data_out_vld = '1') then
+              hour(7 downto 0) <= gps_data_out;
+              xtract_time_state <= M0;
+            end if;
+
+          when M0 =>
+            if (gps_data_out_vld = '1') then
+              minute(15 downto 8) <= gps_data_out;
+              xtract_time_state <= M1;
+            end if;
+          when M1 =>
+            if (gps_data_out_vld = '1') then
+              minute(7 downto 0) <= gps_data_out;
+              xtract_time_state <= S0;
+            end if;
+            
+          when S0 =>
+            if (gps_data_out_vld = '1') then
+              second(15 downto 8) <= gps_data_out;
+              xtract_time_state <= S1;
+            end if;
+          when S1 =>
+            if (gps_data_out_vld = '1') then
+              second(7 downto 0) <= gps_data_out;
+              xtract_time_state <= CR;
+              gps_rx_time_valid <= '1';
+            end if;
+
+          when CR =>
+            if (gps_data_out_vld = '1') then
+              if (gps_data_out = X"0D") then -- CR
+                xtract_time_state <= NL;
+              end if;
+            end if;
+          when NL =>
+            if (gps_data_out_vld = '1') then
+              if (gps_data_out = X"0A") then -- NL
+                xtract_time_state <= Idle;
+              end if;
+            end if;
+            
+            
+          when others =>
+            xtract_time_state <= Idle;
+            second <= (others => '0');
+            minute <= (others => '0');
+            hour <= (others => '0');
+            gps_rx_time_valid <= '0';
+        end case;
+      end if;
+    end process p_xtract_time;
+
+    
+    p_shift_line: process (sys_clock) is
+    begin  -- process p_shift_line
+      if (rising_edge(sys_clock)) then  -- rising clock edge
+        if (gps_data_out_vld = '1') then
+          gps_shift_reg <= gps_shift_reg(gps_shift_reg'high-1 downto 0) & gps_data_out;
+        end if;
+      end if;
+    end process p_shift_line;
+    
+    p_dummy: process (sys_clock) is
+      variable temp0, temp1, temp2, temp3 : std_logic;
+    begin  -- process p_dummy
+      if (rising_edge(sys_clock)) then  -- rising clock edge
+        for i in 0 to 47 loop
+          for j in 0 to 7 loop
+            temp0 := temp0 xor gps_shift_reg(i)(j);            
+          end loop;  -- j
+        end loop;  -- i
+
+        for k in 0 to 15 loop
+          temp1 := temp1 xor hour(k);
+          temp2 := temp2 xor minute(k);
+          temp3 := temp3 xor second(k);
+        end loop;  -- k
+        
+        dummy_out <= temp0 xor temp1 xor temp2 xor temp3 xor
+                     gps_data_out_vld xor dbg_clock xor gps_rx_time_valid;
+        
+      end if;
+    end process p_dummy;
+
+    
     adc_assignment_proc : process( all )
     begin
         for i in adc_controls'range loop
@@ -981,6 +1236,7 @@ begin
         );
 
     generate_sync_xb_gpio_in : for i in exp_gpio'range generate
+      gen_normal_gpio : if i /= 0 and i /= 1 generate
         U_sync_xb_gpio_in : entity work.synchronizer
           generic map (
             RESET_LEVEL         =>  '0'
@@ -990,8 +1246,11 @@ begin
             async               =>  exp_gpio(i),
             sync                =>  nios_xb_gpio_in(i)
           );
+      end generate;
     end generate;
 
+    gps_uart_rxd <= exp_gpio(0);
+    
     U_sync_rx_enable : entity work.synchronizer
         generic map (
             RESET_LEVEL =>  '0'
@@ -1035,23 +1294,6 @@ begin
             end if;
         end if;
     end process;
-
-    -- The metadata gain tag is assembled in rx_clock, but adi_ctrl_out is only
-    -- synchronized into sys_clock (for the Nios readback register below). Reuse
-    -- that synchronized copy rather than adding a third set of per-bit chains,
-    -- and carry all eight bits across the remaining domain boundary in a single
-    -- parallel load so a header can never see a mixture of two gain indices.
-    U_ctrl_out_xfer : entity work.ctrl_out_xfer
-        port map (
-            src_clock           =>  sys_clock,
-            src_reset           =>  sys_reset,
-            src_data            =>  rffe_gpio.i.ctrl_out,
-
-            dst_clock           =>  rx_clock,
-            dst_reset           =>  rx_reset,
-            dst_data            =>  rfic_ctrl_out_rx,
-            dst_valid           =>  rfic_ctrl_out_rx_valid
-        );
 
     U_handshake_timestamp : entity work.handshake
         generic map (
