@@ -37,6 +37,8 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip ps_sy
 # Implementation Details
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/uart_rx.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/uart_tx.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/gps_uart.vhd]]
+
 
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif_p.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif.vhd]]
