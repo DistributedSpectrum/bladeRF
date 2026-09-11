@@ -40,7 +40,10 @@ architecture rtl of gps_uart is
     signal gps_data_out : std_logic_vector(7 downto 0);
     signal gps_data_out_vld : std_logic;
 
+    signal en0, en1 : std_logic;
+    signal rx_time_to_pps, pps_to_rx_time : unsigned(31 downto 0);
 
+    
 begin  -- architecture rtl
 
     p_gps_tx_fsm: process (sys_clock, sys_reset) is
@@ -238,9 +241,47 @@ begin  -- architecture rtl
         end if;
       end if;
     end process p_shift_line;
+
+    p_calc_delta: process (sys_clock, sys_reset) is
+    begin  -- process p_calc_delta
+      if (sys_reset = '0') then         -- asynchronous reset (active low)
+        rx_time_to_pps <= (others => '0');
+        pps_to_rx_time <= (others => '0');
+        
+        en0 <= '0';
+        en1 <= '0';
+      elsif (rising_edge(sys_clock)) then  -- rising clock edge
+        if (gps_rx_time_valid = '1') then
+          en0 <= '1';
+        elsif (pps = '1') then
+          en0 <= '0';
+        end if;
+
+        if (gps_rx_time_valid = '1') then
+          rx_time_to_pps <= (others => '0');          
+        elsif (en0 = '1') then
+          rx_time_to_pps <= rx_time_to_pps + 1;
+        end if;
+        
+        if (pps = '1') then
+          en1 <= '1';
+        elsif (gps_rx_time_valid = '1') then
+          en1 <= '0';
+        end if;
+
+        if (pps = '1') then
+          pps_to_rx_time <= (others => '0');
+        elsif (en1 = '1') then
+          pps_to_rx_time <= pps_to_rx_time + 1;
+        end if;
+        
+        
+      end if;
+    end process p_calc_delta;
+
     
     p_dummy: process (sys_clock) is
-      variable temp0, temp1, temp2, temp3 : std_logic;
+      variable temp0, temp1, temp2, temp3, temp4, temp5 : std_logic;
     begin  -- process p_dummy
       if (rising_edge(sys_clock)) then  -- rising clock edge
         for i in 0 to 47 loop
@@ -254,8 +295,14 @@ begin  -- architecture rtl
           temp2 := temp2 xor minute(k);
           temp3 := temp3 xor second(k);
         end loop;  -- k
+
+        for l in 0 to 31 loop
+          temp4 := temp4 xor std_logic(rx_time_to_pps(l));
+          temp5 := temp5 xor std_logic(pps_to_rx_time(l));
+        end loop;  -- l
         
         dummy_out <= temp0 xor temp1 xor temp2 xor temp3 xor
+                     temp4 xor temp5 xor
                      gps_data_out_vld xor gps_rx_time_valid;
         
       end if;
