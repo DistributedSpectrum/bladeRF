@@ -1,6 +1,6 @@
 library ieee;
 use ieee.std_logic_1164.all;
-use ieee.std_logic_unsigned.all;
+use ieee.numeric_std.all;
 --use ieee.std_logic_arith.all;
 
 entity uart_rx is
@@ -11,6 +11,10 @@ entity uart_rx is
     clk     : in  std_logic;
     reset_n : in  std_logic;
     rxd     : in  std_logic;
+
+    enable : in std_logic;
+    clk_div : in std_logic_vector(15 downto 0);
+    
     data_out : out std_logic_vector(7 downto 0);
     data_out_vld : out std_logic);
 
@@ -24,7 +28,8 @@ architecture rtl of uart_rx is
   signal pip_rxd : std_logic_vector(1 downto 0);
   signal fe_rxd  : std_logic;
 
-  signal div_cnt : integer range 0 to 16383;
+  signal clk_div_start : integer range 0 to 65535;
+  signal div_cnt : integer range 0 to 65535;
   signal div_cnt_en : std_logic;
   
   signal rx_data : std_logic_vector(7 downto 0);
@@ -59,11 +64,13 @@ begin  -- architecture rtl
     end if;
   end process p_fe_rxd;
 
+  clk_div_start <= to_integer('0' & unsigned(clk_div(15 downto 1)));
+  
   p_rx_shift_en: process (clk, reset_n) is
   begin  -- process p_rx_shift_en
     if (reset_n = '0') then             -- asynchronous reset (active low)
       rx_shift_en <= '0';
-      div_cnt <= C_DIV_CNT_START;
+      div_cnt <= clk_div_start;
       div_cnt_en <= '0';
       pip_rx_shift_en <= '0';
       bit_cnt <= 0;
@@ -72,10 +79,10 @@ begin  -- architecture rtl
 
       if (div_cnt_en = '1') then
         if (div_cnt = 0) then
-          if (state = Idle or state = Rx_Stop) then
-            div_cnt <= C_DIV_CNT_START;
+          if (enable = '1' and (state = Idle or state = Rx_Stop)) then
+            div_cnt <= clk_div_start;
           else
-            div_cnt <= C_DIV_CNT;
+            div_cnt <= to_integer(unsigned(clk_div));
           end if;
 
         elsif (state /= Idle) then
@@ -108,7 +115,7 @@ begin  -- architecture rtl
       
       case state is
         when Idle =>
-          if (fe_rxd = '1') then
+          if (fe_rxd = '1' and enable = '1') then
             state <= Rx_Start;
             rx_data <= (others => '0');
           end if;

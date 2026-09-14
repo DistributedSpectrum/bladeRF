@@ -18,7 +18,38 @@ end entity gps_uart;
 
 architecture rtl of gps_uart is
     constant C_GSP_DIV_CNT : integer := 4340;
-  
+    constant C_GPS_DIV_CNT_115k : integer := C_GSP_DIV_CNT / 12;
+    
+    constant CMD_LEN : integer := 20;
+ 
+    type pmtk_cmd_t is array (0 to CMD_LEN - 1) of std_logic_vector(7 downto 0);
+ 
+    constant PMTK251_115200 : pmtk_cmd_t := (
+        0  => x"24",   -- '$'
+        1  => x"50",   -- 'P'
+        2  => x"4D",   -- 'M'
+        3  => x"54",   -- 'T'
+        4  => x"4B",   -- 'K'
+        5  => x"32",   -- '2'
+        6  => x"35",   -- '5'
+        7  => x"31",   -- '1'
+        8  => x"2C",   -- ','
+        9  => x"31",   -- '1'
+        10 => x"31",   -- '1'
+        11 => x"35",   -- '5'
+        12 => x"32",   -- '2'
+        13 => x"30",   -- '0'
+        14 => x"30",   -- '0'
+        15 => x"2A",   -- '*'
+        16 => x"31",   -- '1'
+        17 => x"46",   -- 'F'
+        18 => x"0D",   -- '\r' (CR)
+        19 => x"0A"    -- '\n' (LF)
+    );
+
+    signal tx_index : integer range 0 to 31;
+
+    
     type del_line_ty is array (47 downto 0) of std_logic_vector(7 downto 0);
     signal gps_shift_reg : del_line_ty;
 
@@ -39,58 +70,109 @@ architecture rtl of gps_uart is
     
     signal gps_data_out : std_logic_vector(7 downto 0);
     signal gps_data_out_vld : std_logic;
-
-    signal en0, en1 : std_logic;
-    signal rx_time_to_pps, pps_to_rx_time : unsigned(31 downto 0);
+    signal gps_uart_15k_baud : std_logic;
+    signal gps_rx_clk_div : std_logic_vector(15 downto 0);
+    
+    signal en0, en1, en2 : std_logic;
+    signal rx_time_to_pps, pps_to_rx_time, rx_time_to_rx_time : unsigned(31 downto 0);
 
     
 begin  -- architecture rtl
 
-    p_gps_tx_fsm: process (sys_clock, sys_reset) is
-    begin  -- process p_gps_tx_fsm
-      if (sys_reset = '0') then           -- asynchronous reset (active low)
-        gps_tx_state <= Idle;
-        start_cnt <= to_unsigned(1023,10);
+    -- p_gps_tx_fsm: process (sys_clock, sys_reset) is
+    -- begin  -- process p_gps_tx_fsm
+    --   if (sys_reset = '0') then           -- asynchronous reset (active low)
+    --     gps_tx_state <= Idle;
+    --     start_cnt <= to_unsigned(1023,10);
 
-        gps_data_in <= (others => '0');
-        gps_data_in_vld <= '0';
+    --     gps_data_in <= (others => '0');
+    --     gps_data_in_vld <= '0';
 
-        gps_tx_value <= X"A4";
-      elsif (rising_edge(sys_clock)) then  -- rising clock edge
-        gps_data_in_vld <= '0';
+    --     gps_tx_value <= X"A4";
+    --   elsif (rising_edge(sys_clock)) then  -- rising clock edge
+    --     gps_data_in_vld <= '0';
         
-        case gps_tx_state is
-          when Idle =>
-            start_cnt <= (start_cnt - 1) mod 1024;
-            gps_data_in <= (others => '0');
+    --     case gps_tx_state is
+    --       when Idle =>
+    --         start_cnt <= (start_cnt - 1) mod 1024;
+    --         gps_data_in <= (others => '0');
 
                          
-            if (start_cnt = 0) then
-              gps_tx_state <= Tx0;
-              gps_data_in <= gps_tx_value;
-              gps_data_in_vld <= '1';
-            end if;
+    --         if (start_cnt = 0) then
+    --           gps_tx_state <= Tx0;
+    --           gps_data_in <= gps_tx_value;
+    --           gps_data_in_vld <= '1';
+    --         end if;
 
-          when Tx0 =>
-            gps_data_in <= (others => '0');
+    --       when Tx0 =>
+    --         gps_data_in <= (others => '0');
             
-            if ((gps_tx_done = '1')) then
-              gps_tx_state <= Idle;
-              start_cnt <= to_unsigned(1023,10);
-              gps_tx_value <= not gps_tx_value;
-            end if;
+    --         if ((gps_tx_done = '1')) then
+    --           gps_tx_state <= Idle;
+    --           start_cnt <= to_unsigned(1023,10);
+    --           gps_tx_value <= not gps_tx_value;
+    --         end if;
             
-          when others =>
-            gps_tx_value <= X"A4";
+    --       when others =>
+    --         gps_tx_value <= X"A4";
+    --         gps_tx_state <= Idle;
+    --         start_cnt <= to_unsigned(1023,10);
+
+    --         gps_data_in <= (others => '0');
+    --         gps_data_in_vld <= '0';
+    --     end case;
+    --   end if;
+    -- end process p_gps_tx_fsm;
+
+
+  p_gps_tx: process (sys_clock, sys_reset) is
+  begin  -- process p_gps_tx
+    if (sys_reset = '0') then             -- asynchronous reset (active low)
+      gps_tx_state <= Idle;
+      tx_index <= 0;
+
+      gps_data_in <= (others => '0');
+      gps_data_in_vld <= '0';
+
+      gps_uart_15k_baud <= '0';
+    elsif (rising_edge(sys_clock)) then   -- rising clock edge
+      gps_data_in_vld <= '0';
+      
+      case gps_tx_state is
+        when Idle =>
+          gps_uart_15k_baud <= '0';          
+          
+          if (tx_index < CMD_LEN) then
+            gps_data_in <= PMTK251_115200(tx_index);
+            gps_data_in_vld <= '1';
+          
+            gps_tx_state <= Tx0;
+          else
+            gps_uart_15k_baud <= '1';                      
+          end if;          
+
+        when Tx0 =>
+          if (gps_tx_done = '1') then
+            -- if (tx_index = CMD_LEN-1) then
+            --   tx_index <= 0;
+            -- else
+            --   tx_index <= tx_index + 1;              
+            -- end if;
+
+            tx_index <= tx_index + 1;                          
             gps_tx_state <= Idle;
-            start_cnt <= to_unsigned(1023,10);
-
-            gps_data_in <= (others => '0');
-            gps_data_in_vld <= '0';
-        end case;
-      end if;
-    end process p_gps_tx_fsm;
-
+          end if;
+          
+        when others =>
+          gps_data_in <= (others => '0');
+          gps_data_in_vld <= '0';      
+          
+          gps_tx_state <= Idle;
+          tx_index <= 0;
+          gps_uart_15k_baud <= '0';          
+      end case;
+    end if;
+  end process p_gps_tx;
   
     gps_uart_tx_1: entity work.uart_tx
       generic map (
@@ -102,7 +184,11 @@ begin  -- architecture rtl
         data_in_vld => gps_data_in_vld,
         tx_done     => gps_tx_done,
         txd         => txd);
-    
+
+
+  gps_rx_clk_div <= std_logic_vector(to_unsigned(C_GSP_DIV_CNT,16)) when gps_uart_15k_baud = '0'
+                    else std_logic_vector(to_unsigned(C_GPS_DIV_CNT_115k,16));
+  
       gps_uart_rx_1: entity work.uart_rx
         generic map (
           C_DIV_CNT => C_GSP_DIV_CNT)
@@ -110,6 +196,8 @@ begin  -- architecture rtl
           clk          => sys_clock,
           reset_n      => sys_reset,
           rxd          => rxd,
+          enable => gps_uart_15k_baud,
+          clk_div => gps_rx_clk_div,
           data_out     => gps_data_out,
           data_out_vld => gps_data_out_vld);
   
@@ -247,9 +335,11 @@ begin  -- architecture rtl
       if (sys_reset = '0') then         -- asynchronous reset (active low)
         rx_time_to_pps <= (others => '0');
         pps_to_rx_time <= (others => '0');
+        rx_time_to_rx_time <= (others => '0');
         
         en0 <= '0';
         en1 <= '0';
+        en2 <= '0';
       elsif (rising_edge(sys_clock)) then  -- rising clock edge
         if (gps_rx_time_valid = '1') then
           en0 <= '1';
@@ -274,14 +364,19 @@ begin  -- architecture rtl
         elsif (en1 = '1') then
           pps_to_rx_time <= pps_to_rx_time + 1;
         end if;
-        
+
+        if (gps_rx_time_valid = '1') then
+          rx_time_to_rx_time <= (others => '0');
+        else
+          rx_time_to_rx_time <= rx_time_to_rx_time + 1;
+        end if;
         
       end if;
     end process p_calc_delta;
 
     
     p_dummy: process (sys_clock) is
-      variable temp0, temp1, temp2, temp3, temp4, temp5 : std_logic;
+      variable temp0, temp1, temp2, temp3, temp4, temp5, temp6 : std_logic;
     begin  -- process p_dummy
       if (rising_edge(sys_clock)) then  -- rising clock edge
         for i in 0 to 47 loop
@@ -299,10 +394,11 @@ begin  -- architecture rtl
         for l in 0 to 31 loop
           temp4 := temp4 xor std_logic(rx_time_to_pps(l));
           temp5 := temp5 xor std_logic(pps_to_rx_time(l));
+          temp6 := temp6 xor std_logic(rx_time_to_rx_time(l));
         end loop;  -- l
         
         dummy_out <= temp0 xor temp1 xor temp2 xor temp3 xor
-                     temp4 xor temp5 xor
+                     temp4 xor temp5 xor temp6 xor
                      gps_data_out_vld xor gps_rx_time_valid;
         
       end if;
