@@ -23,7 +23,7 @@ end entity uart_rx;
 
 architecture rtl of uart_rx is
   constant C_DIV_CNT_START : integer := C_DIV_CNT/2;
-  constant C_MOD_MAX : integer := 16384;
+  constant C_MOD_MAX : integer := 65536;
   
   signal pip_rxd : std_logic_vector(1 downto 0);
   signal fe_rxd  : std_logic;

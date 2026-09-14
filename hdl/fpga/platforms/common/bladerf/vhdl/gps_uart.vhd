@@ -19,41 +19,67 @@ end entity gps_uart;
 architecture rtl of gps_uart is
     constant C_GSP_DIV_CNT : integer := 4340;
     constant C_GPS_DIV_CNT_115k : integer := C_GSP_DIV_CNT / 12;
-    
+
+    constant CMD_MAX : integer := 2;
     constant CMD_LEN : integer := 20;
- 
+
+    constant C_CR : character := character'val(13); -- ASCII CR, 0x0D
+    constant C_LF : character := character'val(10); -- ASCII LF, 0x0A
+
+    function char_to_slv(c : character) return std_logic_vector is
+    begin
+      return std_logic_vector(to_unsigned(character'pos(c), 8));
+    end function;
+
+    
     type pmtk_cmd_t is array (0 to CMD_LEN - 1) of std_logic_vector(7 downto 0);
- 
-    constant PMTK251_115200 : pmtk_cmd_t := (
-        0  => x"24",   -- '$'
-        1  => x"50",   -- 'P'
-        2  => x"4D",   -- 'M'
-        3  => x"54",   -- 'T'
-        4  => x"4B",   -- 'K'
-        5  => x"32",   -- '2'
-        6  => x"35",   -- '5'
-        7  => x"31",   -- '1'
-        8  => x"2C",   -- ','
-        9  => x"31",   -- '1'
-        10 => x"31",   -- '1'
-        11 => x"35",   -- '5'
-        12 => x"32",   -- '2'
-        13 => x"30",   -- '0'
-        14 => x"30",   -- '0'
-        15 => x"2A",   -- '*'
-        16 => x"31",   -- '1'
-        17 => x"46",   -- 'F'
-        18 => x"0D",   -- '\r' (CR)
-        19 => x"0A"    -- '\n' (LF)
-    );
+    --type pmtk_cmd_t is array (0 to CMD_MAX - 1) of string(1 to CMD_LEN);
+    
+    type cmd_table_rec is record
+      command : string(1 to CMD_LEN);
+      len     : integer range 0 to 63;
+    end record cmd_table_rec;
+    
+    type cmds_array is array (0 to CMD_MAX-1) of cmd_table_rec;
+    
+    constant init_commands : cmds_array :=
+      (
+        0 => (command => "$PMTK251,115200*1F" & C_CR & C_LF, len => 20),
+        1 => (command => "$PMTK255,1*2D" & C_CR & C_LF & (5 downto 1 => NUL), len => 15)
+        );
 
-    signal tx_index : integer range 0 to 31;
+       
+    
+    -- constant PMTK251_115200 : pmtk_cmd_t := (
+    --     0  => x"24",   -- '$'
+    --     1  => x"50",   -- 'P'
+    --     2  => x"4D",   -- 'M'
+    --     3  => x"54",   -- 'T'
+    --     4  => x"4B",   -- 'K'
+    --     5  => x"32",   -- '2'
+    --     6  => x"35",   -- '5'
+    --     7  => x"31",   -- '1'
+    --     8  => x"2C",   -- ','
+    --     9  => x"31",   -- '1'
+    --     10 => x"31",   -- '1'
+    --     11 => x"35",   -- '5'
+    --     12 => x"32",   -- '2'
+    --     13 => x"30",   -- '0'
+    --     14 => x"30",   -- '0'
+    --     15 => x"2A",   -- '*'
+    --     16 => x"31",   -- '1'
+    --     17 => x"46",   -- 'F'
+    --     18 => x"0D",   -- '\r' (CR)
+    --     19 => x"0A"    -- '\n' (LF)
+    -- );
 
+    signal tx_char_index : integer range 0 to 31;
+    signal tx_cmd_index : integer range 0 to 31;
     
     type del_line_ty is array (47 downto 0) of std_logic_vector(7 downto 0);
     signal gps_shift_reg : del_line_ty;
 
-    type gps_tx_fsm_ty is (Idle, Tx0);
+    type gps_tx_fsm_ty is (Idle, Tx0, Char_Incr, Cmd_Incr, Done);
     signal gps_tx_state : gps_tx_fsm_ty;
     signal start_cnt : unsigned(9 downto 0);
     signal gps_data_in : std_logic_vector(7 downto 0);
@@ -129,7 +155,8 @@ begin  -- architecture rtl
   begin  -- process p_gps_tx
     if (sys_reset = '0') then             -- asynchronous reset (active low)
       gps_tx_state <= Idle;
-      tx_index <= 0;
+      tx_char_index <= 0;
+      tx_cmd_index <= 0;
 
       gps_data_in <= (others => '0');
       gps_data_in_vld <= '0';
@@ -142,37 +169,64 @@ begin  -- architecture rtl
         when Idle =>
           gps_uart_15k_baud <= '0';          
           
-          if (tx_index < CMD_LEN) then
-            gps_data_in <= PMTK251_115200(tx_index);
+          -- if (tx_char_index < init_commands(tx_cmd_index).len ) then
+          --   gps_data_in <= char_to_slv(init_commands(tx_cmd_index).command((tx_char_index+1)));
+          --   gps_data_in_vld <= '1';
+          
+          --   gps_tx_state <= Tx0;
+          -- end if;          
+
+          gps_tx_state <= Char_Incr;
+
+          
+        when Tx0 =>
+          if (gps_tx_done = '1') then
+            tx_char_index <= tx_char_index + 1;                          
+            gps_tx_state <= Char_Incr;
+          end if;
+
+        when Char_Incr =>
+          if (tx_char_index < init_commands(tx_cmd_index).len ) then
+            gps_data_in <= char_to_slv(init_commands(tx_cmd_index).command((tx_char_index+1)));
             gps_data_in_vld <= '1';
           
             gps_tx_state <= Tx0;
           else
-            gps_uart_15k_baud <= '1';                      
+            gps_tx_state <= Cmd_Incr;
+            tx_cmd_index <= tx_cmd_index + 1;
+            tx_char_index <= 0;
+
+            -- 1st command is to set the baud rate to 115.2kbps
+            if (tx_cmd_index = 0) then
+              gps_uart_15k_baud <= '1';
+            end if;
           end if;          
 
-        when Tx0 =>
-          if (gps_tx_done = '1') then
-            -- if (tx_index = CMD_LEN-1) then
-            --   tx_index <= 0;
-            -- else
-            --   tx_index <= tx_index + 1;              
-            -- end if;
-
-            tx_index <= tx_index + 1;                          
-            gps_tx_state <= Idle;
+        when Cmd_Incr =>
+          if (tx_cmd_index < CMD_MAX) then
+            gps_tx_state <= Char_Incr;
+          else
+            gps_tx_state <= Done;
           end if;
+
+        when Done =>
+          null;
           
         when others =>
           gps_data_in <= (others => '0');
           gps_data_in_vld <= '0';      
           
           gps_tx_state <= Idle;
-          tx_index <= 0;
+          tx_char_index <= 0;
+          tx_cmd_index <= 0;
           gps_uart_15k_baud <= '0';          
       end case;
     end if;
   end process p_gps_tx;
+
+
+  gps_rx_clk_div <= std_logic_vector(to_unsigned(C_GSP_DIV_CNT,16)) when gps_uart_15k_baud = '0'
+                    else std_logic_vector(to_unsigned(C_GPS_DIV_CNT_115k,16));
   
     gps_uart_tx_1: entity work.uart_tx
       generic map (
@@ -180,14 +234,11 @@ begin  -- architecture rtl
       port map (
         clk         => sys_clock,
         reset_n     => sys_reset,
+        clk_div => gps_rx_clk_div,
         data_in     => gps_data_in,
         data_in_vld => gps_data_in_vld,
         tx_done     => gps_tx_done,
         txd         => txd);
-
-
-  gps_rx_clk_div <= std_logic_vector(to_unsigned(C_GSP_DIV_CNT,16)) when gps_uart_15k_baud = '0'
-                    else std_logic_vector(to_unsigned(C_GPS_DIV_CNT_115k,16));
   
       gps_uart_rx_1: entity work.uart_rx
         generic map (

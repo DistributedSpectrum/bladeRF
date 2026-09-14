@@ -1,6 +1,6 @@
 library ieee;
 use ieee.std_logic_1164.all;
-use ieee.std_logic_unsigned.all;
+use ieee.numeric_std.all;
 --use ieee.std_logic_arith.all;
 
 entity uart_tx is
@@ -9,6 +9,8 @@ entity uart_tx is
   port (
     clk     : in  std_logic;
     reset_n : in  std_logic;
+
+    clk_div : in std_logic_vector(15 downto 0);
     data_in : in std_logic_vector(7 downto 0);
     data_in_vld : in std_logic;
     tx_done : out std_logic;
@@ -16,9 +18,9 @@ entity uart_tx is
 end entity uart_tx;
 
 architecture rtl of uart_tx is
-  constant C_MOD_MAX : integer := 16384;
+  constant C_MOD_MAX : integer := 65536;
   
-  signal div_cnt : integer range 0 to 16383;
+  signal div_cnt : integer range 0 to 65535;
   signal div_cnt_en : std_logic;
   
   signal tx_data : std_logic_vector(7 downto 0);
@@ -31,12 +33,13 @@ architecture rtl of uart_tx is
   signal state : fsm_ty;
   
 begin  -- architecture rtl
+  
   p_shift_en: process (clk, reset_n) is
   begin  -- process p_shift_en
     if (reset_n = '0') then             -- asynchronous reset (active low)
       shift_en <= '0';
       pip1_shift_en <= '0';
-      div_cnt <= C_DIV_CNT;
+      div_cnt <= to_integer(unsigned(clk_div));
       div_cnt_en <= '0';
       bit_cnt <= 0;
     elsif (rising_edge(clk)) then       -- rising clock edge
@@ -44,7 +47,7 @@ begin  -- architecture rtl
 
       if (div_cnt_en = '1') then
         if (div_cnt = 0) then
-          div_cnt <= C_DIV_CNT;
+          div_cnt <= to_integer(unsigned(clk_div));
         elsif (state /= Idle) then
           div_cnt <= (div_cnt - 1) mod C_MOD_MAX;
         end if;
