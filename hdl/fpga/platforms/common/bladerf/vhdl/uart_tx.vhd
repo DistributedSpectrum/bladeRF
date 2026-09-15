@@ -46,7 +46,7 @@ begin  -- architecture rtl
       div_cnt_en <= not div_cnt_en;
 
       if (div_cnt_en = '1') then
-        if (div_cnt = 0) then
+        if (state = Idle or div_cnt = 0) then
           div_cnt <= to_integer(unsigned(clk_div));
         elsif (state /= Idle) then
           div_cnt <= (div_cnt - 1) mod C_MOD_MAX;

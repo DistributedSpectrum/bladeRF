@@ -20,8 +20,8 @@ architecture rtl of gps_uart is
     constant C_GSP_DIV_CNT : integer := 4340;
     constant C_GPS_DIV_CNT_115k : integer := C_GSP_DIV_CNT / 12;
 
-    constant CMD_MAX : integer := 2;
-    constant CMD_LEN : integer := 20;
+    constant CMD_MAX : integer := 3;
+    constant CMD_LEN : integer := 51;
 
     constant C_CR : character := character'val(13); -- ASCII CR, 0x0D
     constant C_LF : character := character'val(10); -- ASCII LF, 0x0A
@@ -44,8 +44,9 @@ architecture rtl of gps_uart is
     
     constant init_commands : cmds_array :=
       (
-        0 => (command => "$PMTK251,115200*1F" & C_CR & C_LF, len => 20),
-        1 => (command => "$PMTK255,1*2D" & C_CR & C_LF & (5 downto 1 => NUL), len => 15)
+        0 => (command => "$PMTK251,115200*1F" & C_CR & C_LF & (31 downto 1 => NUL), len => 20),
+        1 => (command => "$PMTK314,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1*29" & C_CR & C_LF, len => 51), 
+        2 => (command => "$PMTK255,1*2D" & C_CR & C_LF & (36 downto 1 => NUL), len => 15)
         );
 
        
@@ -73,8 +74,9 @@ architecture rtl of gps_uart is
     --     19 => x"0A"    -- '\n' (LF)
     -- );
 
-    signal tx_char_index : integer range 0 to 31;
+    signal tx_char_index : integer range 0 to 127;
     signal tx_cmd_index : integer range 0 to 31;
+    signal tx_wait_cnt : integer range 0 to 15;
     
     type del_line_ty is array (47 downto 0) of std_logic_vector(7 downto 0);
     signal gps_shift_reg : del_line_ty;
@@ -158,6 +160,8 @@ begin  -- architecture rtl
       tx_char_index <= 0;
       tx_cmd_index <= 0;
 
+      tx_wait_cnt <= 15;
+      
       gps_data_in <= (others => '0');
       gps_data_in_vld <= '0';
 
@@ -167,17 +171,11 @@ begin  -- architecture rtl
       
       case gps_tx_state is
         when Idle =>
-          gps_uart_15k_baud <= '0';          
+          gps_uart_15k_baud <= '0';
+          tx_wait_cnt <= 15;
           
-          -- if (tx_char_index < init_commands(tx_cmd_index).len ) then
-          --   gps_data_in <= char_to_slv(init_commands(tx_cmd_index).command((tx_char_index+1)));
-          --   gps_data_in_vld <= '1';
-          
-          --   gps_tx_state <= Tx0;
-          -- end if;          
-
           gps_tx_state <= Char_Incr;
-
+          --null;
           
         when Tx0 =>
           if (gps_tx_done = '1') then
@@ -195,6 +193,7 @@ begin  -- architecture rtl
             gps_tx_state <= Cmd_Incr;
             tx_cmd_index <= tx_cmd_index + 1;
             tx_char_index <= 0;
+            tx_wait_cnt <= 15;
 
             -- 1st command is to set the baud rate to 115.2kbps
             if (tx_cmd_index = 0) then
@@ -203,14 +202,19 @@ begin  -- architecture rtl
           end if;          
 
         when Cmd_Incr =>
-          if (tx_cmd_index < CMD_MAX) then
-            gps_tx_state <= Char_Incr;
-          else
-            gps_tx_state <= Done;
+          tx_wait_cnt <= (tx_wait_cnt - 1) mod 16;
+
+          if (tx_wait_cnt = 0) then
+            if (tx_cmd_index < CMD_MAX) then
+              gps_tx_state <= Char_Incr;
+            else
+              gps_tx_state <= Done;
+            end if;
           end if;
 
         when Done =>
-          null;
+          tx_cmd_index <= 0;
+          tx_char_index <= 0;
           
         when others =>
           gps_data_in <= (others => '0');
@@ -248,6 +252,7 @@ begin  -- architecture rtl
           reset_n      => sys_reset,
           rxd          => rxd,
           enable => gps_uart_15k_baud,
+          --enable => '1',          
           clk_div => gps_rx_clk_div,
           data_out     => gps_data_out,
           data_out_vld => gps_data_out_vld);
@@ -286,7 +291,7 @@ begin  -- architecture rtl
             -- Wait for 'G'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"47") then -- 'G'
+              if (gps_data_out = X"47" or gps_data_out = X"52") then -- 'G' | 'R'
                 xtract_time_state <= Pre3;
               end if;
             end if;
@@ -294,7 +299,7 @@ begin  -- architecture rtl
             -- Wait for 'G'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"47") then -- 'G'
+              if (gps_data_out = X"47" or gps_data_out = X"4D") then -- 'G' | 'M'
                 xtract_time_state <= Pre4;
               end if;
             end if;
@@ -302,7 +307,7 @@ begin  -- architecture rtl
             -- Wait for 'A'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"41") then -- 'A'
+              if (gps_data_out = X"41" or gps_data_out = X"43") then -- 'A' | 'C'
                 xtract_time_state <= Pre5;
               end if;
             end if;
