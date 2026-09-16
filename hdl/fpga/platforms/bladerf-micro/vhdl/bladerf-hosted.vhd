@@ -56,7 +56,7 @@ architecture hosted_bladerf of bladerf is
 
     signal gps_uart_rxd : std_logic;
     signal gps_uart_txd : std_logic;    
-    signal gps_rx_timestamp : std_logic_vector(47 downto 0);
+    signal gps_rx_timestamp : std_logic_vector(63 downto 0);
     signal gps_rx_timestamp_vld : std_logic;
     signal gps_dummy_out : std_logic;
     
@@ -657,7 +657,8 @@ begin
             usb_speed              => usb_speed_rx,
             rx_mux_sel             => rx_mux_sel,
             rx_overflow_led        => rx_overflow_led,
-            rx_timestamp           => rx_timestamp,
+            --rx_timestamp           => rx_timestamp,
+            rx_timestamp           => unsigned(gps_rx_timestamp),            
 
             -- Triggering
             trigger_arm            => rx_trigger_ctl.arm,

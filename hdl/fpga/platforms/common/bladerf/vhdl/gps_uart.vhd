@@ -9,7 +9,7 @@ entity gps_uart is
     sys_reset   : in  std_logic;
     rxd       : in  std_logic;
     pps : in std_logic;
-    timestamp : out std_logic_vector(3*16-1 downto 0);
+    timestamp : out std_logic_vector(63 downto 0);
     timestamp_vld : out std_logic;
     txd       : out std_logic;
     dummy_out : out std_logic);
@@ -31,10 +31,7 @@ architecture rtl of gps_uart is
       return std_logic_vector(to_unsigned(character'pos(c), 8));
     end function;
 
-    
-    type pmtk_cmd_t is array (0 to CMD_LEN - 1) of std_logic_vector(7 downto 0);
-    --type pmtk_cmd_t is array (0 to CMD_MAX - 1) of string(1 to CMD_LEN);
-    
+        
     type cmd_table_rec is record
       command : string(1 to CMD_LEN);
       len     : integer range 0 to 63;
@@ -48,31 +45,6 @@ architecture rtl of gps_uart is
         1 => (command => "$PMTK314,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1*29" & C_CR & C_LF, len => 51), 
         2 => (command => "$PMTK255,1*2D" & C_CR & C_LF & (36 downto 1 => NUL), len => 15)
         );
-
-       
-    
-    -- constant PMTK251_115200 : pmtk_cmd_t := (
-    --     0  => x"24",   -- '$'
-    --     1  => x"50",   -- 'P'
-    --     2  => x"4D",   -- 'M'
-    --     3  => x"54",   -- 'T'
-    --     4  => x"4B",   -- 'K'
-    --     5  => x"32",   -- '2'
-    --     6  => x"35",   -- '5'
-    --     7  => x"31",   -- '1'
-    --     8  => x"2C",   -- ','
-    --     9  => x"31",   -- '1'
-    --     10 => x"31",   -- '1'
-    --     11 => x"35",   -- '5'
-    --     12 => x"32",   -- '2'
-    --     13 => x"30",   -- '0'
-    --     14 => x"30",   -- '0'
-    --     15 => x"2A",   -- '*'
-    --     16 => x"31",   -- '1'
-    --     17 => x"46",   -- 'F'
-    --     18 => x"0D",   -- '\r' (CR)
-    --     19 => x"0A"    -- '\n' (LF)
-    -- );
 
     signal tx_char_index : integer range 0 to 127;
     signal tx_cmd_index : integer range 0 to 31;
@@ -100,6 +72,13 @@ architecture rtl of gps_uart is
     signal gps_data_out_vld : std_logic;
     signal gps_uart_15k_baud : std_logic;
     signal gps_rx_clk_div : std_logic_vector(15 downto 0);
+
+    signal pps_counter : integer range 0 to 65535; -- Fix when expanding the
+                                             -- fractional accuracy
+
+    signal pip_pps : std_logic_vector(1 downto 0);
+    signal re_pps : std_logic;
+    signal rx_div_cntr : integer range 0 to 2047;
     
     signal en0, en1, en2 : std_logic;
     signal rx_time_to_pps, pps_to_rx_time, rx_time_to_rx_time : unsigned(31 downto 0);
@@ -288,18 +267,16 @@ begin  -- architecture rtl
               xtract_time_state <= Pre2;
             end if;
           when Pre2 =>
-            -- Wait for 'G'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"47" or gps_data_out = X"52") then -- 'G' | 'R'
+              if (gps_data_out = X"5A") then -- 'Z'
                 xtract_time_state <= Pre3;
               end if;
             end if;
           when Pre3 =>
-            -- Wait for 'G'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"47" or gps_data_out = X"4D") then -- 'G' | 'M'
+              if (gps_data_out = X"44") then -- 'D'
                 xtract_time_state <= Pre4;
               end if;
             end if;
@@ -307,7 +284,7 @@ begin  -- architecture rtl
             -- Wait for 'A'
             if (gps_data_out_vld = '1') then
               xtract_time_state <= Idle;
-              if (gps_data_out = X"41" or gps_data_out = X"43") then -- 'A' | 'C'
+              if (gps_data_out = X"41") then -- 'A'
                 xtract_time_state <= Pre5;
               end if;
             end if;
@@ -377,6 +354,48 @@ begin  -- architecture rtl
       end if;
     end process p_xtract_time;
 
+  p_time_out: process (sys_clock, sys_reset) is
+  begin  -- process p_time_out
+    if (sys_reset = '0') then           -- asynchronous reset (active low)
+      pps_counter <= 0;
+
+      pip_pps <= (others => '0');
+      re_pps <= '0';
+      
+      timestamp <= (others => '0');
+      timestamp_vld <= '0';
+    elsif (rising_edge(sys_clock)) then  -- rising clock edge
+      pip_pps <= pip_pps(0) & pps;
+
+      re_pps <= '0';
+      if (pip_pps = "01") then
+        re_pps <= '1';
+      end if;
+
+      if (re_pps = '1' or rx_div_cntr = 0) then
+        rx_div_cntr <= 1230;
+      else
+        rx_div_cntr <= (rx_div_cntr - 1) mod 2048;
+      end if;
+      
+      if (re_pps = '1') then
+        pps_counter <= 0;
+      else
+        if (rx_div_cntr = 0) then
+          pps_counter <= pps_counter + 1;          
+        end if;
+      end if;
+      
+      timestamp_vld <= '0';      
+      if (gps_rx_time_valid = '1') then
+        timestamp(63 downto 16) <= hour & minute & second;
+        timestamp_vld <= '1';
+      end if;
+      timestamp(15 downto 0) <= std_logic_vector(to_unsigned(pps_counter,16));
+      
+    end if;
+  end process p_time_out;
+  
     p_shift_line: process (sys_clock) is
     begin  -- process p_shift_line
       if (rising_edge(sys_clock)) then  -- rising clock edge
