@@ -825,6 +825,39 @@ int nios_rffe_fastlock_save(struct bladerf *dev, bool is_tx,
     return status;
 }
 
+int nios_rx_time_mark_write(struct bladerf *dev, bool value)
+{
+    int status;
+
+    status = nios_8x32_write(dev, NIOS_PKT_8x32_TARGET_RX_TIME_MARK, 0,
+                             value ? 1 : 0);
+
+#ifdef ENABLE_LIBBLADERF_NIOS_ACCESS_LOG_VERBOSE
+    if (status == 0) {
+        log_verbose("%s: Wrote %u\n", __FUNCTION__, value ? 1 : 0);
+    }
+#endif
+
+    return status;
+}
+
+int nios_rx_time_mark_read(struct bladerf *dev, bool *value)
+{
+    int status;
+    uint32_t data;
+
+    status = nios_8x32_read(dev, NIOS_PKT_8x32_TARGET_RX_TIME_MARK, 0, &data);
+    if (status == 0) {
+        *value = (data & 1) != 0;
+
+#ifdef ENABLE_LIBBLADERF_NIOS_ACCESS_LOG_VERBOSE
+        log_verbose("%s: Read %u\n", __FUNCTION__, data & 1);
+#endif
+    }
+
+    return status;
+}
+
 int nios_ad56x1_vctcxo_trim_dac_read(struct bladerf *dev, uint16_t *value)
 {
     int status;

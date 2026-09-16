@@ -650,6 +650,8 @@ BladeRF2-only parameters:
 
 `rssi`          Received signal strength indication
 
+`time_marker`   RX time marker bit echoed in RX metadata (FPGA v0.18.0+)
+
 `clock_ref`     ADF4002 chip status
 
 `refin_freq`    ADF4002 reference clock frequency
@@ -1078,6 +1080,10 @@ BladeRF2-only parameters:
 `clock_out`     Clock output selection
 
 `rssi`          Received signal strength indication
+
+`time_marker`   Sets (1) or clears (0) the RX time marker bit that the FPGA
+                latches at the head of every RX message and reports in the
+                metadata status word (FPGA v0.18.0+)
 
 `clock_ref`     Enables (1) or disables (0) the ADF4002 chip
 

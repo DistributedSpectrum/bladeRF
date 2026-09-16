@@ -51,7 +51,7 @@
  *
  *  https://github.com/Nuand/bladeRF/blob/master/doc/development/versioning.md
  */
-#define LIBBLADERF_API_VERSION (0x02070000)
+#define LIBBLADERF_API_VERSION (0x02080000)
 
 #ifdef __cplusplus
 extern "C" {
@@ -2491,6 +2491,19 @@ const char * CALL_CONV bladerf_format_to_string(bladerf_format format);
 #define BLADERF_META_FLAG_RX_HW_MINIEXP2 (1 << 17)
 
 /**
+ * This flag in bladerf_metadata.status mirrors the RX time marker the host
+ * last wrote with bladerf_set_rx_time_marker(), as the FPGA latched it at the
+ * head of the message. When a bladerf_sync_rx() call spans several messages
+ * the status word is the OR of all of them, so read one message per call to
+ * locate the first header carrying a new value.
+ *
+ * Requires FPGA v0.18.0 or later; earlier images always report it clear.
+ *
+ * @see bladerf_set_rx_time_marker()
+ */
+#define BLADERF_META_FLAG_RX_HW_TIME_MARK (1 << 4)
+
+/**
  * Sample metadata
  *
  * This structure is used in conjunction with the ::BLADERF_FORMAT_SC16_Q11_META
@@ -2707,6 +2720,14 @@ struct bladerf_rx_gain_tag {
  */
 #define BLADERF_RX_GAIN_TAG_CARRIED (1 << 2)
 
+/** The RX time marker (::BLADERF_META_FLAG_RX_HW_TIME_MARK) as the FPGA latched
+ *  it at the head of this entry's message. Because it is recorded per message
+ *  here, a bladerf_sync_rx() call of any size can still locate the exact
+ *  message whose header first carried a new marker value: its `timestamp` is
+ *  the ts_m of the exchange. Requires FPGA v0.18.0 or later; always clear
+ *  before that. */
+#define BLADERF_RX_GAIN_TAG_TIME_MARK (1 << 3)
+
 /**
  * @brief One message's gain profile, positioned within a receive.
  *
@@ -2765,7 +2786,8 @@ struct bladerf_rx_gain_tag_msg {
     /** RX1 full gain-table index at the message's first sample */
     uint8_t gain_index;
 
-    /** ::BLADERF_RX_GAIN_TAG_LOCKED and/or ::BLADERF_RX_GAIN_TAG_CARRIED */
+    /** Any of ::BLADERF_RX_GAIN_TAG_LOCKED, ::BLADERF_RX_GAIN_TAG_CARRIED and
+     *  ::BLADERF_RX_GAIN_TAG_TIME_MARK */
     uint8_t flags;
 
     /** Gain index at the end of each chunk of this message. The number of

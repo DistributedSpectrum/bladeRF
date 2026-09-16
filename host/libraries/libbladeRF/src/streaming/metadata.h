@@ -76,6 +76,33 @@
  * landing in the final clock cycle of a message appears as the next message's
  * base rather than this message's last delta.
  *
+ * The flags word at 0x0c is assembled by the FPGA's fifo_writer and then partly
+ * rewritten by the FX3 GPIF on its way out, so what the host actually sees is:
+ *
+ *      31:18  constant 1
+ *      17:16  mini_exp2, mini_exp1  (BLADERF_META_FLAG_RX_HW_MINIEXP2 / 1)
+ *      15:5   constant 0
+ *          4  RX time marker        (FPGA v0.18.0 and later; constant 0 before)
+ *        3:2  constant 0
+ *          1  not underrun
+ *          0  underrun              (BLADERF_META_FLAG_RX_HW_UNDERFLOW)
+ *
+ * The time marker is a single bit the host sets through the Nios
+ * (NIOS_PKT_8x32_TARGET_RX_TIME_MARK) and the FPGA latches at the head of every
+ * message. A host that reads its clock before and after that write, then finds
+ * the first header carrying the new value, has bounded that header's timestamp
+ * in its own time:
+ *
+ *      ts(T_before) <= header.timestamp <= ts(T_after) + samples_per_message
+ *
+ * The extra message on the right is the one already in flight when the write
+ * landed; it latched the old value at its head even though its later samples
+ * postdate the write. Repeating the exchange and fitting the pairs gives offset
+ * and drift between the host clock and the sample counter. Unlike the gain tag
+ * there is no ambiguity with older images: they emit 0 in bit 4, so a marker
+ * that never comes back is the "unsupported" signal in itself, and the
+ * capability bit only saves the caller from having to wait for it.
+ *
  * The term "buffer" is used to describe a block of of data received from or
  * sent to the device. The size of a "buffer" (in bytes) is always a multiple
  * of the size of a "message." Said another way, a buffer will always evenly

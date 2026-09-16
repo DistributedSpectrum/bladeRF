@@ -3310,6 +3310,50 @@ int bladerf_get_rx_gain_tags(struct bladerf *dev,
                               num_tags);
 }
 
+static int check_rx_time_mark_cap(struct bladerf *dev)
+{
+    struct bladerf2_board_data *board_data = dev->board_data;
+
+    if (!have_cap(board_data->capabilities, BLADERF_CAP_FPGA_RX_TIME_MARK)) {
+        log_debug("This FPGA version (%u.%u.%u) does not echo the RX time "
+                  "marker.\n",
+                  board_data->fpga_version.major,
+                  board_data->fpga_version.minor,
+                  board_data->fpga_version.patch);
+
+        return BLADERF_ERR_UNSUPPORTED;
+    }
+
+    return 0;
+}
+
+int bladerf_set_rx_time_marker(struct bladerf *dev, bool value)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_FPGA_LOADED);
+    CHECK_STATUS(check_rx_time_mark_cap(dev));
+
+    WITH_MUTEX(&dev->lock, {
+        CHECK_STATUS_LOCKED(dev->backend->rx_time_mark_write(dev, value));
+    });
+
+    return 0;
+}
+
+int bladerf_get_rx_time_marker(struct bladerf *dev, bool *value)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_FPGA_LOADED);
+    NULL_CHECK(value);
+    CHECK_STATUS(check_rx_time_mark_cap(dev));
+
+    WITH_MUTEX(&dev->lock, {
+        CHECK_STATUS_LOCKED(dev->backend->rx_time_mark_read(dev, value));
+    });
+
+    return 0;
+}
+
 int bladerf_get_rfic_rx_fir(struct bladerf *dev, bladerf_rfic_rxfir *rxfir)
 {
     CHECK_BOARD_IS_BLADERF2(dev);

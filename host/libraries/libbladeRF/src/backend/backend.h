@@ -218,6 +218,10 @@ struct backend_fns {
                               uint8_t rffe_profile,
                               uint16_t nios_profile);
 
+    /* RX time marker (Nios 8x32 target RX_TIME_MARK, FPGA >= v0.18.0) */
+    int (*rx_time_mark_write)(struct bladerf *dev, bool value);
+    int (*rx_time_mark_read)(struct bladerf *dev, bool *value);
+
     /* AD56X1 VCTCXO Trim DAC accessors */
     int (*ad56x1_vctcxo_trim_dac_write)(struct bladerf *dev, uint16_t value);
     int (*ad56x1_vctcxo_trim_dac_read)(struct bladerf *dev, uint16_t *value);

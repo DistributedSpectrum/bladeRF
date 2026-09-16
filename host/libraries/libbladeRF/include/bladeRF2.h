@@ -293,6 +293,62 @@ int CALL_CONV bladerf_get_rx_gain_tags(struct bladerf *dev,
                                        unsigned int *num_tags);
 
 /**
+ * Set the RX time marker.
+ *
+ * The marker is a single bit the FPGA latches at the head of every RX message
+ * and reports back in bladerf_metadata.status as
+ * ::BLADERF_META_FLAG_RX_HW_TIME_MARK. It exists so the host can bound where
+ * its own clock sits against the FPGA sample counter, which is free-running,
+ * resets whenever metadata streaming is re-enabled, and is otherwise only
+ * readable through bladerf_get_timestamp(), a coarse estimate by design.
+ *
+ * Read the host clock, write the opposite of the current value, read the host
+ * clock again, then receive one message at a time until the flag carries the
+ * new value. That header's timestamp satisfies
+ *
+ * @code
+ *     ts(T_before) <= header.timestamp <= ts(T_after) + samples_per_message
+ * @endcode
+ *
+ * where the extra message on the right is the one already in flight when the
+ * write landed: it latched the old value at its head even though its later
+ * samples postdate the write. Repeating the exchange and fitting the pairs
+ * yields the offset and drift between host time and the sample counter.
+ *
+ * @note  Requires FPGA v0.18.0 or later (::BLADERF_CAP_FPGA_RX_TIME_MARK);
+ *        ::BLADERF_ERR_UNSUPPORTED otherwise. Older images report the flag
+ *        permanently clear, so a marker that never comes back is itself the
+ *        "unsupported" signal.
+ *
+ * @note  The write is one Nios transaction and does not touch the rest of the
+ *        FPGA control register, so it is safe to call from a receive thread
+ *        while another thread reconfigures the device.
+ *
+ * @see   bladerf_get_rx_time_marker(), ::BLADERF_META_FLAG_RX_HW_TIME_MARK
+ *
+ * @param       dev     Device handle
+ * @param[in]   value   New marker value
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_set_rx_time_marker(struct bladerf *dev, bool value);
+
+/**
+ * Read back the RX time marker last written with bladerf_set_rx_time_marker().
+ *
+ * @note  Requires FPGA v0.18.0 or later (::BLADERF_CAP_FPGA_RX_TIME_MARK);
+ *        ::BLADERF_ERR_UNSUPPORTED otherwise.
+ *
+ * @param       dev     Device handle
+ * @param[out]  value   Current marker value
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_get_rx_time_marker(struct bladerf *dev, bool *value);
+
+/**
  * RFIC RX FIR filter choices
  */
 typedef enum {

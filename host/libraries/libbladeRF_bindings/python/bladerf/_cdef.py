@@ -682,6 +682,8 @@ header = """
   int bladerf_get_rx_gain_tags(struct bladerf *dev,
     struct bladerf_rx_gain_tag_msg *tags, unsigned int max_tags,
     unsigned int *num_tags);
+  int bladerf_set_rx_time_marker(struct bladerf *dev, bool value);
+  int bladerf_get_rx_time_marker(struct bladerf *dev, bool *value);
   typedef enum
   {
     BLADERF_RFIC_RXFIR_BYPASS = 0,
