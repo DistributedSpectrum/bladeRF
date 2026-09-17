@@ -17,8 +17,8 @@ entity gps_uart is
 end entity gps_uart;
 
 architecture rtl of gps_uart is
-    constant C_GSP_DIV_CNT : integer := 4340;
-    constant C_GPS_DIV_CNT_115k : integer := C_GSP_DIV_CNT / 12;
+    constant C_GSP_DIV_CNT : integer := 4340;  -- For 9.6 kbps
+    constant C_GPS_DIV_CNT_115k : integer := C_GSP_DIV_CNT / 12; -- For 115.2 kbps
 
     constant CMD_MAX : integer := 3;
     constant CMD_LEN : integer := 51;
@@ -395,6 +395,11 @@ begin  -- architecture rtl
       
     end if;
   end process p_time_out;
+
+
+  --
+  -- Debug
+  -- 
   
     p_shift_line: process (sys_clock) is
     begin  -- process p_shift_line
