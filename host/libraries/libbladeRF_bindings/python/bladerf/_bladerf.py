@@ -1141,6 +1141,24 @@ class BladeRF:
             return None
         return gain_db[0]
 
+    def rx_gain_tag_to_gain_db_at(self, ch, gain_index, frequency):
+        """rx_gain_tag_to_gain_db() at a stated frequency, not the current one.
+
+        Use this whenever "where is the LO now" is not the same question as
+        "where was the LO when these samples arrived" -- which is the case for
+        any sweep driven by schedule_retune(), since the FPGA runs ahead of the
+        reader. Pass the frequency whose scheduled timestamp bounds the samples
+        the index came from.
+
+        Returns None if the device rejects the index.
+        """
+        gain_db = ffi.new("float *")
+        ret = libbladeRF.bladerf_rx_gain_tag_to_gain_db_at(
+            self.dev[0], ch, gain_index, int(frequency), gain_db)
+        if ret < 0:
+            return None
+        return gain_db[0]
+
     def rx_gain_tags(self, max_tags=None):
         """Per-message RFIC gain profiles for the most recent sync_rx() call.
 

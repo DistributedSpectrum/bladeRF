@@ -679,6 +679,8 @@ header = """
   int bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out);
   int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev, bladerf_channel ch,
     uint8_t gain_index, float *gain_db);
+  int bladerf_rx_gain_tag_to_gain_db_at(struct bladerf *dev, bladerf_channel ch,
+    uint8_t gain_index, bladerf_frequency frequency, float *gain_db);
   int bladerf_get_rx_gain_tags(struct bladerf *dev,
     struct bladerf_rx_gain_tag_msg *tags, unsigned int max_tags,
     unsigned int *num_tags);

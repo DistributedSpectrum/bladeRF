@@ -203,13 +203,22 @@ int CALL_CONV bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out);
  *        the LO frequency, so it is not free to call per received buffer. The
  *        result only changes when the gain index or the tuned frequency does.
  *
+ * @note  **Reads the LO now, which is not always where the samples came from.**
+ *        Sweeps driven by bladerf_schedule_retune() run the FPGA ahead of the
+ *        reader, and a fast-lock recall performed by the FPGA leaves this
+ *        answer either stale (host tuning mode) or unavailable (FPGA tuning
+ *        mode, where the Nios invalidates it). Use
+ *        bladerf_rx_gain_tag_to_gain_db_at() there and pass the frequency the
+ *        schedule put in place.
+ *
  * @note  Requires FPGA v0.17.0 or later (::BLADERF_CAP_FPGA_RX_GAIN_TAG), the
  *        same gate as bladerf_get_rx_gain_tags(). An older image supplies no
  *        gain index, so anything reaching here came from elsewhere and would be
  *        converted into a plausible-looking figure; ::BLADERF_ERR_UNSUPPORTED
  *        is returned instead.
  *
- * @see   bladerf_load_gain_calibration(), bladerf_get_gain()
+ * @see   bladerf_rx_gain_tag_to_gain_db_at(), bladerf_load_gain_calibration(),
+ *        bladerf_get_gain()
  *
  * @param      dev         Device handle
  * @param[in]  ch          RX channel the index came from
@@ -223,6 +232,58 @@ int CALL_CONV bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
                                              bladerf_channel ch,
                                              uint8_t gain_index,
                                              float *gain_db);
+
+/**
+ * bladerf_rx_gain_tag_to_gain_db() at a stated frequency rather than the
+ * channel's current one.
+ *
+ * Every frequency-dependent term in the conversion -- the gain-table band, the
+ * front-end offset and the calibration point -- is a pure function of the LO
+ * the samples were captured at. The plain call reads that from the device,
+ * which answers "where is the LO now". Use this one whenever that is not the
+ * same question as "where was the LO when these samples arrived".
+ *
+ * It usually is the same. It is not when retunes are scheduled:
+ *
+ *  - bladerf_schedule_retune() with a future timestamp hands the hop to the
+ *    FPGA, and a sweep normally runs several hops ahead of the reader, so by
+ *    the time a buffer is processed the LO has already moved on. The
+ *    frequency that belongs to those samples is the one whose scheduled
+ *    timestamp bounds them, which only the caller knows.
+ *  - In ::BLADERF_TUNING_MODE_FPGA the Nios invalidates its frequency
+ *    knowledge on every fast-lock profile recall, so bladerf_get_frequency()
+ *    fails outright after a scheduled retune and the plain call fails with
+ *    it.
+ *  - In ::BLADERF_TUNING_MODE_HOST an FPGA-side recall never touches this
+ *    driver's bookkeeping, so bladerf_get_frequency() keeps reporting the
+ *    last frequency the *host* tuned. That is worse than an error: the
+ *    conversion succeeds against the wrong band and returns a plausible
+ *    figure.
+ *
+ * Neither is a bug in the gain tag itself. The FPGA takes the index straight
+ * off the RFIC's CTRL_OUT pins into the message header, which no tuning path
+ * touches; it is only the interpretation that needs to know where the radio
+ * was pointed.
+ *
+ * Also cheaper: no USB round trip to read the LO, which matters when
+ * converting per message rather than per tune.
+ *
+ * @param      dev         Device handle
+ * @param[in]  ch          RX channel the index came from
+ * @param[in]  gain_index  Full gain-table index
+ * @param[in]  frequency   LO frequency, in Hz, the samples were captured at
+ * @param[out] gain_db     Pointer for storing the gain, in dB
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ *
+ * @see bladerf_rx_gain_tag_to_gain_db(), bladerf_schedule_retune()
+ */
+API_EXPORT
+int CALL_CONV bladerf_rx_gain_tag_to_gain_db_at(struct bladerf *dev,
+                                                bladerf_channel ch,
+                                                uint8_t gain_index,
+                                                bladerf_frequency frequency,
+                                                float *gain_db);
 
 /**
  * Retrieve the per-message RFIC gain profiles for the most recent

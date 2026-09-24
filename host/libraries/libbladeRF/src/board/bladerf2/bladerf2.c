@@ -3201,10 +3201,11 @@ int bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out)
     return 0;
 }
 
-int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
-                                   bladerf_channel ch,
-                                   uint8_t gain_index,
-                                   float *gain_db)
+int bladerf_rx_gain_tag_to_gain_db_at(struct bladerf *dev,
+                                      bladerf_channel ch,
+                                      uint8_t gain_index,
+                                      bladerf_frequency frequency,
+                                      float *gain_db)
 {
     CHECK_BOARD_IS_BLADERF2(dev);
     CHECK_BOARD_STATE(STATE_INITIALIZED);
@@ -3230,14 +3231,12 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     }
 
     WITH_MUTEX(&dev->lock, {
-        bladerf_frequency frequency = 0;
         float offset;
         float total;
         bool ok;
         int rfic_gain;
 
-        CHECK_STATUS_LOCKED(dev->board->get_frequency(dev, ch, &frequency));
-        CHECK_STATUS_LOCKED(get_gain_offset(dev, ch, &offset));
+        CHECK_STATUS_LOCKED(get_gain_offset_at(dev, ch, frequency, &offset));
 
         rfic_gain = ad936x_gain_index_to_gain_db(gain_index, frequency, &ok);
         if (!ok) {
@@ -3286,6 +3285,22 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     });
 
     return 0;
+}
+
+int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
+                                   bladerf_channel ch,
+                                   uint8_t gain_index,
+                                   float *gain_db)
+{
+    bladerf_frequency frequency = 0;
+
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+
+    CHECK_STATUS(dev->board->get_frequency(dev, ch, &frequency));
+
+    return bladerf_rx_gain_tag_to_gain_db_at(dev, ch, gain_index, frequency,
+                                             gain_db);
 }
 
 int bladerf_get_rx_gain_tags(struct bladerf *dev,
