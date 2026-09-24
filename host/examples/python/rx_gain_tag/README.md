@@ -657,6 +657,7 @@ transfers independently of either.
 | `rx_hop_waterfall.py` | per-step IQ files plus a waterfall with one PSD row per packet; shows the retune lag directly |
 | `rx_psd_dbm.py` | one large contiguous read → per-packet gain from `rx_gain_tags()` → Welch PSD calibrated in dBm, with an RSSI band |
 | `rx_lte_rssi.py` | RSSI of LTE cells given as `CENTER:CHANNEL_BW`, each tuned to its own centre |
+| `rx_fast_sweep.py` | wideband sweep driven by *scheduled* quick tunes, so the FPGA hops on the sample clock and the host never waits for a retune. hackrf_sweep-compatible CSV in dBm. ~640 stops/s at 20 Msps |
 
 All need the in-repo bindings and a libbladeRF containing the tag support:
 
