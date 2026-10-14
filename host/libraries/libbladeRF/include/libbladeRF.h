@@ -51,7 +51,7 @@
  *
  *  https://github.com/Nuand/bladeRF/blob/master/doc/development/versioning.md
  */
-#define LIBBLADERF_API_VERSION (0x02070000)
+#define LIBBLADERF_API_VERSION (0x02070100)
 
 #ifdef __cplusplus
 extern "C" {
@@ -123,6 +123,19 @@ typedef enum {
 
 /** Length of device serial number string, including NUL-terminator */
 #define BLADERF_SERIAL_LENGTH 33
+
+/**
+ * Serial number recorded in a generic gain calibration table, one built to be
+ * shared across many boards rather than measured on a single one.
+ *
+ * A table carrying this serial (`Serial: default` on the first line of the CSV)
+ * loads on any device without a serial mismatch warning, and its binary form
+ * keeps this serial instead of being stamped with the converting device's.
+ * bladerf_load_gain_calibration() falls back to
+ * `default_rx_gain_cal.tbl` / `default_tx_gain_cal.tbl` when the table it was
+ * asked for is not found.
+ */
+#define BLADERF_GAIN_CAL_DEFAULT_SERIAL "default"
 
 /**
  * Information about a bladeRF attached to the system
@@ -4492,15 +4505,23 @@ struct bladerf_gain_cal_tbl {
  * optimized gain settings across its frequency range. The operation is
  * protected by mutex locks to maintain thread safety.
  *
+ * If the requested file, or the per-serial table when `cal_file_loc` is NULL,
+ * cannot be found, the generic table `default_rx_gain_cal.tbl` /
+ * `default_tx_gain_cal.tbl` is loaded in its place (see
+ * ::BLADERF_GAIN_CAL_DEFAULT_SERIAL), with a warning naming the table that was
+ * missing.
+ *
  * @param[in] dev          Pointer to the initialized bladeRF device.
  * @param[in] ch           The target channel (RX or TX) for gain calibration.
  * @param[in] cal_file_loc Path to the calibration file, either in CSV or binary
- * format. CSV files are converted to binary format during the process.
+ * format. CSV files are converted to binary format during the process. NULL
+ * looks up `<serial>_rx_gain_cal.tbl` / `<serial>_tx_gain_cal.tbl`.
  *
  * @return 0 on success, indicating that the calibration data was successfully
  * applied to the channel. Returns BLADERF_ERR_UNSUPPORTED if the device or
- * channel does not support gain calibration. Other BLADERF_ERR_* error codes
- * indicate specific failures, such as file access issues or conversion errors.
+ * channel does not support gain calibration, and BLADERF_ERR_NO_FILE if neither
+ * the requested table nor the default one is found. Other BLADERF_ERR_* error
+ * codes indicate specific failures, such as conversion errors.
  */
 API_EXPORT
 int CALL_CONV bladerf_load_gain_calibration(struct bladerf *dev,
