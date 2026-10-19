@@ -305,6 +305,17 @@ static int dummy_rffe_fastlock_save(struct bladerf *dev,
     return 0;
 }
 
+static int dummy_rx_time_mark_write(struct bladerf *dev, bool value)
+{
+    return 0;
+}
+
+static int dummy_rx_time_mark_read(struct bladerf *dev, bool *value)
+{
+    *value = false;
+    return 0;
+}
+
 static int dummy_ad56x1_vctcxo_trim_dac_write(struct bladerf *dev,
                                               uint16_t value)
 {
@@ -515,6 +526,8 @@ const struct backend_fns backend_fns_dummy = {
     FIELD_INIT(.rffe_control_read, dummy_rffe_control_read),
 
     FIELD_INIT(.rffe_fastlock_save, dummy_rffe_fastlock_save),
+    FIELD_INIT(.rx_time_mark_write, dummy_rx_time_mark_write),
+    FIELD_INIT(.rx_time_mark_read, dummy_rx_time_mark_read),
 
     FIELD_INIT(.ad56x1_vctcxo_trim_dac_write,
                dummy_ad56x1_vctcxo_trim_dac_write),

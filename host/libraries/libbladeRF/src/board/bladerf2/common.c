@@ -388,13 +388,15 @@ bool does_rffe_dir_have_enabled_ch(uint32_t reg, bladerf_direction dir)
     return false;
 }
 
-int get_gain_offset(struct bladerf *dev, bladerf_channel ch, float *offset)
+int get_gain_offset_at(struct bladerf *dev,
+                      bladerf_channel ch,
+                      bladerf_frequency frequency,
+                      float *offset)
 {
     CHECK_BOARD_STATE(STATE_INITIALIZED);
     NULL_CHECK(offset);
 
     struct bladerf_gain_range const *ranges = NULL;
-    bladerf_frequency frequency             = 0;
     size_t i, ranges_len;
 
     if (BLADERF_CHANNEL_IS_TX(ch)) {
@@ -404,8 +406,6 @@ int get_gain_offset(struct bladerf *dev, bladerf_channel ch, float *offset)
         ranges     = bladerf2_rx_gain_ranges;
         ranges_len = ARRAY_SIZE(bladerf2_rx_gain_ranges);
     }
-
-    CHECK_STATUS(dev->board->get_frequency(dev, ch, &frequency));
 
     for (i = 0; i < ranges_len; ++i) {
         struct bladerf_gain_range const *r = &(ranges[i]);
@@ -420,4 +420,15 @@ int get_gain_offset(struct bladerf *dev, bladerf_channel ch, float *offset)
     }
 
     return BLADERF_ERR_INVAL;
+}
+
+int get_gain_offset(struct bladerf *dev, bladerf_channel ch, float *offset)
+{
+    bladerf_frequency frequency = 0;
+
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+
+    CHECK_STATUS(dev->board->get_frequency(dev, ch, &frequency));
+
+    return get_gain_offset_at(dev, ch, frequency, offset);
 }

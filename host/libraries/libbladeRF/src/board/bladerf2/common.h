@@ -493,6 +493,20 @@ bool check_total_sample_rate(struct bladerf *dev);
 
 bool does_rffe_dir_have_enabled_ch(uint32_t reg, bladerf_direction dir);
 
+/**
+ * @brief      Front-end gain offset for a channel at a stated frequency
+ *
+ * Split out of get_gain_offset() so a caller that already knows which
+ * frequency a set of samples was captured at does not have to ask the device
+ * what the LO is doing now. Those are not the same thing once retunes are
+ * scheduled ahead of the reader: see bladerf_rx_gain_tag_to_gain_db_at().
+ */
+int get_gain_offset_at(struct bladerf *dev,
+                       bladerf_channel ch,
+                       bladerf_frequency frequency,
+                       float *offset);
+
+/** get_gain_offset_at() at the channel's current frequency. */
 int get_gain_offset(struct bladerf *dev, bladerf_channel ch, float *offset);
 
 #endif  // BLADERF2_COMMON_H_

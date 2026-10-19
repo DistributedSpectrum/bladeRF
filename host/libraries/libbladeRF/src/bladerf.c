@@ -2295,6 +2295,14 @@ int bladerf_set_oversample_register_config(struct bladerf *dev) {
 /* Calibration */
 /******************************************************************************/
 
+/* "<serial>_rx_gain_cal.tbl" or "<serial>_tx_gain_cal.tbl" */
+static void gain_cal_tbl_name(char *buf, size_t len, const char *serial,
+                              bladerf_channel ch)
+{
+    snprintf(buf, len, "%s_%s_gain_cal.tbl", serial,
+             BLADERF_CHANNEL_IS_TX(ch) ? "tx" : "rx");
+}
+
 int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char* cal_file_loc)
 {
     int status = 0;
@@ -2333,18 +2341,37 @@ int bladerf_load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const
         strcpy(filename, cal_file_loc);
     } else {
         log_debug("No calibration file specified, using serial number\n");
-        strcpy(filename, dev->ident.serial);
-        filename_len -= strlen(filename);
-
-        if (BLADERF_CHANNEL_IS_TX(ch))
-            strncat(filename, "_tx_gain_cal.tbl", filename_len);
-        else
-            strncat(filename, "_rx_gain_cal.tbl", filename_len);
+        gain_cal_tbl_name(filename, filename_len + 1, dev->ident.serial, ch);
     }
 
     full_path = file_find(filename);
     if (full_path == NULL) {
-        log_error("Failed to find gain calibration file: %s\n", filename);
+        /* A board that was never calibrated still runs better on the generic
+         * table than on none, so fall back to it rather than failing. */
+        char *dir_end = strrchr(filename, '/');
+#if BLADERF_OS_WINDOWS
+        if (strrchr(filename, '\\') > dir_end)
+            dir_end = strrchr(filename, '\\');
+#endif
+        log_warning("Gain calibration file not found: %s, "
+                    "falling back to the default table\n", filename);
+
+        /* Look next to the table that was asked for first, then in the
+         * usual search paths. */
+        if (dir_end != NULL) {
+            size_t dir_len = (size_t)(dir_end - filename) + 1;
+            gain_cal_tbl_name(dir_end + 1, filename_len + 1 - dir_len,
+                              BLADERF_GAIN_CAL_DEFAULT_SERIAL, ch);
+            full_path = file_find(filename);
+        }
+        if (full_path == NULL) {
+            gain_cal_tbl_name(filename, filename_len + 1,
+                              BLADERF_GAIN_CAL_DEFAULT_SERIAL, ch);
+            full_path = file_find(filename);
+        }
+    }
+    if (full_path == NULL) {
+        log_error("Failed to find default gain calibration file: %s\n", filename);
         status = BLADERF_ERR_NO_FILE;
         goto error;
     }

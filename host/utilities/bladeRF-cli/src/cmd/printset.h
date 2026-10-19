@@ -73,6 +73,8 @@ int print_clock_sel(struct cli_state *state, int argc, char **argv);
 int set_clock_sel(struct cli_state *state, int argc, char **argv);
 int print_biastee(struct cli_state *state, int argc, char **argv);
 int set_biastee(struct cli_state *state, int argc, char **argv);
+int print_time_marker(struct cli_state *state, int argc, char **argv);
+int set_time_marker(struct cli_state *state, int argc, char **argv);
 
 /* printset_xb.c */
 int print_xb_gpio(struct cli_state *state, int argc, char **argv);

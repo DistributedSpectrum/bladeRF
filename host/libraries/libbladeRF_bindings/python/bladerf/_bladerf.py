@@ -1141,6 +1141,24 @@ class BladeRF:
             return None
         return gain_db[0]
 
+    def rx_gain_tag_to_gain_db_at(self, ch, gain_index, frequency):
+        """rx_gain_tag_to_gain_db() at a stated frequency, not the current one.
+
+        Use this whenever "where is the LO now" is not the same question as
+        "where was the LO when these samples arrived" -- which is the case for
+        any sweep driven by schedule_retune(), since the FPGA runs ahead of the
+        reader. Pass the frequency whose scheduled timestamp bounds the samples
+        the index came from.
+
+        Returns None if the device rejects the index.
+        """
+        gain_db = ffi.new("float *")
+        ret = libbladeRF.bladerf_rx_gain_tag_to_gain_db_at(
+            self.dev[0], ch, gain_index, int(frequency), gain_db)
+        if ret < 0:
+            return None
+        return gain_db[0]
+
     def rx_gain_tags(self, max_tags=None):
         """Per-message RFIC gain profiles for the most recent sync_rx() call.
 
@@ -1182,8 +1200,31 @@ class BladeRF:
                     flags=t.flags,
                     chunk_gain_index=tuple(t.chunk_gain_index),
                     locked=bool(t.flags & RX_GAIN_TAG_LOCKED),
-                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED))
+                    carried=bool(t.flags & RX_GAIN_TAG_CARRIED),
+                    time_mark=bool(t.flags & RX_GAIN_TAG_TIME_MARK))
                 for t in tags]
+
+    def set_rx_time_marker(self, value):
+        """Set the RX time marker bit the FPGA echoes in meta.status as
+        META_FLAG_RX_HW_TIME_MARK, latched at the head of every RX message.
+
+        Read time.clock_gettime(CLOCK_REALTIME) before and after this call,
+        then sync_rx() one message at a time until the flag carries the new
+        value: that header's timestamp lies in
+        [ts(before), ts(after) + samples_per_message]. Needs FPGA v0.18.0 or
+        later; raises BladeRFError(UNSUPPORTED) otherwise.
+        """
+        _check_error(libbladeRF.bladerf_set_rx_time_marker(self.dev[0],
+                                                           bool(value)))
+
+    def get_rx_time_marker(self):
+        """Current RX time marker value, or None if the FPGA lacks it."""
+        value = ffi.new("bool *")
+        ret = libbladeRF.bladerf_get_rx_time_marker(self.dev[0], value)
+        if ret == -8:  # BLADERF_ERR_UNSUPPORTED
+            return None
+        _check_error(ret)
+        return bool(value[0])
 
     # Phase Detector/Frequency Synthesizer
 
@@ -1482,6 +1523,9 @@ RxGainTag = collections.namedtuple(
     "version flags gain_index gain_index_min gain_index_max chunks "
     "num_messages chunk_gain_index changed locked")
 
+# bladerf_metadata.status bit mirroring the RX time marker (FPGA >= v0.18.0).
+META_FLAG_RX_HW_TIME_MARK = 1 << 4
+
 RX_GAIN_TAG_VERSION_NONE = 0
 RX_GAIN_TAG_VERSION_1 = 1
 RX_GAIN_TAG_CHANGED = 1 << 0
@@ -1494,11 +1538,13 @@ RX_GAIN_TAG_LOCKED = 1 << 1
 # sync_rx() call, so its profile was carried over rather than read during the
 # call that produced the entry.
 RX_GAIN_TAG_CARRIED = 1 << 2
+# The RX time marker as latched at the head of this entry's message (FPGA >= v0.18.0).
+RX_GAIN_TAG_TIME_MARK = 1 << 3
 
 RxGainTagMsg = collections.namedtuple(
     "RxGainTagMsg",
     "timestamp sample_offset sample_count msg_sample_offset gain_index flags "
-    "chunk_gain_index locked carried")
+    "chunk_gain_index locked carried time_mark")
 
 
 def rx_gain_tag(meta):

@@ -3201,10 +3201,11 @@ int bladerf_get_rfic_ctrl_out(struct bladerf *dev, uint8_t *ctrl_out)
     return 0;
 }
 
-int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
-                                   bladerf_channel ch,
-                                   uint8_t gain_index,
-                                   float *gain_db)
+int bladerf_rx_gain_tag_to_gain_db_at(struct bladerf *dev,
+                                      bladerf_channel ch,
+                                      uint8_t gain_index,
+                                      bladerf_frequency frequency,
+                                      float *gain_db)
 {
     CHECK_BOARD_IS_BLADERF2(dev);
     CHECK_BOARD_STATE(STATE_INITIALIZED);
@@ -3230,14 +3231,12 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     }
 
     WITH_MUTEX(&dev->lock, {
-        bladerf_frequency frequency = 0;
         float offset;
         float total;
         bool ok;
         int rfic_gain;
 
-        CHECK_STATUS_LOCKED(dev->board->get_frequency(dev, ch, &frequency));
-        CHECK_STATUS_LOCKED(get_gain_offset(dev, ch, &offset));
+        CHECK_STATUS_LOCKED(get_gain_offset_at(dev, ch, frequency, &offset));
 
         rfic_gain = ad936x_gain_index_to_gain_db(gain_index, frequency, &ok);
         if (!ok) {
@@ -3288,6 +3287,22 @@ int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
     return 0;
 }
 
+int bladerf_rx_gain_tag_to_gain_db(struct bladerf *dev,
+                                   bladerf_channel ch,
+                                   uint8_t gain_index,
+                                   float *gain_db)
+{
+    bladerf_frequency frequency = 0;
+
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_INITIALIZED);
+
+    CHECK_STATUS(dev->board->get_frequency(dev, ch, &frequency));
+
+    return bladerf_rx_gain_tag_to_gain_db_at(dev, ch, gain_index, frequency,
+                                             gain_db);
+}
+
 int bladerf_get_rx_gain_tags(struct bladerf *dev,
                              struct bladerf_rx_gain_tag_msg *tags,
                              unsigned int max_tags,
@@ -3308,6 +3323,50 @@ int bladerf_get_rx_gain_tags(struct bladerf *dev,
      * not be made to wait behind an unrelated control transfer. */
     return sync_get_gain_tags(&board_data->sync[BLADERF_RX], tags, max_tags,
                               num_tags);
+}
+
+static int check_rx_time_mark_cap(struct bladerf *dev)
+{
+    struct bladerf2_board_data *board_data = dev->board_data;
+
+    if (!have_cap(board_data->capabilities, BLADERF_CAP_FPGA_RX_TIME_MARK)) {
+        log_debug("This FPGA version (%u.%u.%u) does not echo the RX time "
+                  "marker.\n",
+                  board_data->fpga_version.major,
+                  board_data->fpga_version.minor,
+                  board_data->fpga_version.patch);
+
+        return BLADERF_ERR_UNSUPPORTED;
+    }
+
+    return 0;
+}
+
+int bladerf_set_rx_time_marker(struct bladerf *dev, bool value)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_FPGA_LOADED);
+    CHECK_STATUS(check_rx_time_mark_cap(dev));
+
+    WITH_MUTEX(&dev->lock, {
+        CHECK_STATUS_LOCKED(dev->backend->rx_time_mark_write(dev, value));
+    });
+
+    return 0;
+}
+
+int bladerf_get_rx_time_marker(struct bladerf *dev, bool *value)
+{
+    CHECK_BOARD_IS_BLADERF2(dev);
+    CHECK_BOARD_STATE(STATE_FPGA_LOADED);
+    NULL_CHECK(value);
+    CHECK_STATUS(check_rx_time_mark_cap(dev));
+
+    WITH_MUTEX(&dev->lock, {
+        CHECK_STATUS_LOCKED(dev->backend->rx_time_mark_read(dev, value));
+    });
+
+    return 0;
 }
 
 int bladerf_get_rfic_rx_fir(struct bladerf *dev, bladerf_rfic_rxfir *rxfir)
