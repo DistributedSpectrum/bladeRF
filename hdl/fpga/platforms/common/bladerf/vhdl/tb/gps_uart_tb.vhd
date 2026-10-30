@@ -68,7 +68,7 @@ architecture behav of gps_uart_tb is
   signal sys_reset     : std_logic;
   signal rxd           : std_logic;
   signal pps           : std_logic;
-  signal timestamp     : std_logic_vector(3*16-1 downto 0);
+  signal timestamp     : std_logic_vector(63 downto 0);
   signal timestamp_vld : std_logic;
   signal txd           : std_logic;
   signal dummy_out     : std_logic;
