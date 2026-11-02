@@ -557,12 +557,14 @@ begin
 
     -- Expansion GPIO outputs
     generate_xb_gpio_out : for i in exp_gpio'range generate
-      gen_normal_gpio : if i /=0 and i /= 1 and i /= 2 generate
+      -- exclude the GPS pins from normal GPIO drive: 2 = PPS (in),
+      -- 12 = UART TX (out), 13 = UART RX (in)
+      gen_normal_gpio : if i /= 2 and i /= 12 and i /= 13 generate
         exp_gpio(i) <= nios_xb_gpio_out(i) when nios_xb_gpio_oe(i) = '1' else 'Z';
       end generate;
     end generate;
 
-    exp_gpio(1) <= gps_uart_txd;
+    exp_gpio(12) <= gps_uart_txd;
     
     tx_packet_ready <= '1';
 
@@ -1024,7 +1026,8 @@ begin
         );
 
     generate_sync_xb_gpio_in : for i in exp_gpio'range generate
-      gen_normal_gpio : if i /= 0 and i /= 1 generate
+      -- exclude the GPS UART pins (12 = TX out, 13 = RX in, read directly below)
+      gen_normal_gpio : if i /= 12 and i /= 13 generate
         U_sync_xb_gpio_in : entity work.synchronizer
           generic map (
             RESET_LEVEL         =>  '0'
@@ -1037,7 +1040,7 @@ begin
       end generate;
     end generate;
 
-    gps_uart_rxd <= exp_gpio(0);
+    gps_uart_rxd <= exp_gpio(13);
     
     U_sync_rx_enable : entity work.synchronizer
         generic map (
