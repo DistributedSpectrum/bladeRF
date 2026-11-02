@@ -722,7 +722,10 @@ begin
     gps_uart_1: entity work.gps_uart
       port map (
         sys_clock     => sys_clock,
-        sys_reset     => sys_reset,
+        -- top-level sys_reset is active-HIGH ('0' = normal operation), but
+        -- gps_uart (and its uart_rx/uart_tx) use active-LOW reset. Invert it,
+        -- otherwise the GPS UART is held in reset during normal RX streaming.
+        sys_reset     => not sys_reset,
         rxd           => gps_uart_rxd,
         pps           => exp_gpio(2),
         timestamp     => gps_rx_timestamp,
