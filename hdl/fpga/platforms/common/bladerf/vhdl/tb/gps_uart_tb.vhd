@@ -153,21 +153,17 @@ begin  -- architecture behav
     pps <= '0';
     wait for 100 us;
 
-    -- Send the ZDA sentence twice, with an idle gap between, as a real GPS does.
+    -- Send ONE ZDA sentence and require it to decode on the FIRST try.
     --
-    -- NOTE: the DUT's uart_rx loads its baud counter (div_cnt) at reset with the
-    -- SLOW-boot-baud half-bit value and never refreshes it while the RX sits idle
-    -- (disabled) during init. So when the RX switches on at the fast baud, the
-    -- FIRST received frame samples ~6 bit-times late and is lost/garbled; only
-    -- after that frame completes does div_cnt reload to the correct fast value.
-    -- This is the "intermittent startup behavior" to debug. The second sentence
-    -- below decodes correctly, which is what the self-check verifies.
-    for rep in 1 to 2 loop
-      report "Injecting ZDA sentence #" & integer'image(rep) & " at fast baud...";
-      for i in ZDA_MSG'range loop
-        uart_send_char(rxd, ZDA_MSG(i), C_BIT_FAST);
-      end loop;
-      wait for 2 ms;                    -- idle gap so the RX returns to Idle
+    -- This is the regression test for the uart_rx startup-desync fix: uart_rx now
+    -- keeps div_cnt primed at the current half-bit while Idle, so the first frame
+    -- after the RX switches on at the fast baud samples correctly. Before the fix,
+    -- the DUT loaded div_cnt with the slow-boot-baud value at reset and never
+    -- refreshed it while idle, so this first sentence was sampled ~6 bits late and
+    -- lost -- the test had to send the sentence twice to pass.
+    report "Injecting ZDA sentence at fast baud...";
+    for i in ZDA_MSG'range loop
+      uart_send_char(rxd, ZDA_MSG(i), C_BIT_FAST);
     end loop;
 
     -- Let the last bytes and the time-out stage settle.

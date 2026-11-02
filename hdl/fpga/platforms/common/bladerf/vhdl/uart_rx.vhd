@@ -87,6 +87,11 @@ begin  -- architecture rtl
 
         elsif (state /= Idle) then
           div_cnt <= (div_cnt - 1) mod C_MOD_MAX;
+        else
+          -- Idle: keep div_cnt primed at the current half-bit so the first frame
+          -- after the RX switches on (enable / baud change) samples correctly.
+          -- Fixes the startup desync that dropped the first received NMEA sentence.
+          div_cnt <= clk_div_start;
         end if;
       end if;
 
