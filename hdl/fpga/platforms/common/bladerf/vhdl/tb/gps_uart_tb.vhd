@@ -1,35 +1,16 @@
 -------------------------------------------------------------------------------
--- Title      : Testbench for design "gps_uart"
--- Project    :
--------------------------------------------------------------------------------
--- File       : gps_uart_tb.vhd
--- Author     : Elya  <elya@maxwell>
--- Company    :
--- Created    : 2026-09-14
--- Last update: 2026-10-30
--- Platform   :
--- Standard   : VHDL'93/02 (self-checking parts use VHDL-2008)
--------------------------------------------------------------------------------
--- Description: Drives a GPS NMEA ZDA sentence into the gps_uart RX line and a
---              PPS pulse, then checks that the time-extraction FSM produces the
---              expected timestamp.
+-- Testbench for gps_uart (UBX-NAV-TIMEUTC decoder)
 --
---              The DUT holds the RX disabled (gps_uart_15k_baud = '0') until it
---              has transmitted the first $PMTK251 init command at the slow boot
---              baud; the RX then switches on at the fast baud. Measured on this
---              design, that happens at ~21.706 ms, so the stimulus waits until
---              C_RX_ENABLE_TIME before injecting the sentence.
+-- Injects a binary UBX-NAV-TIMEUTC frame on the RX line at the DUT's fast baud
+-- and checks that the module:
+--   * validates the Fletcher checksum and the validUTC flag,
+--   * converts the UTC date/time to Unix epoch seconds in timestamp[63:32],
+--   * runs the PPS-disciplined fractional counter in timestamp[31:0],
+--   * pulses timestamp_vld only for a good, valid frame.
 --
---              Effective UART bit period = 2 * clk_div clocks (both uart_rx and
---              uart_tx divide the system clock by 2 via a toggled enable).
---              Fast mode: clk_div = C_GPS_DIV_CNT_115k = 4340/12 = 361, so the
---              bit period is 2*361 = 722 sys_clock cycles = 9025 ns (~110.8 kbaud).
--------------------------------------------------------------------------------
--- Revisions  :
--- Date        Version  Author  Description
--- 2026-09-14  1.0      elya    Created
--- 2026-10-30  1.1      brad    Fixed 48->64 bit timestamp; added NMEA ZDA + PPS
---                              stimulus and self-check.
+-- Negative tests: a validUTC=0 frame and a bad-checksum frame must NOT update.
+--
+-- Reference frame: 2026-11-02 17:42:30 UTC -> Unix epoch 1793641350 = 0x6AE8CB86.
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -39,76 +20,97 @@ use ieee.numeric_std.all;
 library std;
 use std.env.all;
 
--------------------------------------------------------------------------------
-
 entity gps_uart_tb is
-
 end entity gps_uart_tb;
-
--------------------------------------------------------------------------------
 
 architecture behav of gps_uart_tb is
 
-  -- component ports
+  -- DUT ports
   signal sys_clock     : std_logic := '0';
   signal sys_reset     : std_logic := '0';
-  signal rxd           : std_logic := '1';  -- UART idle is high
+  signal rxd           : std_logic := '1';   -- UART idle high
   signal pps           : std_logic := '0';
   signal timestamp     : std_logic_vector(63 downto 0);
   signal timestamp_vld : std_logic;
   signal txd           : std_logic;
   signal dummy_out     : std_logic;
 
-  -- clock / baud timing
-  constant C_CLK_HALF  : time := 6.25 ns;            -- 80 MHz system clock
-  constant C_BIT_FAST  : time := 9025 ns;            -- 2 * 361 * 12.5 ns
+  -- timing
+  constant C_CLK_HALF : time := 6.25 ns;   -- 80 MHz
+  constant C_BIT_FAST : time := 9025 ns;   -- 2 * 361 * 12.5 ns (~110.8 kbaud)
 
-  -- The DUT enables the RX (and switches to the fast baud) only after it has
-  -- clocked out the first init command. Measured at ~21.706 ms; wait past that.
+  -- RX only enables after the TX init sends the first command (~21.7 ms).
   constant C_RX_ENABLE_TIME : time := 22 ms;
 
-  -- Expected decoded time: ASCII "123519" packed as hour&minute&second.
-  constant C_EXP_TIME  : std_logic_vector(47 downto 0) := x"313233353139";
+  -- Expected decoded epoch for the reference frame.
+  constant C_EXP_EPOCH : std_logic_vector(31 downto 0) := x"6AE8CB86";
 
-  -- CR/LF
-  constant CR : character := character'val(13);
-  constant LF : character := character'val(10);
+  -- monitor state (one writer: p_mon)
+  signal vld_count     : integer := 0;
+  signal latched_epoch : std_logic_vector(31 downto 0) := (others => '0');
+  signal latched_frac  : std_logic_vector(31 downto 0) := (others => '0');
 
-  -- A representative ZDA sentence (checksum is not validated by this DUT).
-  -- Time field 123519 -> 12:35:19.
-  constant ZDA_MSG : string :=
-    "$GPZDA,123519.00,30,10,2026,00,00*6F" & CR & LF;
+  type byte_array is array (natural range <>) of std_logic_vector(7 downto 0);
 
-  -- latched flag: did we ever see timestamp_vld pulse?
-  signal saw_vld : std_logic := '0';
+  -- Good frame: NAV-TIMEUTC, 2026-11-02 17:42:30, valid=0x07 (validUTC set), CK=94 99
+  constant UBX_GOOD : byte_array := (
+    x"B5", x"62", x"01", x"21", x"14", x"00",             -- sync, class, id, len(20)
+    x"00", x"00", x"00", x"00",                           -- iTOW
+    x"00", x"00", x"00", x"00",                           -- tAcc
+    x"00", x"00", x"00", x"00",                           -- nano
+    x"EA", x"07",                                         -- year 2026 (LE)
+    x"0B",                                                -- month 11
+    x"02",                                                -- day 2
+    x"11",                                                -- hour 17
+    x"2A",                                                -- min 42
+    x"1E",                                                -- sec 30
+    x"07",                                                -- valid (validTOW|WKN|UTC)
+    x"94", x"99");                                        -- CK_A, CK_B
 
-  -- Send one byte, LSB first, 8N1, at the given bit period.
+  -- Same time but valid=0x03 (validUTC clear) -> must be rejected. CK=90 95
+  constant UBX_NOUTC : byte_array := (
+    x"B5", x"62", x"01", x"21", x"14", x"00",
+    x"00", x"00", x"00", x"00",
+    x"00", x"00", x"00", x"00",
+    x"00", x"00", x"00", x"00",
+    x"EA", x"07", x"0B", x"02", x"11", x"2A", x"1E",
+    x"03",                                                -- valid: no validUTC
+    x"90", x"95");                                        -- CK_A, CK_B
+
+  -- Good payload but corrupted CK_B -> must be rejected.
+  constant UBX_BADCK : byte_array := (
+    x"B5", x"62", x"01", x"21", x"14", x"00",
+    x"00", x"00", x"00", x"00",
+    x"00", x"00", x"00", x"00",
+    x"00", x"00", x"00", x"00",
+    x"EA", x"07", x"0B", x"02", x"11", x"2A", x"1E", x"07",
+    x"94", x"00");                                        -- bad CK_B
+
   procedure uart_send_byte(signal   line_out : out std_logic;
                            constant data     : in  std_logic_vector(7 downto 0);
                            constant bit_time : in  time) is
   begin
-    line_out <= '0';                    -- start bit
+    line_out <= '0';                    -- start
     wait for bit_time;
-    for i in 0 to 7 loop                -- data bits, LSB first
+    for i in 0 to 7 loop                -- data LSB first
       line_out <= data(i);
       wait for bit_time;
     end loop;
-    line_out <= '1';                    -- stop bit
+    line_out <= '1';                    -- stop
     wait for bit_time;
-  end procedure uart_send_byte;
+  end procedure;
 
-  procedure uart_send_char(signal   line_out : out std_logic;
-                           constant c        : in  character;
-                           constant bit_time : in  time) is
+  procedure send_frame(signal   line_out : out std_logic;
+                       constant frame    : in  byte_array;
+                       constant bit_time : in  time) is
   begin
-    uart_send_byte(line_out,
-                   std_logic_vector(to_unsigned(character'pos(c), 8)),
-                   bit_time);
-  end procedure uart_send_char;
+    for i in frame'range loop
+      uart_send_byte(line_out, frame(i), bit_time);
+    end loop;
+  end procedure;
 
-begin  -- architecture behav
+begin
 
-  -- component instantiation
   DUT: entity work.gps_uart
     port map (
       sys_clock     => sys_clock,
@@ -120,73 +122,78 @@ begin  -- architecture behav
       txd           => txd,
       dummy_out     => dummy_out);
 
-  -- clock generation
   sys_clock <= not sys_clock after C_CLK_HALF;
 
-  -- monitor: latch any timestamp_vld pulse
+  -- monitor: count valid pulses and latch the decoded epoch/fraction
   p_mon: process (sys_clock) is
   begin
     if rising_edge(sys_clock) then
       if timestamp_vld = '1' then
-        saw_vld <= '1';
-        report "timestamp_vld pulsed, timestamp = 0x" & to_hstring(timestamp);
+        vld_count     <= vld_count + 1;
+        latched_epoch <= timestamp(63 downto 32);
+        latched_frac  <= timestamp(31 downto 0);
+        report "timestamp_vld: epoch=0x" & to_hstring(timestamp(63 downto 32)) &
+               " frac=0x" & to_hstring(timestamp(31 downto 0));
       end if;
     end if;
-  end process p_mon;
+  end process;
 
-  -- stimulus
   p_tb: process is
-  begin  -- process p_tb
-    -- active-low reset
+    variable c : integer;
+  begin
     sys_reset <= '0';
-    rxd       <= '1';
-    pps       <= '0';
+    rxd <= '1';
+    pps <= '0';
     wait for 30 ns;
     sys_reset <= '1';
 
-    -- Wait for the DUT to enable its RX at the fast baud.
+    -- wait for the DUT to enable RX at the fast baud
     wait for C_RX_ENABLE_TIME;
 
-    -- Emit a PPS edge just before the sentence, to reset the fractional counter.
+    -- a PPS edge so the fractional counter is running
     pps <= '1';
     wait for 20 us;
     pps <= '0';
     wait for 100 us;
 
-    -- Send ONE ZDA sentence and require it to decode on the FIRST try.
-    --
-    -- This is the regression test for the uart_rx startup-desync fix: uart_rx now
-    -- keeps div_cnt primed at the current half-bit while Idle, so the first frame
-    -- after the RX switches on at the fast baud samples correctly. Before the fix,
-    -- the DUT loaded div_cnt with the slow-boot-baud value at reset and never
-    -- refreshed it while idle, so this first sentence was sampled ~6 bits late and
-    -- lost -- the test had to send the sentence twice to pass.
-    report "Injecting ZDA sentence at fast baud...";
-    for i in ZDA_MSG'range loop
-      uart_send_char(rxd, ZDA_MSG(i), C_BIT_FAST);
-    end loop;
+    -- 1) GOOD frame -> must decode
+    c := vld_count;
+    report "Injecting GOOD UBX-NAV-TIMEUTC frame...";
+    send_frame(rxd, UBX_GOOD, C_BIT_FAST);
+    wait for 300 us;
+    assert vld_count = c + 1
+      report "FAIL: good frame did not pulse timestamp_vld" severity error;
+    assert latched_epoch = C_EXP_EPOCH
+      report "FAIL: epoch 0x" & to_hstring(latched_epoch) &
+             " != expected 0x" & to_hstring(C_EXP_EPOCH) severity error;
+    assert timestamp(63 downto 32) = C_EXP_EPOCH
+      report "FAIL: live epoch not held after decode" severity error;
 
-    -- Let the last bytes and the time-out stage settle.
-    wait for 200 us;
+    -- 2) validUTC=0 frame -> must be ignored
+    c := vld_count;
+    report "Injecting validUTC=0 frame (expect ignored)...";
+    send_frame(rxd, UBX_NOUTC, C_BIT_FAST);
+    wait for 300 us;
+    assert vld_count = c
+      report "FAIL: validUTC=0 frame updated the timestamp" severity error;
 
-    -- Self-check.
-    assert saw_vld = '1'
-      report "FAIL: timestamp_vld never pulsed" severity error;
+    -- 3) bad-checksum frame -> must be ignored
+    c := vld_count;
+    report "Injecting bad-checksum frame (expect ignored)...";
+    send_frame(rxd, UBX_BADCK, C_BIT_FAST);
+    wait for 300 us;
+    assert vld_count = c
+      report "FAIL: bad-checksum frame updated the timestamp" severity error;
 
-    assert timestamp(63 downto 16) = C_EXP_TIME
-      report "FAIL: decoded time 0x" & to_hstring(timestamp(63 downto 16)) &
-             " != expected 0x" & to_hstring(C_EXP_TIME)
-      severity error;
-
-    if saw_vld = '1' and timestamp(63 downto 16) = C_EXP_TIME then
-      report "PASS: gps_uart decoded ZDA time correctly (0x" &
-             to_hstring(timestamp(63 downto 16)) & "), pps_counter=0x" &
-             to_hstring(timestamp(15 downto 0)) severity note;
+    if latched_epoch = C_EXP_EPOCH and vld_count = c then
+      report "PASS: UBX-NAV-TIMEUTC decoded to epoch 0x" & to_hstring(latched_epoch) &
+             " (frac 0x" & to_hstring(latched_frac) &
+             "); validUTC/checksum gating works." severity note;
     end if;
 
     report "Simulation finished." severity note;
     stop;
     wait;
-  end process p_tb;
+  end process;
 
 end architecture behav;
