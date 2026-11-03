@@ -5,7 +5,7 @@ UART + PPS and stamps every RX DMA block's metadata with an NTP-style UTC timest
 
 ```
 timestamp[63:32] = Unix epoch seconds (UTC)
-timestamp[31:0]  = sub-second fraction = sys_clock (80 MHz) ticks since the last PPS edge
+timestamp[31:0]  = sub-second fraction = number of RX SAMPLES since the last PPS edge
 ```
 
 It decodes the **binary UBX-NAV-TIMEUTC** message (class 0x01, id 0x21), verifying the
@@ -20,13 +20,17 @@ Fletcher checksum and the message's `validUTC` flag, and disciplines the seconds
 | UART RX (bladeRF ← GPS TX) | `exp_gpio[0]` | J8 | **56** |
 | UART TX (bladeRF → GPS RX) | `exp_gpio[1]` | J7 | **54** |
 | PPS     (bladeRF ← GPS)    | `exp_gpio[2]` | H9 | **50** |
-| GND                        | —         | —  | 59 / 60 |
+| GND                        | —         | —  | **52** (next to PPS); also 15/16, 21/22, 27/28, 33/34, 39/40, 45/46, 51/52, 59/60 |
 
 - **Baud: 110803.** The `uart_rx` bit period is `2 * C_GPS_DIV_CNT_115k = 2 * 361 = 722`
   `sys_clock` cycles; at 80 MHz that is 9.025 µs → **110803 baud**. The GPS UART must be set
   to this exact rate (see below) so there is no baud error.
 - Do **not** connect the GPS's 3.3 V output pins to the bladeRF. Avoid connector pins
   57/58 (+5 V) and pin 1 (XB_VCCIO).
+- GND pins (schematic U74, Samtec BSH-030-01-F-D-A): 15, 16, 21, 22, 27, 28, 33, 34, 39, 40,
+  45, 46, 51, 52, 59, 60 are all on the ground rail. Pin **52** is the pair directly below
+  PPS pin 50, so tie the GW16143 J2 pin 4 (timepulse GND) there; a PPS lead with no nearby
+  return floats and picks up UART edges.
 
 ---
 
@@ -67,7 +71,8 @@ Notes:
 | J5 pin 2 | UART_TX (GPS out) | 56 (bladeRF RX) |
 | J5 pin 3 | UART_RX (GPS in)  | 54 (bladeRF TX) |
 | J2 pin 2 | Timepulse / PPS   | 50 |
-| J2 or J5 pin 4 | GND         | 59 / 60 |
+| J2 pin 4 | Timepulse GND | **52** (adjacent to pin 50, keeps the PPS return short) |
+| J5 pin 4 | UART GND     | 59 / 60 (or 51/52) |
 
 (GW16143 J2 pin 3 "Interrupt" = F9P EXTINT, an input; not used by this design.)
 
@@ -78,9 +83,8 @@ Notes:
 ```
 ts    = metadata.timestamp;            // uint64, from SC16_Q11_META blocks
 epoch = ts >> 32;                       // Unix epoch seconds (UTC); 0 => GPS not locked yet
-frac  = ts & 0xffffffff;                // sys_clock ticks since PPS
-block_start_utc   = epoch + frac / 80e6;
-utc(sample n)     = block_start_utc + n / sample_rate;
+frac  = ts & 0xffffffff;                // RX samples since PPS (sample-exact)
+utc(sample n)     = epoch + (frac + n) / sample_rate;   // n = index within the block
 ```
 
 Correlate `block_start_utc` with the gpsd position/time fix read over the F9P's USB
@@ -91,23 +95,33 @@ treat such blocks as untimed.
 
 ---
 
+## Sample-exact timestamp in the rx_clock domain (`rx_sample_ts`)
+
+The timestamp that reaches the metadata is owned by the **rx_clock** domain (`../vhdl/rx_sample_ts.vhd`):
+the fraction is a count of RX sample strobes since the PPS, and the seconds advance in the **same rx cycle**
+in which that count restarts, so epoch and fraction can never disagree. `gps_uart` (sys_clock) still decodes
+UBX and qualifies the PPS; it hands over two single-bit toggles (accepted PPS edge, UBX epoch load) and the
+epoch/lock state as one coherent word through `ts_cdc`. The UBX load lands ~42 ms after the PPS, so it never
+collides with the per-second advance. Counting samples instead of snapshotting a sys_clock counter removes the
+clock-domain snapshot jitter (±~100 ns, ±7 ticks) that the earlier design carried: `fifo_writer` latches the
+timestamp at the first sample of each message, so each block is stamped exactly to the sample
+(25 ns at 40 MSps). The host needs only the sample rate to place every sample in UTC.
+
 ## Timestamp integrity across the clock domains (`ts_cdc`)
 
-The 64-bit timestamp is generated in the **`sys_clock`** domain (the fraction counter
-free-runs at 80 MHz) but latched by the RX block in the **`rx_clock`** (AD9361) domain at
-the start of each DMA block. Sampling a 64-bit word across asynchronous clocks without
-synchronization **tears**: when the latch instant coincides with the per-second update
-(PPS rollover — `epoch += 1` and `frac → 0` on the same cycle) some bits are captured
-before the update and some after, producing a garbage timestamp.
+The epoch and lock state are generated in the **`sys_clock`** domain (UBX decoder) but
+consumed in the **`rx_clock`** (AD9361) domain. Sampling a multi-bit word across asynchronous
+clocks without synchronization **tears**: when the capture instant coincides with an update
+some bits are captured before the update and some after, producing a garbage value.
 
 `ts_cdc` (`../vhdl/ts_cdc.vhd`) makes this crossing safe with a toggle/ack handshake: the
 source latches a snapshot into a holding register and flips a request toggle, and does not
 latch the next snapshot until the destination has acknowledged — so the held value is
-guaranteed stable while the destination captures it. `U_rx` therefore always latches a
-**coherent** 64-bit value. The refresh latency is one handshake round trip (a few cycles each
-way, well under a microsecond), far finer than a DMA block. It is instantiated in
-`bladerf-hosted.vhd` between `gps_uart.timestamp` (sys_clock) and `U_rx.rx_timestamp`
-(rx_clock).
+guaranteed stable while the destination captures it. In the current design `ts_cdc` carries the 34-bit
+{lock, sync toggle, epoch} word into `rx_sample_ts`; the final 64-bit timestamp is generated in rx_clock directly. The refresh latency is one handshake round trip (a few cycles each
+way, well under a microsecond), far finer than a DMA block. It is instantiated inside
+`rx_sample_ts`, which `bladerf-hosted.vhd` places between `gps_uart` (sys_clock) and
+`U_rx.rx_timestamp` (rx_clock).
 
 ## PPS qualification (glitch filter + refractory window)
 
@@ -142,11 +156,22 @@ Do **not** judge the timestamp through `bladerf_sync_rx()`: libbladeRF's sync la
 async stream API with `BLADERF_FORMAT_SC16_Q11_META` and parse the 128-bit header of each
 8192-byte message yourself (timestamp = bytes 4..11, little-endian, FX3 fw ≥ 2.5.0 on
 SuperSpeed). Check: epoch matches an NTP-synced clock, epoch only steps +1 at the PPS, and
-`frac` is monotonic between PPS edges (it advances exactly 40 ticks per sample at 2 Msps).
+`frac` is monotonic between PPS edges (it advances by exactly 2044 per message, one per sample).
 
 Verified on hardware 2026-11-03 (build `hostedxA4-2026-11-03_11.39.45`): epoch steps `+1`
 exactly once per second at the PPS, no spurious edges, `epoch == 0` never occurs, the first
 message of a capture is already timed, and the epoch matches an NTP-synced host to the second.
+
+**Measured oscillator (2026-11-03, 10 min at 40 MSps, sys_clock-tick build):** PPS-to-PPS interval
+mean 79 999 982.7 ticks = VCTCXO **−0.216 ppm**, per-second sd 0.04 ppm, warm-up trend +0.05 ppm/10 min;
+a free-running counter would drift −129 µs in 10 min, the PPS-disciplined one is bounded to one second's
+worth (0.33 µs worst). Host software may rescale `frac` by the measured PPS interval for ~40 ns residual.
+
+**Sample-counting build verified (2026-11-03, `hostedxA4-2026-11-03_12.21.03`, 60 s at 40 MSps,
+timepulse GND on pin 52):** PPS-to-PPS interval mean 39 999 991.4 samples (−0.215 ppm, the same
+VCTCXO offset as above), per-second **sd 1.2 samples (30 ns)**, min/max 39 999 988 / 39 999 993;
+every message exactly 2044 samples after the previous one; epoch − host = 0 for every second;
+0 epoch anomalies. The ±7-tick snapshot jitter of the tick build is gone.
 
 **Known startup artifact:** the first ~3 messages (~3 ms) of the *first* stream after an FPGA
 load carry garbage headers (epoch ≈ 4.28e9, i.e. year 2105) — stale FX3/GPIF buffer contents

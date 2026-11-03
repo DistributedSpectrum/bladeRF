@@ -39,6 +39,11 @@ entity gps_uart is
     pps : in std_logic;
     timestamp : out std_logic_vector(63 downto 0);
     timestamp_vld : out std_logic;
+    -- for rx_sample_ts (sample-exact timestamp in the rx_clock domain)
+    epoch_sec_o   : out std_logic_vector(31 downto 0);
+    utc_locked_o  : out std_logic;
+    sync_tgl      : out std_logic;   -- toggles when epoch_sec is (re)loaded from UBX
+    pps_tgl       : out std_logic;   -- toggles on each accepted PPS edge
     txd       : out std_logic;
     dummy_out : out std_logic);
 
@@ -155,6 +160,8 @@ architecture rtl of gps_uart is
     signal frac_counter : unsigned(31 downto 0);   -- sys_clock ticks since PPS
     signal epoch_sec    : unsigned(31 downto 0);    -- disciplined UTC seconds
     signal utc_locked   : std_logic;
+    signal sync_tgl_r   : std_logic;
+    signal pps_tgl_r    : std_logic;
 
 begin  -- architecture rtl
 
@@ -460,6 +467,8 @@ begin  -- architecture rtl
       frac_counter <= (others => '0');
       epoch_sec    <= (others => '0');
       utc_locked   <= '0';
+      sync_tgl_r   <= '0';
+      pps_tgl_r    <= '0';
       timestamp_vld <= '0';
     elsif (rising_edge(sys_clock)) then
       -- synchronize PPS (2 FF)
@@ -490,6 +499,7 @@ begin  -- architecture rtl
       if (pps_clean = '1' and pps_clean_d = '0' and pps_refr = 0) then
         re_pps   <= '1';
         pps_refr <= G_PPS_REFRACTORY;
+        pps_tgl_r <= not pps_tgl_r;
       end if;
 
       -- fractional seconds = sys_clock ticks since the PPS edge. Preload the
@@ -504,6 +514,7 @@ begin  -- architecture rtl
       if (epoch_calc_vld = '1') then
         epoch_sec  <= epoch_calc;
         utc_locked <= '1';
+        sync_tgl_r <= not sync_tgl_r;
       elsif (re_pps = '1' and utc_locked = '1') then
         epoch_sec <= epoch_sec + 1;
       end if;
@@ -516,6 +527,11 @@ begin  -- architecture rtl
   -- Concurrent output so timestamp tracks epoch_sec/frac_counter in lockstep with
   -- timestamp_vld (epoch_sec stays 0 until the first valid UBX => host sees "unlocked").
   timestamp <= std_logic_vector(epoch_sec) & std_logic_vector(frac_counter);
+
+  epoch_sec_o  <= std_logic_vector(epoch_sec);
+  utc_locked_o <= utc_locked;
+  sync_tgl     <= sync_tgl_r;
+  pps_tgl      <= pps_tgl_r;
 
 
   --

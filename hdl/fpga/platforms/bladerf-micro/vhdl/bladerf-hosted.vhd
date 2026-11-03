@@ -57,7 +57,11 @@ architecture hosted_bladerf of bladerf is
     signal gps_uart_rxd : std_logic;
     signal gps_uart_txd : std_logic;    
     signal gps_rx_timestamp : std_logic_vector(63 downto 0);
-    signal gps_rx_timestamp_sync : std_logic_vector(63 downto 0);
+    signal gps_rx_timestamp_sync : std_logic_vector(63 downto 0);   -- rx_clock domain, sample-exact
+    signal gps_epoch_sec   : std_logic_vector(31 downto 0);
+    signal gps_utc_locked  : std_logic;
+    signal gps_sync_tgl    : std_logic;
+    signal gps_pps_tgl     : std_logic;
     signal gps_reset_n : std_logic;   -- power-on-only reset for gps_uart (from PLL lock)
     signal gps_rx_timestamp_vld : std_logic;
     signal gps_dummy_out : std_logic;
@@ -660,8 +664,8 @@ begin
             rx_mux_sel             => rx_mux_sel,
             rx_overflow_led        => rx_overflow_led,
             --rx_timestamp           => rx_timestamp,
-            -- Tear-free CDC: sys_clock-domain GPS timestamp resynchronized into
-            -- the rx_clock domain before U_rx latches it (see ts_cdc.vhd).
+            -- Sample-exact GPS timestamp, generated in the rx_clock domain
+            -- (see rx_sample_ts.vhd); fifo_writer latches it per message.
             rx_timestamp           => unsigned(gps_rx_timestamp_sync),
 
             -- Triggering
@@ -748,21 +752,26 @@ begin
         pps           => exp_gpio(2),
         timestamp     => gps_rx_timestamp,
         timestamp_vld => gps_rx_timestamp_vld,
+        epoch_sec_o   => gps_epoch_sec,
+        utc_locked_o  => gps_utc_locked,
+        sync_tgl      => gps_sync_tgl,
+        pps_tgl       => gps_pps_tgl,
         txd           => gps_uart_txd,
         dummy_out     => gps_dummy_out);
 
-    -- Resynchronize the 64-bit GPS timestamp from gps_uart's sys_clock domain
-    -- into the rx_clock (AD9361) domain with a toggle/ack handshake so U_rx
-    -- always latches a coherent, non-torn value (fixes the ~7% garbage-
-    -- timestamp blocks caused by the previous raw multi-bit crossing).
-    gps_ts_cdc_1: entity work.ts_cdc
-      generic map (
-        WIDTH => 64)
+    -- Sample-exact timestamp owned by the rx_clock domain: seconds advance and
+    -- the sample count restarts in the same rx cycle at each PPS; the absolute
+    -- second is loaded from UBX ~42 ms later. See rx_sample_ts.vhd.
+    gps_rx_ts_1: entity work.rx_sample_ts
       port map (
-        src_clk  => sys_clock,
-        src_data => gps_rx_timestamp,
-        dst_clk  => rx_clock,
-        dst_data => gps_rx_timestamp_sync);
+        sys_clock  => sys_clock,
+        epoch_sec  => gps_epoch_sec,
+        utc_locked => gps_utc_locked,
+        sync_tgl   => gps_sync_tgl,
+        pps_tgl    => gps_pps_tgl,
+        rx_clock   => rx_clock,
+        sample_v   => adc_streams(0).data_v,
+        timestamp  => gps_rx_timestamp_sync);
 
     p_dummy: process (sys_clock) is
       variable temp0, temp1, temp2, temp3 : std_logic;

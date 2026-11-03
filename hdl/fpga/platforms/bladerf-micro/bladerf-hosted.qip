@@ -39,6 +39,7 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhd
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/uart_tx.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/gps_uart.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/ts_cdc.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/rx_sample_ts.vhd]]
 
 
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif_p.vhd]]

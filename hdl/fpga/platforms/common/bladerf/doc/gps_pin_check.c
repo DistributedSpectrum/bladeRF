@@ -43,7 +43,7 @@ static void *cb(struct bladerf *dev, struct bladerf_stream *st,
             if (ep < prev_epoch || (ep == prev_epoch && fr < prev_frac)) nonmono++;
             if (ep > prev_epoch + 1) nonmono++;
         }
-        if (fr > 84000000u) fracbad++;
+        if (fr > 64512000u) fracbad++;   /* fraction = samples since PPS; > 61.44 MSps*1.05 is impossible */
         if (ep == 0) nzero++;
         else if (d >= -2 && d <= 1) ngood++;
         else if (d > 1) { nhigh++; if (d > worst_high) worst_high = d; }
