@@ -57,6 +57,8 @@ architecture hosted_bladerf of bladerf is
     signal gps_uart_rxd : std_logic;
     signal gps_uart_txd : std_logic;    
     signal gps_rx_timestamp : std_logic_vector(63 downto 0);
+    signal gps_rx_timestamp_sync : std_logic_vector(63 downto 0);
+    signal gps_reset_n : std_logic;   -- power-on-only reset for gps_uart (from PLL lock)
     signal gps_rx_timestamp_vld : std_logic;
     signal gps_dummy_out : std_logic;
     
@@ -658,7 +660,9 @@ begin
             rx_mux_sel             => rx_mux_sel,
             rx_overflow_led        => rx_overflow_led,
             --rx_timestamp           => rx_timestamp,
-            rx_timestamp           => unsigned(gps_rx_timestamp),            
+            -- Tear-free CDC: sys_clock-domain GPS timestamp resynchronized into
+            -- the rx_clock domain before U_rx latches it (see ts_cdc.vhd).
+            rx_timestamp           => unsigned(gps_rx_timestamp_sync),
 
             -- Triggering
             trigger_arm            => rx_trigger_ctl.arm,
@@ -719,20 +723,47 @@ begin
 
     dbg_clock <= dbg_clk_cnt(4);
 
+    -- gps_uart gets a POWER-ON-ONLY reset derived from the sys_clock PLL lock,
+    -- NOT the FX3 stream reset (sys_reset = fx3_ctl(7)). libbladeRF pulses the
+    -- FX3 reset on every RX enable, which used to reset the GPS time and leave
+    -- the first ~1 s of every capture untimed (epoch 0) until the next UBX
+    -- resync. GPS time is independent of the sample stream, so it now persists
+    -- across stream enable/disable. (gps_uart and its uart cores are active-LOW.)
+    U_reset_sync_gps : entity work.reset_synchronizer
+      generic map (
+        INPUT_LEVEL  => '0',    -- PLL not locked => reset
+        OUTPUT_LEVEL => '0'     -- active-low out
+      )
+      port map (
+        clock => sys_clock,
+        async => sys_pll_locked,
+        sync  => gps_reset_n
+      );
+
     gps_uart_1: entity work.gps_uart
       port map (
         sys_clock     => sys_clock,
-        -- top-level sys_reset is active-HIGH ('0' = normal operation), but
-        -- gps_uart (and its uart_rx/uart_tx) use active-LOW reset. Invert it,
-        -- otherwise the GPS UART is held in reset during normal RX streaming.
-        sys_reset     => not sys_reset,
+        sys_reset     => gps_reset_n,
         rxd           => gps_uart_rxd,
         pps           => exp_gpio(2),
         timestamp     => gps_rx_timestamp,
         timestamp_vld => gps_rx_timestamp_vld,
         txd           => gps_uart_txd,
         dummy_out     => gps_dummy_out);
-    
+
+    -- Resynchronize the 64-bit GPS timestamp from gps_uart's sys_clock domain
+    -- into the rx_clock (AD9361) domain with a toggle/ack handshake so U_rx
+    -- always latches a coherent, non-torn value (fixes the ~7% garbage-
+    -- timestamp blocks caused by the previous raw multi-bit crossing).
+    gps_ts_cdc_1: entity work.ts_cdc
+      generic map (
+        WIDTH => 64)
+      port map (
+        src_clk  => sys_clock,
+        src_data => gps_rx_timestamp,
+        dst_clk  => rx_clock,
+        dst_data => gps_rx_timestamp_sync);
+
     p_dummy: process (sys_clock) is
       variable temp0, temp1, temp2, temp3 : std_logic;
     begin  -- process p_dummy

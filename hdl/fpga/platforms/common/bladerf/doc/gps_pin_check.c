@@ -1,7 +1,13 @@
 /* GPS UART pin self-check.
- * Streams the bladeRF RX metadata and reports whether the gps_uart timestamp is
- * decoding GPS UTC (=> UART RX pigtail on the right pin) and whether PPS is
- * resetting the sub-second fraction (=> PPS pigtail on the right pin).
+ * Reads the RAW 128-bit metadata headers of the RX stream (async API) and
+ * reports whether the gps_uart timestamp is decoding GPS UTC (=> UART RX
+ * pigtail on the right pin) and whether PPS is resetting the sub-second
+ * fraction (=> PPS pigtail on the right pin), plus timestamp integrity.
+ *
+ * Raw headers are used on purpose: libbladeRF's sync layer treats
+ * metadata.timestamp as a sample counter and does arithmetic on it, so values
+ * read through bladerf_sync_rx() can be mangled or zero-filled.
+ *
  * Assumes the gps_uart FPGA is already loaded (the .sh wrapper does that).
  */
 #include <stdio.h>
@@ -11,56 +17,77 @@
 #include <time.h>
 #include <libbladeRF.h>
 
+#define MSG_BYTES 8192u   /* FX3 fw >= 2.5.0 on SuperSpeed */
+#define HDR_BYTES 16u
+#define RUN_SECONDS 6
+
+static time_t t0;
+static unsigned long nmsg, nzero, ngood, nhigh, nonmono, fracbad, pps_steps;
+static long worst_high;
+static uint32_t first_epoch, last_epoch, prev_epoch, prev_frac;
+
+static void *cb(struct bladerf *dev, struct bladerf_stream *st,
+                struct bladerf_metadata *m, void *samples, size_t n, void *ud)
+{
+    (void)dev; (void)st; (void)m; (void)ud;
+    const uint8_t *b = samples;
+    size_t bytes = n * 4;
+    for (size_t off = 0; off + HDR_BYTES <= bytes; off += MSG_BYTES) {
+        uint64_t ts; memcpy(&ts, b + off + 4, 8);
+        uint32_t ep = (uint32_t)(ts >> 32), fr = (uint32_t)ts;
+        long d = (long)ep - (long)time(NULL);
+
+        if (nmsg == 0) first_epoch = ep;
+        else {
+            if (ep == prev_epoch + 1 && fr < prev_frac) pps_steps++;        /* clean PPS */
+            if (ep < prev_epoch || (ep == prev_epoch && fr < prev_frac)) nonmono++;
+            if (ep > prev_epoch + 1) nonmono++;
+        }
+        if (fr > 84000000u) fracbad++;
+        if (ep == 0) nzero++;
+        else if (d >= -2 && d <= 1) ngood++;
+        else if (d > 1) { nhigh++; if (d > worst_high) worst_high = d; }
+
+        last_epoch = ep; prev_epoch = ep; prev_frac = fr; nmsg++;
+    }
+    return (time(NULL) - t0 >= RUN_SECONDS) ? BLADERF_STREAM_SHUTDOWN : samples;
+}
+
 int main(void)
 {
-    struct bladerf *dev = NULL;
-    int st;
+    struct bladerf *dev = NULL; struct bladerf_stream *st; void **bufs; int s;
 
-    st = bladerf_open(&dev, NULL);
-    if (st) { fprintf(stderr, "open: %s\n", bladerf_strerror(st)); return 2; }
-
+    s = bladerf_open(&dev, NULL);
+    if (s) { fprintf(stderr, "open: %s\n", bladerf_strerror(s)); return 2; }
     bladerf_set_sample_rate(dev, BLADERF_CHANNEL_RX(0), 2000000u, NULL);
     bladerf_set_frequency(dev, BLADERF_CHANNEL_RX(0), 2400000000ULL);
 
-    st = bladerf_sync_config(dev, BLADERF_RX_X1, BLADERF_FORMAT_SC16_Q11_META,
-                             16, 8192, 8, 3500);
-    if (st) { fprintf(stderr, "sync_config: %s\n", bladerf_strerror(st)); return 2; }
-    st = bladerf_enable_module(dev, BLADERF_RX, true);
-    if (st) { fprintf(stderr, "enable: %s\n", bladerf_strerror(st)); return 2; }
+    const size_t spb = (MSG_BYTES / 4) * 16;
+    s = bladerf_init_stream(&st, dev, cb, &bufs, 16, BLADERF_FORMAT_SC16_Q11_META, spb, 8, NULL);
+    if (s) { fprintf(stderr, "init_stream: %s\n", bladerf_strerror(s)); return 2; }
+    s = bladerf_enable_module(dev, BLADERF_RX, true);
+    if (s) { fprintf(stderr, "enable: %s\n", bladerf_strerror(s)); return 2; }
 
-    const unsigned N = 65536;                 /* ~32.7 ms per block @ 2 Msps */
-    int16_t *buf = malloc((size_t)N * 2 * sizeof(int16_t));
-    uint32_t max_epoch = 0, last_frac = 0;
-    int pps_seen = 0, first = 1;
-    unsigned long nblk = 0;
-
-    printf("Streaming RX metadata for ~6 s ...\n");
-    time_t t0 = time(NULL);
-    while (time(NULL) - t0 < 6) {
-        struct bladerf_metadata meta;
-        memset(&meta, 0, sizeof(meta));
-        meta.flags = BLADERF_META_FLAG_RX_NOW;
-        st = bladerf_sync_rx(dev, buf, N, &meta, 2000);
-        if (st) { fprintf(stderr, "rx: %s\n", bladerf_strerror(st)); break; }
-
-        uint32_t epoch = (uint32_t)(meta.timestamp >> 32);
-        uint32_t frac  = (uint32_t)(meta.timestamp & 0xffffffffULL);
-        if (epoch > max_epoch) max_epoch = epoch;
-        if (!first && frac < last_frac) pps_seen = 1;   /* fraction dropped => PPS reset */
-        last_frac = frac;
-        first = 0;
-        nblk++;
-    }
+    printf("Reading raw RX metadata headers for ~%d s ...\n", RUN_SECONDS);
+    t0 = time(NULL);
+    s = bladerf_stream(st, BLADERF_RX_X1);
     bladerf_enable_module(dev, BLADERF_RX, false);
-    free(buf);
+    if (s) fprintf(stderr, "stream: %s\n", bladerf_strerror(s));
+
+    time_t hnow = time(NULL);
+    int uart_ok = (last_epoch != 0) && (labs((long)last_epoch - (long)hnow) <= 2);
+    int pps_ok  = pps_steps > 0;
 
     printf("\n==================== GPS UART pin check ====================\n");
-    printf("blocks read: %lu\n", nblk);
+    printf("messages read: %lu   (first message %s)\n", nmsg,
+           first_epoch ? "already timed" : "untimed (epoch 0)");
 
-    if (max_epoch) {
-        time_t t = (time_t)max_epoch; struct tm g; gmtime_r(&t, &g);
-        char s[64]; strftime(s, sizeof s, "%Y-%m-%d %H:%M:%S", &g);
-        printf("UART RX (pin 56): OK   -- decoded GPS UTC %s (epoch %u)\n", s, max_epoch);
+    if (last_epoch) {
+        time_t t = (time_t)last_epoch; struct tm g; gmtime_r(&t, &g);
+        char ss[64]; strftime(ss, sizeof ss, "%Y-%m-%d %H:%M:%S", &g);
+        struct tm h; gmtime_r(&hnow, &h); char hs[64]; strftime(hs, sizeof hs, "%H:%M:%S", &h);
+        printf("UART RX (pin 56): %s -- decoded GPS UTC %s (epoch %u); host now %s UTC\n",
+               uart_ok ? "OK  " : "FAIL", ss, last_epoch, hs);
     } else {
         printf("UART RX (pin 56): FAIL -- no UTC decoded (epoch stayed 0)\n");
         printf("   -> put the YELLOW pigtail (GW16143 J5 pin2, GPS TX) on bladeRF pin 56,\n");
@@ -68,13 +95,21 @@ int main(void)
     }
 
     printf("PPS      (pin 50): %s\n",
-           pps_seen ? "OK   -- 1 Hz reset of the fraction seen"
-                    : "FAIL -- no 1 Hz reset seen (put PPS on bladeRF pin 50; needs a GPS fix)");
+           pps_ok ? "OK   -- 1 Hz epoch step with fraction reset seen"
+                  : "FAIL -- no clean 1 Hz step seen (put PPS on bladeRF pin 50; needs a GPS fix)");
+
+    printf("Integrity: %lu/%lu msgs correct, %lu epoch==0, %lu high outliers (worst +%lds), "
+           "%lu non-monotonic, %lu frac>1.05s\n",
+           ngood, nmsg, nzero, nhigh, worst_high, nonmono, fracbad);
+    printf("   -> %s\n", (nonmono == 0 && fracbad == 0 && nhigh == 0)
+           ? "OK: timestamps clean (no tears, no spurious PPS edges)"
+           : "WARN: timestamp glitches present (spurious PPS edges or a torn crossing)");
 
     printf("(UART TX pin 54 is not functionally testable here -- the F9P is configured\n");
     printf(" over USB/ubxtool and ignores the bladeRF's TX.)\n");
     printf("===========================================================\n");
 
+    bladerf_deinit_stream(st);
     bladerf_close(dev);
-    return max_epoch ? 0 : 1;
+    return (uart_ok && pps_ok) ? 0 : 1;
 }

@@ -20,6 +20,18 @@ use ieee.numeric_std.all;
 
 entity gps_uart is
 
+  generic (
+    -- PPS qualification. The raw PPS pin picks up edge noise (on hardware,
+    -- UART RX activity ~42 ms after each PPS induced a burst of false edges
+    -- on the PPS input, bumping epoch_sec by up to +12 and zeroing the
+    -- fraction until the next UBX resync). A real PPS is 1 Hz, so:
+    --   G_PPS_FILTER_CYCLES : pps must be high this many consecutive
+    --                         sys_clock cycles before an edge counts
+    --   G_PPS_REFRACTORY    : after an accepted edge, ignore the input for
+    --                         this many cycles (0.9 s at 80 MHz)
+    G_PPS_FILTER_CYCLES : natural := 8;
+    G_PPS_REFRACTORY    : natural := 72_000_000);
+
   port (
     sys_clock       : in  std_logic;
     sys_reset   : in  std_logic;
@@ -132,6 +144,14 @@ architecture rtl of gps_uart is
     -----------------------------------------------------------------------------
     signal pip_pps      : std_logic_vector(1 downto 0);
     signal re_pps       : std_logic;
+    -- PPS qualifier (glitch filter + refractory window)
+    signal pps_hi_cnt   : integer range 0 to G_PPS_FILTER_CYCLES;
+    signal pps_clean    : std_logic;
+    signal pps_clean_d  : std_logic;
+    signal pps_refr     : integer range 0 to G_PPS_REFRACTORY;
+    -- cycles from the sampled PPS edge until frac_counter is (re)loaded:
+    -- 2 (sync) + G_PPS_FILTER_CYCLES + 1 (pps_clean) + 1 (re_pps) = G+4
+    constant C_PPS_LATENCY : natural := G_PPS_FILTER_CYCLES + 4;
     signal frac_counter : unsigned(31 downto 0);   -- sys_clock ticks since PPS
     signal epoch_sec    : unsigned(31 downto 0);    -- disciplined UTC seconds
     signal utc_locked   : std_logic;
@@ -433,21 +453,49 @@ begin  -- architecture rtl
     if (sys_reset = '0') then
       pip_pps <= (others => '0');
       re_pps  <= '0';
+      pps_hi_cnt  <= 0;
+      pps_clean   <= '0';
+      pps_clean_d <= '0';
+      pps_refr    <= 0;
       frac_counter <= (others => '0');
       epoch_sec    <= (others => '0');
       utc_locked   <= '0';
       timestamp_vld <= '0';
     elsif (rising_edge(sys_clock)) then
-      -- synchronize + rising-edge detect PPS
+      -- synchronize PPS (2 FF)
       pip_pps <= pip_pps(0) & pps;
-      re_pps  <= '0';
-      if (pip_pps = "01") then
-        re_pps <= '1';
+
+      -- glitch filter: pps_clean asserts only after G_PPS_FILTER_CYCLES
+      -- consecutive high samples
+      if (pip_pps(1) = '1') then
+        if (pps_hi_cnt < G_PPS_FILTER_CYCLES) then
+          pps_hi_cnt <= pps_hi_cnt + 1;
+        end if;
+      else
+        pps_hi_cnt <= 0;
+      end if;
+      if (pps_hi_cnt >= G_PPS_FILTER_CYCLES) then
+        pps_clean <= '1';
+      else
+        pps_clean <= '0';
+      end if;
+      pps_clean_d <= pps_clean;
+
+      -- refractory window: once an edge is accepted, ignore the input for
+      -- G_PPS_REFRACTORY cycles (a real PPS cannot recur sooner than 1 s)
+      if (pps_refr /= 0) then
+        pps_refr <= pps_refr - 1;
+      end if;
+      re_pps <= '0';
+      if (pps_clean = '1' and pps_clean_d = '0' and pps_refr = 0) then
+        re_pps   <= '1';
+        pps_refr <= G_PPS_REFRACTORY;
       end if;
 
-      -- fractional seconds = sys_clock ticks since the PPS edge
+      -- fractional seconds = sys_clock ticks since the PPS edge. Preload the
+      -- qualifier latency so frac still counts from the physical edge.
       if (re_pps = '1') then
-        frac_counter <= (others => '0');
+        frac_counter <= to_unsigned(C_PPS_LATENCY, 32);
       else
         frac_counter <= frac_counter + 1;
       end if;
