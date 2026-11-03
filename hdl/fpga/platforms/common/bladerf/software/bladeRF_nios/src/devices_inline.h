@@ -40,16 +40,28 @@ static inline uint32_t control_reg_read(void)
     return IORD_ALTERA_AVALON_PIO_DATA(CONTROL_BASE);
 }
 
+/* Bit 22 of the control register is the RX time marker, echoed by the FPGA
+ * into RX metadata flags bit 4 (see NIOS_PKT_8x32_TARGET_RX_TIME_MARK). The
+ * Nios owns it: control_reg_write() preserves it and the accessors below
+ * change it through the PIO's set/clear ports so no read-modify-write is
+ * involved on either side. */
+#define CONTROL_REG_RX_TIME_MARK_SHIFT  22
+#define CONTROL_REG_RX_TIME_MARK        (1u << CONTROL_REG_RX_TIME_MARK_SHIFT)
+
 static inline void control_reg_write(uint32_t value)
 {
     const size_t CFG_GPIO_CLOCK_SELECT = 18; // Refer to bladerf2_common.h
     const uint32_t CLK_SEL_MASK = (1 << CFG_GPIO_CLOCK_SELECT);
-    uint32_t current_clock_select, requested_clock_select;
+    uint32_t current, current_clock_select, requested_clock_select;
     bool delay_nios_response = false;
 
-    current_clock_select = control_reg_read() & CLK_SEL_MASK;
+    current = control_reg_read();
+    current_clock_select = current & CLK_SEL_MASK;
     requested_clock_select = value & CLK_SEL_MASK;
     delay_nios_response = current_clock_select != requested_clock_select;
+
+    value = (value & ~CONTROL_REG_RX_TIME_MARK) |
+            (current & CONTROL_REG_RX_TIME_MARK);
 
     IOWR_ALTERA_AVALON_PIO_DATA(CONTROL_BASE, value);
 
@@ -58,6 +70,20 @@ static inline void control_reg_write(uint32_t value)
     if (delay_nios_response) {
         DBG("__resp_delay__");
         usleep(5);
+    }
+}
+
+static inline uint32_t rx_time_mark_read(void)
+{
+    return (control_reg_read() & CONTROL_REG_RX_TIME_MARK) ? 1 : 0;
+}
+
+static inline void rx_time_mark_write(uint32_t value)
+{
+    if (value & 1) {
+        IOWR_ALTERA_AVALON_PIO_SET_BITS(CONTROL_BASE, CONTROL_REG_RX_TIME_MARK);
+    } else {
+        IOWR_ALTERA_AVALON_PIO_CLEAR_BITS(CONTROL_BASE, CONTROL_REG_RX_TIME_MARK);
     }
 }
 

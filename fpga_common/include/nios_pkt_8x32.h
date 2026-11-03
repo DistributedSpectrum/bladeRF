@@ -114,6 +114,24 @@
 #define NIOS_PKT_8x32_TARGET_USR1     0x80
 #define NIOS_PKT_8x32_TARGET_USR128   0xff
 
+/* RX time marker (FPGA >= v0.18.0, bladeRF 2.0 only). One bit the host sets
+ * and the FPGA echoes in bit 4 of the flags word of every RX metadata header,
+ * latched at the head of each message. Bracketing the write with host clock
+ * reads bounds where the FPGA sample counter sits in host time:
+ *
+ *     ts(T_before_write) <= ts(first header carrying the new value)
+ *                        <= ts(T_after_write) + samples_per_message
+ *
+ * Write: data bit 0 is the new marker value; addr is ignored.
+ * Read:  data bit 0 is the current marker value.
+ *
+ * Kept out of NIOS_PKT_8x32_TARGET_CONTROL on purpose. The marker physically
+ * lives in that register (bit 22), but libbladeRF read-modify-writes CONTROL
+ * from several code paths, so a host toggling a bit there from another thread
+ * could clobber meta_sync or the format bits. The Nios owns bit 22 instead:
+ * CONTROL writes leave it alone and this target flips it atomically. */
+#define NIOS_PKT_8x32_TARGET_RX_TIME_MARK  NIOS_PKT_8x32_TARGET_USR1
+
 /* Flag bits */
 #define NIOS_PKT_8x32_FLAG_WRITE      (1 << 0)
 #define NIOS_PKT_8x32_FLAG_SUCCESS    (1 << 1)

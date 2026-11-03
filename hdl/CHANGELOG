@@ -6,6 +6,35 @@ hosted on GitHub: https://github.com/nuand/bladeRF
 ================================================================================
 
 --------------------------------
+v0.18.0 (2026-09-03)
+--------------------------------
+
+Adds a host-settable time marker to the RX metadata header so the host can bound
+a sample timestamp in its own clock. bladeRF 2.0 (micro) only.
+
+ Features:
+ * hdl: RX time marker. Control register bit 22, owned by the Nios and set via
+   8x32 target RX_TIME_MARK (0x80), is latched at the head of every RX message
+   and echoed in bit 4 of the metadata flags word, which the FX3 GPIF now passes
+   through instead of zeroing. Writes to the CONTROL target leave bit 22 alone.
+ * hdl: rx_timestamp_tb checks the GPIF's flags-word rewrite and the marker echo.
+
+--------------------------------
+v0.17.0 (2026-08-18)
+--------------------------------
+
+Pairs each RX message with the gain the AD9361's AGC actually applied to it.
+bladeRF 2.0 (micro) only.
+
+ Features:
+ * hdl: The reserved word of the RX metadata header carries an RFIC gain
+   profile: 7-bit gain-table index at the first sample, AGC lock bit, and four
+   signed 6-bit per-chunk deltas. Headers are committed at the tail of the
+   message so the profile describes that message's own samples.
+ * hdl: AD9361 CTRL_OUT is moved from sys_clock into rx_clock as one atomic
+   byte (ctrl_out_xfer) before being tagged.
+
+--------------------------------
 v0.16.0 (2025-05-06)
 --------------------------------
 

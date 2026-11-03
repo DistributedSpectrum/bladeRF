@@ -435,6 +435,18 @@ int nios_legacy_rffe_fastlock_save(struct bladerf *dev, bool is_tx,
     return BLADERF_ERR_UNSUPPORTED;
 }
 
+int nios_legacy_rx_time_mark_write(struct bladerf *dev, bool value)
+{
+    log_debug("This operation is not supported by the legacy NIOS packet format\n");
+    return BLADERF_ERR_UNSUPPORTED;
+}
+
+int nios_legacy_rx_time_mark_read(struct bladerf *dev, bool *value)
+{
+    log_debug("This operation is not supported by the legacy NIOS packet format\n");
+    return BLADERF_ERR_UNSUPPORTED;
+}
+
 int nios_legacy_ad56x1_vctcxo_trim_dac_read(struct bladerf *dev, uint16_t *value)
 {
     log_debug("This operation is not supported by the legacy NIOS packet format\n");

@@ -5,6 +5,91 @@ For more detailed information, please see the git change log and issue tracker
 hosted on GitHub: https://github.com/Nuand/bladeRF
 ================================================================================
 
+v2.10.0 (2026-10-15)
+--------------------------------
+
+This version of libbladeRF is intended for use with:
+
+  FX3 Firmware v2.6.1
+  FPGA         v0.18.0
+
+New Features:
+ * bladeRF 2.0: Added BLADERF_GAIN_CAL_DEFAULT_SERIAL ("default"), the serial
+   a generic gain calibration table carries so one table can be shared across
+   many boards. A CSV whose first line is `Serial: default` converts to a .tbl
+   that keeps that serial instead of the converting device's, and loads on any
+   device without a serial mismatch warning
+
+Bug Fixes:
+ * bladerf_load_gain_calibration() no longer fails with BLADERF_ERR_NO_FILE
+   when the requested table, or the per-serial table when no path is given,
+   is missing. It falls back to default_rx_gain_cal.tbl /
+   default_tx_gain_cal.tbl, looking next to the requested file first and then
+   in the usual search paths. It fails only if neither is found
+
+Notes:
+ * The log now says which table was loaded: per-serial or default at INFO,
+   and a warning when the requested table was missing. A table recorded for a
+   different serial is still a warning, not an error
+
+v2.9.0 (2026-09-24)
+--------------------------------
+
+This version of libbladeRF is intended for use with:
+
+  FX3 Firmware v2.6.1
+  FPGA         v0.18.0
+
+New Features:
+ * bladeRF 2.0: Added bladerf_rx_gain_tag_to_gain_db_at(), which converts an
+   RFIC gain-table index at a frequency the caller states instead of the one
+   the device is tuned to now. Every frequency-dependent term in the
+   conversion -- gain-table band, front-end offset, calibration point --
+   belongs to the LO the samples were captured at, and that is not the
+   current LO once retunes are scheduled ahead of the reader
+ * Added the python binding rx_gain_tag_to_gain_db_at()
+
+Notes:
+ * This is what makes gain tags usable with scheduled quick tunes. Under
+   BLADERF_TUNING_MODE_FPGA the Nios invalidates its frequency knowledge on
+   every fast-lock profile recall, so bladerf_get_frequency() fails after a
+   scheduled retune and bladerf_rx_gain_tag_to_gain_db() failed with it.
+   Under BLADERF_TUNING_MODE_HOST an FPGA-side recall never touches the host
+   driver's bookkeeping, so the same call silently converted against the last
+   frequency the host tuned. Measured on an xA4 with a calibration table
+   loaded, gain index 40 converts to 28.50 dB at 100 MHz and 7.65 dB at
+   5800 MHz, so reading the wrong band is worth up to 20.9 dB of absolute
+   power error
+ * bladerf_rx_gain_tag_to_gain_db() is unchanged in behaviour and is now a
+   wrapper that reads the current frequency and defers to the new call.
+   Verified identical over 780 (frequency, index) pairs across all three
+   gain-table bands
+
+v2.8.0 (2026-09-03)
+--------------------------------
+
+This version of libbladeRF is intended for use with:
+
+  FX3 Firmware v2.6.1
+  FPGA         v0.18.0
+
+New Features:
+ * bladeRF 2.0: Added bladerf_set_rx_time_marker() and
+   bladerf_get_rx_time_marker(). The marker is a bit the FPGA latches at the
+   head of every RX message and reports in bladerf_metadata.status as
+   BLADERF_META_FLAG_RX_HW_TIME_MARK, so a host that brackets the write with
+   its own clock reads can bound a sample timestamp in host time and, by
+   repeating, measure offset and drift against the FPGA sample counter
+ * Added python bindings (set_rx_time_marker(), get_rx_time_marker(),
+   META_FLAG_RX_HW_TIME_MARK), bladeRF-cli "print/set time_marker", and
+   libbladeRF_test_rx_time_marker, which runs the exchange and reports the
+   measured bound
+ * bladeRF 2.0: FPGA v0.18.0 added to the compatibility table
+
+Notes:
+ * Both calls require FPGA v0.18.0 or later and return BLADERF_ERR_UNSUPPORTED
+   otherwise. Older images report the flag permanently clear
+
 v2.7.0 (2026-08-21)
 --------------------------------
 

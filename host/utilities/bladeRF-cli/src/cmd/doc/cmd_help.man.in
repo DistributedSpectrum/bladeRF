@@ -851,6 +851,11 @@ T}@T{
 Received signal strength indication
 T}
 T{
+\f[C]time_marker\f[]
+T}@T{
+RX time marker bit echoed in RX metadata (FPGA v0.18.0+)
+T}
+T{
 \f[C]clock_ref\f[]
 T}@T{
 ADF4002 chip status
@@ -1553,6 +1558,13 @@ T{
 \f[C]rssi\f[]
 T}@T{
 Received signal strength indication
+T}
+T{
+\f[C]time_marker\f[]
+T}@T{
+Sets (1) or clears (0) the RX time marker bit that the FPGA latches at the
+head of every RX message and reports in the metadata status word (FPGA
+v0.18.0+)
 T}
 T{
 \f[C]clock_ref\f[]

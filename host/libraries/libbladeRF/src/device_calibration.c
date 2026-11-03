@@ -183,7 +183,8 @@ int gain_cal_csv_to_bin(struct bladerf *dev, const char *csv_path, const char *b
     char current_dir[1000];
     char expected_header[1024];
     char device_serial[BLADERF_SERIAL_LENGTH];
-    char csv_serial[BLADERF_SERIAL_LENGTH];
+    char csv_serial[BLADERF_SERIAL_LENGTH] = "";
+    bool generic;
 
     uint64_t frequency;
     float power;
@@ -219,8 +220,9 @@ int gain_cal_csv_to_bin(struct bladerf *dev, const char *csv_path, const char *b
         goto error;
     }
 
-    sscanf(line, "Serial: %s", csv_serial);
-    if (strcmp(device_serial, csv_serial) != 0) {
+    sscanf(line, "Serial: %32s", csv_serial);
+    generic = strcmp(csv_serial, BLADERF_GAIN_CAL_DEFAULT_SERIAL) == 0;
+    if (!generic && strcmp(device_serial, csv_serial) != 0) {
         log_warning("Gain calibration file serial (%s) does not match device serial (%s)\n", csv_serial, device_serial);
     }
 
@@ -259,7 +261,11 @@ int gain_cal_csv_to_bin(struct bladerf *dev, const char *csv_path, const char *b
 
     image->version = GAIN_CAL_VERSION;
 
-    memcpy(&image->data[offset], device_serial, BLADERF_SERIAL_LENGTH);
+    /* A generic table keeps its serial through conversion. Stamping it with
+     * this device's serial would make the .tbl look per-serial, and every
+     * other board loading it would then warn about a mismatch. */
+    memcpy(&image->data[offset], generic ? csv_serial : device_serial,
+           BLADERF_SERIAL_LENGTH);
     offset += BLADERF_SERIAL_LENGTH;
 
     for (size_t i = 0; i < num_entries; i++) {
@@ -431,7 +437,13 @@ int load_gain_calibration(struct bladerf *dev, bladerf_channel ch, const char *b
     memcpy(file_serial, image->data, BLADERF_SERIAL_LENGTH);
     file_serial[BLADERF_SERIAL_LENGTH - 1] = '\0';
 
-    if (strcmp(device_serial, file_serial) != 0) {
+    if (strcmp(file_serial, BLADERF_GAIN_CAL_DEFAULT_SERIAL) == 0) {
+        log_info("Loading default gain calibration table for %s: %s\n",
+                 channel2str(ch), binary_path);
+    } else if (strcmp(device_serial, file_serial) == 0) {
+        log_info("Loading per-serial gain calibration table for %s: %s\n",
+                 channel2str(ch), binary_path);
+    } else {
         log_warning("Calibration file serial (%s) does not match device serial (%s)\n", file_serial, device_serial);
     }
 

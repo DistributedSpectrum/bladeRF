@@ -138,6 +138,9 @@ architecture arch of rx_timestamp_tb is
     signal meta_en_tx           :   std_logic := '0';
     signal meta_en_rx           :   std_logic := '0';
 
+    -- Driven by meta_verify, which also checks that it comes back in flags bit 4
+    signal time_marker_tb       :   std_logic := '0';
+
     signal rx_packet_control    :   packet_control_t := PACKET_CONTROL_DEFAULT;
     signal tx_packet_control    :   packet_control_t;
 
@@ -433,6 +436,9 @@ begin
             -- Mini expansion signals
             mini_exp               => "00",
 
+            -- Echoed into RX metadata flags bit 4
+            time_marker            => time_marker_tb,
+
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_pclk_pll,
             meta_fifo_raclr        => not fx3_control.rx_enable,
@@ -615,8 +621,10 @@ begin
 
     meta_verify: process
         type timestamp_arr is array (natural range <>) of unsigned(63 downto 0);
+        type flags_arr     is array (natural range <>) of std_logic_vector(31 downto 0);
         constant HEADER_LEN     : integer := 4;
         variable timestamp      : timestamp_arr(1 downto 0);
+        variable flags          : flags_arr(1 downto 0);
         variable delta          : unsigned(63 downto 0) := (others => '0');
         variable delta_expected : unsigned(63 downto 0);
         variable iteration      : natural               := 1;
@@ -640,9 +648,21 @@ begin
                 if (i = 2) then
                     timestamp(j)(63 downto 32) := unsigned(fx3_gpif.gpif_out);
                 end if;
+                if (i = 3) then
+                    flags(j) := fx3_gpif.gpif_out;
+                end if;
                 -- report "Header ["& integer'image(i) &"] "& to_hstring(fx3_gpif.gpif_out);
             end loop;
             report "Timestamp: " & integer'image(to_integer(timestamp(j)));
+
+            -- The GPIF rewrites the low half of the flags word on the way out:
+            -- 15:5 and 3:2 read as zero, 1:0 is the underrun pair, and only
+            -- bit 4 -- the time marker -- comes through from fifo_writer.
+            assert (flags(j)(31 downto 18) = "11111111111111" and
+                    flags(j)(15 downto 5)  = "00000000000" and
+                    flags(j)(3 downto 2)   = "00")
+                report "Unexpected flags word " & to_hstring(flags(j))
+                severity failure;
         end loop;
 
         delta := timestamp(1) - timestamp(0);
@@ -659,6 +679,23 @@ begin
                 severity failure;
         else
             report "rst timestamp ignored";
+        end if;
+
+        -- Time marker: toggled at the end of every third iteration and checked
+        -- two iterations later. The message in flight when it toggles already
+        -- latched the old value at its head and its header may still be queued
+        -- in the meta FIFO, so the iteration straight after is left unchecked.
+        if (iteration mod 3 = 2) then
+            for j in 0 to 1 loop
+                assert (flags(j)(4) = time_marker_tb)
+                    report lf&"Time marker not echoed in header "&integer'image(j)&lf&
+                           "flags " & to_hstring(flags(j)) &
+                           ", expected bit 4 = " & std_logic'image(time_marker_tb)
+                    severity failure;
+            end loop;
+            report "Time marker " & std_logic'image(time_marker_tb) & " echoed in flags bit 4";
+        elsif (iteration mod 3 = 0) then
+            time_marker_tb <= not time_marker_tb;
         end if;
     end process meta_verify;
 

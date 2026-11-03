@@ -137,6 +137,19 @@ void control_reg_write(uint32_t value)
     ASSERT(value == 0x80402057);
 }
 
+uint32_t rx_time_mark_read(void)
+{
+    uint32_t ret = 1;
+    DBG("%s: returning %u\n", __FUNCTION__, ret);
+    return ret;
+}
+
+void rx_time_mark_write(uint32_t value)
+{
+    DBG("%s: value=%u\n", __FUNCTION__, value);
+    ASSERT((value & ~1u) == 0);
+}
+
 uint16_t iqbal_get_gain(bladerf_module m)
 {
     uint16_t ret = 0xffff;

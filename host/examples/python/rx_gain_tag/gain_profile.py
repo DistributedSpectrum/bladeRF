@@ -177,12 +177,24 @@ def profile(tag, chunks=CHUNKS):
 class GainDb:
     """Memoised gain index -> dB.
 
-    bladerf_rx_gain_tag_to_gain_db() depends on the tuned LO through the gain
-    table band, the front-end offset and the calibration table, so a cache must be
-    keyed on (frequency, index) and not on the index alone. In
-    BLADERF_TUNING_MODE_FPGA each miss also costs a USB round trip to read the LO,
-    while a capture only ever contains a handful of distinct indices -- so caching
-    turns one call per chunk per packet into a few calls per frequency.
+    The conversion depends on the tuned LO through the gain table band, the
+    front-end offset and the calibration table, so a cache must be keyed on
+    (frequency, index) and not on the index alone.
+
+    It asks for that frequency explicitly, via
+    bladerf_rx_gain_tag_to_gain_db_at(). The plain call reads the LO from the
+    device, which answers "where is the radio pointed now" -- a different
+    question from "where was it pointed when these samples arrived" as soon as
+    retunes are scheduled, because the FPGA then runs several hops ahead of the
+    reader. Worse, an FPGA-side fast-lock recall leaves that read stale in host
+    tuning mode and failing outright in FPGA tuning mode, so the plain call
+    either converts against the wrong band or does not work at all. Measured on
+    an xA4 with a calibration table loaded, gain index 40 is 28.50 dB at
+    100 MHz and 7.65 dB at 5800 MHz.
+
+    Caching still matters: a capture only ever contains a handful of distinct
+    indices, so this turns one call per chunk per packet into a few per
+    frequency.
     """
 
     def __init__(self, dev, ch):
@@ -197,9 +209,13 @@ class GainDb:
         return self.__call__
 
     def __call__(self, index):
+        if self.freq is None:
+            raise RuntimeError("call at(frequency) first: the conversion is "
+                               "band dependent and this class will not guess "
+                               "which frequency the samples came from")
         key = (self.freq, index)
         if key not in self.cache:
-            g = self.dev.rx_gain_tag_to_gain_db(self.ch, index)
+            g = self.dev.rx_gain_tag_to_gain_db_at(self.ch, index, self.freq)
             if g is None:
                 raise RuntimeError(
                     f"gain index {index} is outside the RX gain table. Is RFIC "
