@@ -78,22 +78,78 @@ Notes:
 
 ---
 
-## Host-side decode of `bladerf_metadata.timestamp`
+## Host-side use (FPGA v0.19.0, libbladeRF 2.11.0)
+
+The RX metadata header is **24 bytes** in `SC16_Q11_META` / `SC8_Q7_META` on this image:
+the standard 16-byte header (reserved/gain tag, 64-bit timestamp, flags) followed by two
+extension dwords, with two fewer samples per message (2042 on SuperSpeed, 250 on Hi-Speed).
+libbladeRF 2.11.0 recognises the image (`BLADERF_CAP_FPGA_RX_META_V2`, FPGA >= 0.19.0) and
+sizes messages accordingly; older libbladeRF on this image would mistake the two extension
+dwords for samples.
+
+**The 64-bit timestamp is still the stock free-running sample counter.** Nothing about the
+sync layer, timed reads, overrun detection, or host software that times samples against NTP
+changes; with no GPS fitted, no fix, or no PPS, that path works exactly as before. GPS time is
+*additional*, in the extension dwords, sampled at the same instant as the counter:
+
+| offset | content |
+|---|---|
+| 0x10 | GPS word: bits 25:0 samples since the PPS (saturating), 26 UTC_VALID, 27 PPS_ALIVE, 28 FRAC_VALID, 29 UBX_FRESH, 30 GPS_LOCK, 31 GPS_PRESENT |
+| 0x14 | UTC epoch seconds (0 until UTC_VALID) |
 
 ```
-ts    = metadata.timestamp;            // uint64, from SC16_Q11_META blocks
-epoch = ts >> 32;                       // Unix epoch seconds (UTC); 0 => GPS not locked yet
-frac  = ts & 0xffffffff;                // RX samples since PPS (sample-exact)
-utc(sample n)     = epoch + (frac + n) / sample_rate;   // n = index within the block
+utc(payload sample n of a message) = gps_epoch + (gps_frac + n) / sample_rate
 ```
 
-Correlate `block_start_utc` with the gpsd position/time fix read over the F9P's USB
-interface (`/dev/ttyACM0`) to tag each IQ capture with the sensor's UTC time and location.
+Through the sync API, `bladerf_sync_rx()` overlays a `struct bladerf_rx_gps_time` on
+`bladerf_metadata.reserved` right after the gain tag (`version`, `flags`, `epoch`, `frac` of
+the first returned sample, and `pps_interval`), and sets these status flags:
 
-`epoch == 0` means the GPS has not yet delivered a valid UTC (no lock / `validUTC=0`);
-treat such blocks as untimed.
+| `bladerf_metadata.status` flag | meaning |
+|---|---|
+| `BLADERF_META_STATUS_GPS_PRESENT` | the image supplies GPS time (overlay valid) |
+| `BLADERF_META_STATUS_GPS_UTC_VALID` | the epoch has been loaded from a valid UBX-NAV-TIMEUTC at least once |
+| `BLADERF_META_STATUS_GPS_PPS_ALIVE` | a PPS edge was accepted within the last 1.5 s |
+| `BLADERF_META_STATUS_GPS_UBX_FRESH` | a valid UBX time message within the last 5 s (clear + PPS_ALIVE = holdover) |
+| `BLADERF_META_STATUS_GPS_FRAC_VALID` | a PPS edge has been seen since RX was enabled (see below) |
+| `BLADERF_META_STATUS_GPS_LOCK` | UTC_VALID and PPS_ALIVE and FRAC_VALID, for **every** message the call returned samples from |
 
----
+Per message, `bladerf_get_rx_gain_tags()` entries carry `gps_epoch`, `gps_frac`,
+`pps_interval` and `BLADERF_RX_GAIN_TAG_GPS_LOCK`.
+
+**Why FRAC_VALID exists:** the FPGA counts RX samples, and samples only flow while RX is enabled.
+After `bladerf_enable_module(RX, true)` the fraction is short by however long RX was off, until
+the next PPS re-anchors it; so the first second of every session is unlocked.
+
+**PPS interval:** the counter value at the PPS that began a second is `timestamp - gps_frac`,
+the same for every message of that second; from one second to the next it moves by exactly the
+number of samples in between. libbladeRF derives `pps_interval` that way (e.g. 39 999 990 at
+40 MSps) -- the sample rate as measured against GPS, for converting the fraction to seconds
+exactly. Raw-header readers can do the same.
+
+The async API still works for raw headers (bytes 4..11 = counter, 16..19 = GPS word, 20..23 =
+epoch); `gps_pin_check.c` and the scratch tools read them that way.
+
+**Async API ordering (libbladeRF 2.11.0 fix).** With `bladerf_init_stream()` /
+`bladerf_enable_module()` / `bladerf_stream()`, RX used to be enabled before any USB transfer
+was pending, and the FX3 then lost the first two dwords of the session: every message of the
+stream was framed two samples early relative to its header. With the 16-byte header that was
+an invisible constant timestamp offset; with the extension it showed up as the GPS entry
+sitting in the last two dwords of every message. `bladerf_stream()` now drops and re-raises
+the FX3's RX stream around the submission of its transfers (the sync path always primed its
+transfers first), so both APIs give the same, correctly framed messages.
+
+Verified on hardware 2026-11-03 at 40 and 61.44 MSps: async raw headers carry the GPS entry
+at offset 16 in every message; `drift_cap` (async) measures the PPS interval 39 999 989.7
+samples, sd 0.6, 0 anomalies; `libbladeRF_test_rx_gps_time` (sync, 40 MSps, 20 s) passes with
+0 overruns, 0 counter or GPS steps wrong, every message GPS_LOCK after the session's first PPS,
+and a timed read landing on the exact counter value. Correlate the epoch with
+the gpsd position/time fix read over the F9P's USB port (same receiver, same PPS).
+
+Gain tag: the reserved word still carries the RFIC gain profile (FPGA >= 0.17.0). Its chunks
+still span 511 dwords each; the extension entry is the first two dwords of chunk 0, so payload
+sample `s` (0-based) belongs to chunk `(s + 2) / 511`. The time marker (flags bit 4, FPGA
+>= 0.18.0) is unchanged.
 
 ## Sample-exact timestamp in the rx_clock domain (`rx_sample_ts`)
 
@@ -172,6 +228,19 @@ timepulse GND on pin 52):** PPS-to-PPS interval mean 39 999 991.4 samples (−0.
 VCTCXO offset as above), per-second **sd 1.2 samples (30 ns)**, min/max 39 999 988 / 39 999 993;
 every message exactly 2044 samples after the previous one; epoch − host = 0 for every second;
 0 epoch anomalies. The ±7-tick snapshot jitter of the tick build is gone.
+
+**10-minute runs at other rates (2026-11-03, same build):**
+
+| Rate | seconds | PPS interval mean | offset | sd | min / max | free-running 10 min | epoch = host |
+|------|---------|-------------------|--------|----|-----------|---------------------|--------------|
+| 61.44 MSps | 598 | 61 439 989.6 | −0.169 ppm | 1.5 samples (25 ns) | 61 439 980 / 61 439 992 | −101 µs | 598/598 |
+| 20.48 MSps | 598 | 20 479 995.1 | −0.238 ppm | 0.5 samples (23 ns) | 20 479 994 / 20 479 996 | −142 µs | 598/598 |
+
+Zero epoch anomalies, zero dropped USB buffers, every message exactly 2044 samples apart at both rates
+(61.44 MSps is the maximum USB 3 rate). The per-second scatter is ~25 ns rms at any rate, i.e. the GPS
+time-pulse jitter plus one sample of quantization. The mean offset differs slightly between rates because the
+AD9361 BBPLL rounds each requested rate with its fractional-N divider; it is constant per rate and can be
+calibrated out host-side if needed. Chart: https://claude.ai/artifact/CQQn9HWJjmpyL81tk39RKJ
 
 **Known startup artifact:** the first ~3 messages (~3 ms) of the *first* stream after an FPGA
 load carry garbage headers (epoch ≈ 4.28e9, i.e. year 2105) — stale FX3/GPIF buffer contents

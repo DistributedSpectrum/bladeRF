@@ -42,7 +42,10 @@ entity rx_timestamp_tb is
 
         ENABLE_CHANNEL_0            : std_logic := '1';
         ENABLE_CHANNEL_1            : std_logic := '0';
-        EIGHT_BIT_MODE_EN           : std_logic := '1'
+        EIGHT_BIT_MODE_EN           : std_logic := '1';
+
+        -- 24-byte RX metadata header (status entry ahead of the samples)
+        ENABLE_META_V2              : boolean   := true
     );
 end entity;
 
@@ -140,6 +143,9 @@ architecture arch of rx_timestamp_tb is
 
     -- Driven by meta_verify, which also checks that it comes back in flags bit 4
     signal time_marker_tb       :   std_logic := '0';
+
+    constant TS_STATUS_TB       :   std_logic_vector(31 downto 0) := x"0000010F";
+    constant TS_AUX_TB          :   std_logic_vector(31 downto 0) := x"02625A00";
 
     signal rx_packet_control    :   packet_control_t := PACKET_CONTROL_DEFAULT;
     signal tx_packet_control    :   packet_control_t;
@@ -395,7 +401,8 @@ begin
             -- Exercise the deferred (tail-of-message) metadata commit: the
             -- inter-header timestamp delta asserted below is what proves the
             -- message length is still exactly GPIF_BUF_SIZE - HEADER_LEN.
-            ENABLE_GAIN_TAG        => true
+            ENABLE_GAIN_TAG        => true,
+            ENABLE_META_V2         => ENABLE_META_V2
         )
         port map (
             rx_reset               => rx_reset,
@@ -438,6 +445,10 @@ begin
 
             -- Echoed into RX metadata flags bit 4
             time_marker            => time_marker_tb,
+
+            -- Header v2 status entry, checked at dwords 4 and 5 below
+            hdr_ext0               => TS_STATUS_TB,
+            hdr_ext1               => TS_AUX_TB,
 
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_pclk_pll,
@@ -628,6 +639,8 @@ begin
         variable delta          : unsigned(63 downto 0) := (others => '0');
         variable delta_expected : unsigned(63 downto 0);
         variable iteration      : natural               := 1;
+        variable v2_words       : flags_arr(1 downto 0);
+        variable status_samples : natural               := 0;
         -- variable timestamp  : unsigned(63 downto 0) := (others => '0');
     begin
         wait for 1 ns;
@@ -636,6 +649,16 @@ begin
 
         if (ENABLE_CHANNEL_0 and ENABLE_CHANNEL_1) then
             delta_expected := delta_expected/2;
+        end if;
+
+        -- Header v2: the status entry takes two of the message's dwords, so
+        -- that many samples fewer separate consecutive headers.
+        if (ENABLE_META_V2) then
+            status_samples := 2 when not EIGHT_BIT_MODE_EN else 4;
+            if (ENABLE_CHANNEL_0 and ENABLE_CHANNEL_1) then
+                status_samples := status_samples/2;
+            end if;
+            delta_expected := delta_expected - status_samples;
         end if;
 
         for j in 0 to 1 loop
@@ -653,6 +676,18 @@ begin
                 end if;
                 -- report "Header ["& integer'image(i) &"] "& to_hstring(fx3_gpif.gpif_out);
             end loop;
+            if (ENABLE_META_V2) then
+                -- dwords 4 and 5: the status entry fifo_writer put ahead of the samples
+                for i in 0 to 1 loop
+                    wait until rising_edge(fx3_pclk_pll);
+                    v2_words(i) := fx3_gpif.gpif_out;
+                end loop;
+                assert (v2_words(0) = TS_STATUS_TB and v2_words(1) = TS_AUX_TB)
+                    report lf&"Header v2 status entry wrong in message "&integer'image(j)&lf&
+                           "dword4 " & to_hstring(v2_words(0)) & " expected " & to_hstring(TS_STATUS_TB) & lf &
+                           "dword5 " & to_hstring(v2_words(1)) & " expected " & to_hstring(TS_AUX_TB)
+                    severity failure;
+            end if;
             report "Timestamp: " & integer'image(to_integer(timestamp(j)));
 
             -- The GPIF rewrites the low half of the flags word on the way out:

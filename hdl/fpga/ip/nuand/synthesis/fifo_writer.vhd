@@ -39,7 +39,18 @@ entity fifo_writer is
         -- that platforms without an AD9361 -- and images that do not wire up
         -- rfic_ctrl_out -- keep emitting the historical constant rather than
         -- advertising a gain index they do not have.
-        ENABLE_GAIN_TAG       : boolean := false
+        ENABLE_GAIN_TAG       : boolean := false;
+
+        -- Metadata header v2: write one 64-bit entry {hdr_ext1, hdr_ext0} into
+        -- the sample FIFO ahead of the first sample of every message, so the
+        -- host sees a 24-byte header (the 16-byte header plus two extension
+        -- dwords at 0x10 and 0x14, sampled in the same cycle as the timestamp)
+        -- followed by two fewer samples. The message stays 2044 dwords, the GPIF is
+        -- untouched, and the gain-tag chunks still span 511 dwords each (the
+        -- status entry occupies the first two dwords of chunk 0). Requires a
+        -- 64-bit sample FIFO so the entry is written in one cycle and the
+        -- packer's phase is unchanged; only used in metadata (non-packet) mode.
+        ENABLE_META_V2        : boolean := false
     );
     port (
         clock               :   in      std_logic;
@@ -70,6 +81,11 @@ entity fifo_writer is
         -- platforms that do not wire this up are unaffected.
         rfic_ctrl_out       :   in      std_logic_vector(7 downto 0) := (others => '0');
         rfic_ctrl_out_valid :   in      std_logic := '0';
+
+        -- Header v2 extension dwords (ENABLE_META_V2), already in this clock
+        -- domain. hdr_ext0 goes to header offset 0x10, hdr_ext1 to 0x14.
+        hdr_ext0            :   in      std_logic_vector(31 downto 0) := (others => '0');
+        hdr_ext1            :   in      std_logic_vector(31 downto 0) := (others => '0');
 
         in_sample_controls  :   in      sample_controls_t(0 to NUM_STREAMS-1) := (others => SAMPLE_CONTROL_DISABLE);
         in_samples          :   in      sample_streams_t(0 to NUM_STREAMS-1)  := (others => ZERO_SAMPLE);
@@ -242,6 +258,15 @@ architecture simple of fifo_writer is
     signal sync_mini_exp: std_logic_vector(1 downto 0);
 
     signal meta_fifo_used_v_r : unsigned(meta_fifo_usedw'length downto 0) := (others => '0');
+
+    -- Header v2: pulses in the cycle the first sample of a message is seen
+    -- (the same cycle the header content is pinned in META_WRITE). The FIFO
+    -- write of the status entry lands one cycle later, which is always ahead
+    -- of that sample's own write: the packer needs at least one more cycle
+    -- (MIMO) or one more sample (single channel) to complete an entry.
+    signal v2_inject   : std_logic := '0';
+    signal v2_inject_r : std_logic := '0';
+
     signal fifo_used_v_r      : unsigned(fifo_usedw'length downto 0) := (others => '0');
 
     -- Low 16 bits of the flags dword. The GPIF (fx3_gpif.vhd) rewrites these on
@@ -311,6 +336,46 @@ begin
             end if;
         end if;
     end process;
+
+    -- ------------------------------------------------------------------------
+    -- HEADER V2 STATUS ENTRY
+    -- ------------------------------------------------------------------------
+    gen_meta_v2 : if ENABLE_META_V2 generate
+        assert FIFO_DATA_WIDTH = 64
+            report "ENABLE_META_V2 requires a 64-bit sample FIFO entry"
+            severity failure;
+
+        -- Same condition that pins the header in META_WRITE: the first valid
+        -- sample of a message in metadata (non-packet) mode.
+        p_v2_inject : process( all )
+            variable v : std_logic;
+        begin
+            v := '0';
+            if( meta_current.state = META_WRITE and meta_fifo_full = '0' and
+                packet_en = '0' and meta_en = '1' ) then
+                for i in in_samples'range loop
+                    if( in_samples(i).data_v = '1' ) then
+                        v := '1';
+                    end if;
+                end loop;
+            end if;
+            v2_inject <= v;
+        end process;
+
+        p_v2_inject_r : process( clock, reset )
+        begin
+            if( reset = '1' ) then
+                v2_inject_r <= '0';
+            elsif( rising_edge(clock) ) then
+                v2_inject_r <= v2_inject;
+            end if;
+        end process;
+    end generate;
+
+    gen_no_meta_v2 : if not ENABLE_META_V2 generate
+        v2_inject   <= '0';
+        v2_inject_r <= '0';
+    end generate;
 
     -- ------------------------------------------------------------------------
     -- MINI EXP PIN SYNCHRONIZER
@@ -478,7 +543,10 @@ begin
 
             when META_DOWNCOUNT =>
 
-                if( fifo_current.fifo_write = '1' and meta_current.meta_write = '0' ) then
+                -- The v2 status entry is a FIFO write like any other and counts
+                -- toward the message (and toward chunk 0 of the gain tag).
+                if( fifo_current.fifo_write = '1' and
+                    (meta_current.meta_write = '0' or v2_inject_r = '1') ) then
                     meta_future.dma_downcount <= meta_current.dma_downcount - NUM_STREAMS;
 
                     -- Walk the chunk boundaries off the same dword writes that
@@ -904,6 +972,16 @@ begin
                 fifo_future.state <= CLEAR;
 
         end case;
+
+        -- Header v2: the status entry goes in ahead of the message's first
+        -- sample. The packer's accumulator is empty at a message boundary
+        -- (messages are a whole number of entries), so overriding it here
+        -- loses nothing; the sample seen this cycle is still in in_samples_r
+        -- and is packed next cycle as usual.
+        if( ENABLE_META_V2 and v2_inject = '1' ) then
+            fifo_future.fifo_write <= '1';
+            fifo_future.fifo_data  <= resize(unsigned(hdr_ext1 & hdr_ext0), fifo_future.fifo_data'length);
+        end if;
 
         -- Abort?
         if( enable = '0' ) then

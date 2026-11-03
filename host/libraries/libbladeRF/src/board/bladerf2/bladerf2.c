@@ -25,6 +25,7 @@
 
 #include "bladeRF.h"
 #include "host_config.h"
+#include "thread.h"
 
 #include "log.h"
 #define LOGGER_ID_STRING
@@ -2132,10 +2133,28 @@ static int bladerf2_init_stream(struct bladerf_stream **stream,
                              user_data);
 }
 
+/* Re-raise the FX3's RX stream once the async stream has had time to submit
+ * its USB transfers. See bladerf2_stream(). */
+static void *rx_stream_rearm_task(void *arg)
+{
+    struct bladerf *dev = arg;
+
+    usleep(10000);
+
+    MUTEX_LOCK(&dev->lock);
+    dev->backend->enable_module(dev, BLADERF_RX, true);
+    MUTEX_UNLOCK(&dev->lock);
+
+    return NULL;
+}
+
 static int bladerf2_stream(struct bladerf_stream *stream,
                            bladerf_channel_layout layout)
 {
     bladerf_direction dir = layout & BLADERF_DIRECTION_MASK;
+    struct bladerf *dev   = stream->dev;
+    bool rearm_rx         = false;
+    THREAD rearm_thread;
     int rv;
 
     switch (layout) {
@@ -2148,16 +2167,50 @@ static int bladerf2_stream(struct bladerf_stream *stream,
             return -EINVAL;
     }
 
-    WITH_MUTEX(&stream->dev->lock, {
+    WITH_MUTEX(&dev->lock, {
         CHECK_STATUS_LOCKED(
-            perform_format_config(stream->dev, dir, stream->format));
+            perform_format_config(dev, dir, stream->format));
     });
+
+    /* If RX was enabled before this call, the FX3 has been streaming into its
+     * own buffers with no USB transfer pending, and when the transfers do
+     * arrive the first two dwords of the session are gone: every message is
+     * then framed two samples early relative to its header, a constant
+     * timestamp offset that nothing in the 16-byte header can reveal (and a
+     * displaced extension entry with the 24-byte one). The sync path avoids
+     * this by submitting its transfers before the module is enabled
+     * (sync_prime_stream). Do the equivalent here: drop the FX3's RX stream,
+     * let async_run_stream() submit the transfers, and re-raise it a moment
+     * later. The RFIC stays enabled throughout. */
+    if (dir == BLADERF_RX) {
+        uint32_t reg = 0;
+
+        WITH_MUTEX(&dev->lock, {
+            if (dev->backend->rffe_control_read(dev, &reg) == 0 &&
+                does_rffe_dir_have_enabled_ch(reg, BLADERF_RX)) {
+                rearm_rx = (dev->backend->enable_module(dev, BLADERF_RX, false) == 0);
+            }
+        });
+
+        if (rearm_rx &&
+            THREAD_CREATE(&rearm_thread, rx_stream_rearm_task, dev) != THREAD_SUCCESS) {
+            /* Could not defer it; re-enable now rather than leave RX off */
+            WITH_MUTEX(&dev->lock, {
+                dev->backend->enable_module(dev, BLADERF_RX, true);
+            });
+            rearm_rx = false;
+        }
+    }
 
     rv = async_run_stream(stream, layout);
 
-    WITH_MUTEX(&stream->dev->lock, {
+    if (rearm_rx) {
+        THREAD_JOIN(rearm_thread, NULL);
+    }
+
+    WITH_MUTEX(&dev->lock, {
         CHECK_STATUS_LOCKED(
-            perform_format_deconfig(stream->dev, dir));
+            perform_format_deconfig(dev, dir));
     });
 
     return rv;

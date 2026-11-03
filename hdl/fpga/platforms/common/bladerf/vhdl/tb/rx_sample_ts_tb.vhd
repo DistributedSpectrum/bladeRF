@@ -6,13 +6,17 @@ architecture sim of rx_sample_ts_tb is
   signal epoch : std_logic_vector(31 downto 0) := (others=>'0'); signal locked, sync_tgl, pps_tgl : std_logic := '0';
   signal sample_v : std_logic := '1';      -- one sample every rx cycle (40 MSps)
   signal ts : std_logic_vector(63 downto 0); signal mfails, sfails : integer := 0; signal checks : integer := 0;
+  signal pps_alive, ubx_fresh : std_logic := '0'; signal rx_en : std_logic := '0';
+  signal gps_word, gps_epoch : std_logic_vector(31 downto 0);
   function ep(t: std_logic_vector(63 downto 0)) return integer is begin return to_integer(unsigned(t(63 downto 32))); end;
   function sc(t: std_logic_vector(63 downto 0)) return integer is begin return to_integer(unsigned(t(31 downto 0))); end;
 begin
   sys_clk <= not sys_clk after 6.25 ns when running else '0';   -- 80 MHz
   rx_clk  <= not rx_clk  after 12.5 ns when running else '0';   -- 40 MHz, async phase
   dut: entity work.rx_sample_ts port map (sys_clock=>sys_clk, epoch_sec=>epoch, utc_locked=>locked,
-       sync_tgl=>sync_tgl, pps_tgl=>pps_tgl, rx_clock=>rx_clk, sample_v=>sample_v, timestamp=>ts);
+       pps_alive=>pps_alive, ubx_fresh=>ubx_fresh,
+       sync_tgl=>sync_tgl, pps_tgl=>pps_tgl, rx_clock=>rx_clk, rx_enable=>rx_en, sample_v=>sample_v, timestamp=>ts,
+       gps_word=>gps_word, gps_epoch=>gps_epoch);
   -- coherence monitor: every rx cycle the count grows by exactly 1, except in the
   -- cycle the seconds change, where the count must restart (0 or 1) in that same cycle
   p_mon: process(rx_clk) variable pe, ps : integer := 0; variable first : boolean := true; begin
@@ -31,26 +35,41 @@ begin
     procedure expect(cond: boolean; msg: string) is begin
       if cond then report "ok   " & msg; else report "FAIL " & msg severity error; sfails <= sfails + 1; end if; end;
   begin
-    wait for 2 us;
+    wait for 1 us; rx_en <= '1'; wait for 1 us;
+    expect(gps_word(31 downto 26) = "100000", "status before lock = GPS_PRESENT only (" & to_hstring(gps_word) & ")");
+    expect(unsigned(gps_epoch) = 0, "epoch 0 before lock");
     -- PPS while unlocked: count restarts, seconds stay 0
     wait until rising_edge(sys_clk); pps_tgl <= not pps_tgl; wait for 2 us;
     expect(ep(ts) = 0 and sc(ts) < 90, "PPS unlocked: epoch 0, count restarted (" & integer'image(sc(ts)) & ")");
     -- UBX load 42 ms-style (here 20 us later): epoch 1000, locked
     wait for 18 us; wait until rising_edge(sys_clk); epoch <= std_logic_vector(to_unsigned(1000,32)); locked <= '1'; sync_tgl <= not sync_tgl;
+    pps_alive <= '1'; ubx_fresh <= '1';
     wait for 2 us; expect(ep(ts) = 1000, "UBX load: epoch=" & integer'image(ep(ts)));
+    expect(gps_word(31 downto 26) = "111111", "status locked = PRESENT+LOCK+FRESH+FRAC+ALIVE+VALID (" & to_hstring(gps_word) & ")");
+    expect(unsigned(gps_epoch) = 1000 and unsigned(gps_word(25 downto 0)) = sc(ts), "gps_epoch/frac mirror the timestamp");
     expect(sc(ts) > 800, "UBX load left the count running (" & integer'image(sc(ts)) & ")");
     -- next PPS: +1 second and count restart in the same cycle (sys side mirrors gps_uart: epoch_sec+1)
     wait for 8 us; wait until rising_edge(sys_clk); pps_tgl <= not pps_tgl; epoch <= std_logic_vector(to_unsigned(1001,32));
     wait for 1 us; expect(ep(ts) = 1001 and sc(ts) < 45, "PPS locked: epoch=" & integer'image(ep(ts)) & " count=" & integer'image(sc(ts)));
+    -- second PPS edge, 30 us after the first at 40 MSps: interval = samples between the edges
+    pps_alive <= '0'; wait for 2 us;
+    expect(gps_word(30) = '0' and gps_word(27) = '0' and gps_word(26) = '1', "PPS dead: GPS_LOCK and PPS_ALIVE clear, UTC_VALID stays (" & to_hstring(gps_word) & ")");
+    pps_alive <= '1';
+    -- RX re-enable: FRAC_VALID and GPS_LOCK drop and the interval is cleared until a PPS with RX running
+    wait until rising_edge(rx_clk); rx_en <= '0'; wait for 1 us; wait until rising_edge(rx_clk); rx_en <= '1'; wait for 1 us;
+    expect(gps_word(28) = '0' and gps_word(30) = '0', "RX re-enable: FRAC_VALID/GPS_LOCK clear (" & to_hstring(gps_word) & ")");
+    wait until rising_edge(sys_clk); pps_tgl <= not pps_tgl; epoch <= std_logic_vector(unsigned(epoch)+1); wait for 1 us;
+    expect(gps_word(28) = '1' and gps_word(30) = '1', "first PPS after re-enable: FRAC_VALID and GPS_LOCK back (" & to_hstring(gps_word) & ")");
+    wait for 20 us; wait until rising_edge(sys_clk); pps_tgl <= not pps_tgl; epoch <= std_logic_vector(unsigned(epoch)+1); wait for 1 us;
     -- UBX resync to the same second: no change
     wait for 20 us; wait until rising_edge(sys_clk); sync_tgl <= not sync_tgl; wait for 2 us;
-    expect(ep(ts) = 1001 and sc(ts) > 800, "UBX resync same second: unchanged");
+    expect(ep(ts) = 1003 and sc(ts) > 800, "UBX resync same second: unchanged (epoch " & integer'image(ep(ts)) & ")");
     -- a UBX correction (+5): absolute load wins
     wait for 5 us; wait until rising_edge(sys_clk); epoch <= std_logic_vector(to_unsigned(1006,32)); sync_tgl <= not sync_tgl; wait for 2 us;
     expect(ep(ts) = 1006, "UBX correction applied: epoch=" & integer'image(ep(ts)));
     -- several more PPS, checked by the monitor
     for i in 1 to 5 loop wait for 30 us; wait until rising_edge(sys_clk); pps_tgl <= not pps_tgl; epoch <= std_logic_vector(unsigned(epoch)+1); end loop;
-    wait for 5 us; expect(ep(ts) = 1011, "after 5 PPS: epoch=" & integer'image(ep(ts)));
+    wait for 5 us; expect(ep(ts) = 1011, "after 5 more PPS: epoch=" & integer'image(ep(ts)));
     running <= false; wait for 50 ns;
     report "monitor checks=" & integer'image(checks) & " fails=" & integer'image(mfails + sfails);
     if mfails + sfails = 0 then report "RX_SAMPLE_TS PASS" severity note; else report "RX_SAMPLE_TS FAIL" severity failure; end if;

@@ -51,7 +51,7 @@
  *
  *  https://github.com/Nuand/bladeRF/blob/master/doc/development/versioning.md
  */
-#define LIBBLADERF_API_VERSION (0x020A0000)
+#define LIBBLADERF_API_VERSION (0x020B0000)
 
 #ifdef __cplusplus
 extern "C" {
@@ -2397,6 +2397,52 @@ const char * CALL_CONV bladerf_format_to_string(bladerf_format format);
  */
 #define BLADERF_META_STATUS_UNDERRUN (1 << 1)
 
+/**
+ * This receive carries GPS time: the FPGA is a GPS image with v0.19.0 or
+ * later, and bladerf_sync_rx() has overlaid a ::bladerf_rx_gps_time on
+ * bladerf_metadata::reserved after the gain tag (see ::bladerf_rx_gps_time).
+ * The `timestamp` field itself is unchanged: still the free-running sample
+ * counter, so software that times samples against the host clock keeps working
+ * with or without a GPS fix.
+ */
+#define BLADERF_META_STATUS_GPS_PRESENT (1 << 8)
+
+/**
+ * The GPS seconds have been set from a valid GPS time fix at least once.
+ */
+#define BLADERF_META_STATUS_GPS_UTC_VALID (1 << 9)
+
+/**
+ * The FPGA accepted a PPS edge within the last 1.5 s, so the samples-since-PPS
+ * count is being disciplined.
+ */
+#define BLADERF_META_STATUS_GPS_PPS_ALIVE (1 << 10)
+
+/**
+ * The GPS time is locked: ::BLADERF_META_STATUS_GPS_UTC_VALID,
+ * ::BLADERF_META_STATUS_GPS_PPS_ALIVE and ::BLADERF_META_STATUS_GPS_FRAC_VALID
+ * all held for every message this call returned samples from. A call that
+ * consumed no message header repeats the most recent header's state. Per
+ * message, the same bit is ::BLADERF_RX_GAIN_TAG_GPS_LOCK in
+ * bladerf_get_rx_gain_tags().
+ */
+#define BLADERF_META_STATUS_GPS_LOCK (1 << 11)
+
+/**
+ * A valid GPS time message was decoded within the last 5 s. Clear with
+ * ::BLADERF_META_STATUS_GPS_PPS_ALIVE set means the seconds are running on PPS
+ * holdover.
+ */
+#define BLADERF_META_STATUS_GPS_UBX_FRESH (1 << 12)
+
+/**
+ * A PPS edge has been seen since RX was enabled. The FPGA counts samples only
+ * while they flow, so until the first PPS of a session the samples-since-PPS
+ * count is short by however long RX was off, and
+ * ::BLADERF_META_STATUS_GPS_LOCK stays clear.
+ */
+#define BLADERF_META_STATUS_GPS_FRAC_VALID (1 << 13)
+
 /*
  * Metadata flags
  *
@@ -2526,7 +2572,8 @@ const char * CALL_CONV bladerf_format_to_string(bladerf_format format);
 struct bladerf_metadata {
     /**
      * Free-running FPGA counter that monotonically increases at the sample rate
-     * of the associated channel.
+     * of the associated channel. (GPS time, when the image supplies it, is
+     * reported separately: see ::bladerf_rx_gps_time.)
      */
     bladerf_timestamp timestamp;
 
@@ -2548,8 +2595,13 @@ struct bladerf_metadata {
      * Output bit field to denoting the status of transmissions/receptions. API
      * calls will write this field.
      *
-     * Possible status flags include ::BLADERF_META_STATUS_OVERRUN and
-     * ::BLADERF_META_STATUS_UNDERRUN.
+     * Possible status flags include ::BLADERF_META_STATUS_OVERRUN,
+     * ::BLADERF_META_STATUS_UNDERRUN, the hardware flags
+     * ::BLADERF_META_FLAG_RX_HW_TIME_MARK, ::BLADERF_META_FLAG_RX_HW_MINIEXP1
+     * and ::BLADERF_META_FLAG_RX_HW_MINIEXP2, and on GPS-timed images
+     * ::BLADERF_META_STATUS_GPS_PRESENT, ::BLADERF_META_STATUS_GPS_UTC_VALID,
+     * ::BLADERF_META_STATUS_GPS_PPS_ALIVE, ::BLADERF_META_STATUS_GPS_LOCK,
+     * ::BLADERF_META_STATUS_GPS_UBX_FRESH and ::BLADERF_META_STATUS_GPS_FRAC_VALID.
      */
     uint32_t status;
 
@@ -2574,9 +2626,11 @@ struct bladerf_metadata {
      *
      * On RX with ::BLADERF_FORMAT_SC16_Q11_META or ::BLADERF_FORMAT_SC8_Q7_META,
      * bladerf_sync_rx() overlays a ::bladerf_rx_gain_tag on the first
-     * `sizeof(struct bladerf_rx_gain_tag)` bytes of this field and zeroes the
-     * remainder. Older FPGA images report
-     * ::BLADERF_RX_GAIN_TAG_VERSION_NONE in the `version` field.
+     * `sizeof(struct bladerf_rx_gain_tag)` bytes of this field, a
+     * ::bladerf_rx_gps_time on the next `sizeof(struct bladerf_rx_gps_time)`
+     * bytes, and zeroes the remainder. Older FPGA images report
+     * ::BLADERF_RX_GAIN_TAG_VERSION_NONE / ::BLADERF_RX_GPS_TIME_VERSION_NONE
+     * in the `version` fields.
      */
     uint8_t reserved[32];
 };
@@ -2741,6 +2795,12 @@ struct bladerf_rx_gain_tag {
  *  before that. */
 #define BLADERF_RX_GAIN_TAG_TIME_MARK (1 << 3)
 
+/** The GPS lock state (::BLADERF_META_STATUS_GPS_LOCK) of this entry's
+ *  message: `gps_epoch` and `gps_frac` come from a valid fix with a live PPS
+ *  seen since RX was enabled. Requires FPGA v0.19.0 or later on a GPS image;
+ *  always clear otherwise. */
+#define BLADERF_RX_GAIN_TAG_GPS_LOCK (1 << 4)
+
 /**
  * @brief One message's gain profile, positioned within a receive.
  *
@@ -2799,17 +2859,89 @@ struct bladerf_rx_gain_tag_msg {
     /** RX1 full gain-table index at the message's first sample */
     uint8_t gain_index;
 
-    /** Any of ::BLADERF_RX_GAIN_TAG_LOCKED, ::BLADERF_RX_GAIN_TAG_CARRIED and
-     *  ::BLADERF_RX_GAIN_TAG_TIME_MARK */
+    /** Any of ::BLADERF_RX_GAIN_TAG_LOCKED, ::BLADERF_RX_GAIN_TAG_CARRIED,
+     *  ::BLADERF_RX_GAIN_TAG_TIME_MARK and ::BLADERF_RX_GAIN_TAG_GPS_LOCK */
     uint8_t flags;
 
     /** Gain index at the end of each chunk of this message. The number of
      *  valid entries is ::bladerf_rx_gain_tag::chunks. */
     uint8_t chunk_gain_index[8];
 
-    /** Reserved for future use; currently zero */
-    uint8_t reserved[4];
+    /** Samples between the last two PPS edges before this message, i.e. the
+     *  sample rate as measured against GPS, derived from the counter and
+     *  `gps_frac` across a second boundary. Zero until measured, and always
+     *  zero without FPGA v0.19.0 on a GPS image. */
+    uint32_t pps_interval;
+
+    /** GPS time of the message's first sample: UTC seconds since the Unix
+     *  epoch and RX samples since the PPS edge that began that second, so
+     *  payload sample n of the message was taken at
+     *  `gps_epoch + (gps_frac + n) / sample_rate`. Only meaningful with
+     *  ::BLADERF_RX_GAIN_TAG_GPS_LOCK. */
+    uint32_t gps_epoch;
+    uint32_t gps_frac;
 };
+
+/**
+ * @brief GPS time of the first sample returned by a bladerf_sync_rx() call.
+ *
+ * Overlaid on ::bladerf_metadata::reserved immediately after the
+ * ::bladerf_rx_gain_tag (at byte offset `sizeof(struct bladerf_rx_gain_tag)`)
+ * by bladerf_sync_rx() in a metadata format. Requires FPGA v0.19.0 or later on
+ * an image with a GPS receiver (hdl/fpga/platforms/common/bladerf/doc/
+ * gps_time_setup.md); otherwise `version` is ::BLADERF_RX_GPS_TIME_VERSION_NONE.
+ *
+ * The ::bladerf_metadata::timestamp stays the free-running sample counter, so
+ * this is purely additional: sample n of the returned buffer was taken at
+ *
+ * @code
+ *     utc = epoch + (frac + n) / sample_rate
+ * @endcode
+ *
+ * where `sample_rate` may be taken as `pps_interval` when that is nonzero (the
+ * rate as the FPGA measured it against GPS over the last full second). Trust
+ * the value only when ::BLADERF_META_STATUS_GPS_LOCK is set in the status.
+ *
+ * A message that straddles a PPS edge is handled: if the first returned sample
+ * lies past the edge, `epoch` is already the new second and `frac` counts from
+ * it.
+ */
+struct bladerf_rx_gps_time {
+    /** ::BLADERF_RX_GPS_TIME_VERSION_1, or ::BLADERF_RX_GPS_TIME_VERSION_NONE
+     *  when the image supplies no GPS time. Check before reading the rest. */
+    uint8_t version;
+
+    /** GPS word status bits of the message the first sample came from:
+     *  bit 0 UTC_VALID, 1 PPS_ALIVE, 2 FRAC_VALID, 3 UBX_FRESH, 4 GPS_LOCK
+     *  (the same information as the BLADERF_META_STATUS_GPS_* flags, but for
+     *  that one message rather than the whole call). */
+    uint8_t flags;
+
+    uint16_t reserved;
+
+    /** UTC seconds since the Unix epoch at the PPS that began the second */
+    uint32_t epoch;
+
+    /** RX samples since that PPS edge at the first returned sample */
+    uint32_t frac;
+
+    /** Samples in the last full second, 0 until measured */
+    uint32_t pps_interval;
+};
+
+#define BLADERF_RX_GPS_TIME_VERSION_NONE 0
+#define BLADERF_RX_GPS_TIME_VERSION_1 1
+
+/** UTC_VALID bit of ::bladerf_rx_gps_time::flags */
+#define BLADERF_RX_GPS_TIME_UTC_VALID (1 << 0)
+/** PPS_ALIVE bit of ::bladerf_rx_gps_time::flags */
+#define BLADERF_RX_GPS_TIME_PPS_ALIVE (1 << 1)
+/** FRAC_VALID bit of ::bladerf_rx_gps_time::flags */
+#define BLADERF_RX_GPS_TIME_FRAC_VALID (1 << 2)
+/** UBX_FRESH bit of ::bladerf_rx_gps_time::flags */
+#define BLADERF_RX_GPS_TIME_UBX_FRESH (1 << 3)
+/** GPS_LOCK bit of ::bladerf_rx_gps_time::flags */
+#define BLADERF_RX_GPS_TIME_LOCK (1 << 4)
 
 /** @} (End of STREAMING_FORMAT_METADATA) */
 

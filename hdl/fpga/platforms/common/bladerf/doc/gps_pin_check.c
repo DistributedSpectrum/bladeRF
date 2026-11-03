@@ -18,7 +18,7 @@
 #include <libbladeRF.h>
 
 #define MSG_BYTES 8192u   /* FX3 fw >= 2.5.0 on SuperSpeed */
-#define HDR_BYTES 16u
+#define HDR_BYTES 24u     /* FPGA >= 0.19.0: 16-byte header + status + PPS interval */
 #define RUN_SECONDS 6
 
 static time_t t0;
@@ -33,8 +33,9 @@ static void *cb(struct bladerf *dev, struct bladerf_stream *st,
     const uint8_t *b = samples;
     size_t bytes = n * 4;
     for (size_t off = 0; off + HDR_BYTES <= bytes; off += MSG_BYTES) {
-        uint64_t ts; memcpy(&ts, b + off + 4, 8);
-        uint32_t ep = (uint32_t)(ts >> 32), fr = (uint32_t)ts;
+        uint64_t ts; memcpy(&ts, b + off + 4, 8);            /* stock sample counter */
+        uint32_t gw, ep; memcpy(&gw, b + off + 16, 4); memcpy(&ep, b + off + 20, 4);
+        uint32_t fr = gw & 0x03ffffffu;                       /* GPS: samples since PPS */
         long d = (long)ep - (long)time(NULL);
 
         if (nmsg == 0) first_epoch = ep;

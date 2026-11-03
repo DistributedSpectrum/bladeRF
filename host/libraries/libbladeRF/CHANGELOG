@@ -5,6 +5,42 @@ For more detailed information, please see the git change log and issue tracker
 hosted on GitHub: https://github.com/Nuand/bladeRF
 ================================================================================
 
+v2.11.0 (2026-11-03)
+--------------------------------
+
+This version of libbladeRF is intended for use with:
+
+  FX3 Firmware v2.6.1
+  FPGA         v0.19.0
+
+New Features:
+ * bladeRF 2.0: 24-byte RX metadata header (FPGA v0.19.0,
+   BLADERF_CAP_FPGA_RX_META_V2). In SC16_Q11_META and SC8_Q7_META the FPGA
+   adds two extension dwords after the 16-byte header and sends two fewer
+   samples per message; the sync layer sizes messages accordingly. The
+   timestamp field is still the free-running sample counter, so existing
+   consumers see no change in meaning. Older images keep the 16-byte header
+ * GPS time per receive: on a GPS image the extension carries UTC seconds and
+   RX samples since the PPS, sampled with the counter. bladerf_sync_rx()
+   overlays a bladerf_rx_gps_time on bladerf_metadata.reserved after the gain
+   tag, and sets BLADERF_META_STATUS_GPS_PRESENT, _GPS_UTC_VALID,
+   _GPS_PPS_ALIVE, _GPS_UBX_FRESH, _GPS_FRAC_VALID and _GPS_LOCK (the last
+   only if every message the call returned samples from was locked). The PPS
+   interval -- the sample rate as measured against GPS -- is derived from the
+   counter across each second boundary
+ * bladerf_rx_gain_tag_msg gains BLADERF_RX_GAIN_TAG_GPS_LOCK and gps_epoch,
+   gps_frac and pps_interval fields (the reserved bytes are gone; the struct
+   grew by 8 bytes)
+Bug Fixes:
+ * bladeRF 2.0: bladerf_stream() on an RX layout with the module already
+   enabled now briefly drops and re-raises the FX3's RX stream around the
+   submission of its USB transfers. Enabling RX before any transfer was
+   pending lost the first two dwords of the session inside the FX3, so every
+   message of an async-API stream was framed two samples early relative to
+   its header -- a constant timestamp offset the 16-byte header could not
+   reveal. bladerf_sync_rx() was never affected (it primes its transfers
+   before enabling the module)
+
 v2.10.0 (2026-10-15)
 --------------------------------
 

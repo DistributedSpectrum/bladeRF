@@ -30,7 +30,13 @@ entity gps_uart is
     --   G_PPS_REFRACTORY    : after an accepted edge, ignore the input for
     --                         this many cycles (0.9 s at 80 MHz)
     G_PPS_FILTER_CYCLES : natural := 8;
-    G_PPS_REFRACTORY    : natural := 72_000_000);
+    G_PPS_REFRACTORY    : natural := 72_000_000;
+    --   G_PPS_ALIVE_CYCLES  : pps_alive_o stays high this long after an
+    --                         accepted PPS edge (1.5 s at 80 MHz)
+    --   G_UBX_FRESH_CYCLES  : ubx_fresh_o stays high this long after a valid
+    --                         UBX-NAV-TIMEUTC decode (5 s at 80 MHz)
+    G_PPS_ALIVE_CYCLES  : natural := 120_000_000;
+    G_UBX_FRESH_CYCLES  : natural := 400_000_000);
 
   port (
     sys_clock       : in  std_logic;
@@ -44,6 +50,8 @@ entity gps_uart is
     utc_locked_o  : out std_logic;
     sync_tgl      : out std_logic;   -- toggles when epoch_sec is (re)loaded from UBX
     pps_tgl       : out std_logic;   -- toggles on each accepted PPS edge
+    pps_alive_o   : out std_logic;   -- an accepted PPS edge within G_PPS_ALIVE_CYCLES
+    ubx_fresh_o   : out std_logic;   -- a valid UBX time decode within G_UBX_FRESH_CYCLES
     txd       : out std_logic;
     dummy_out : out std_logic);
 
@@ -162,6 +170,8 @@ architecture rtl of gps_uart is
     signal utc_locked   : std_logic;
     signal sync_tgl_r   : std_logic;
     signal pps_tgl_r    : std_logic;
+    signal pps_age      : integer range 0 to G_PPS_ALIVE_CYCLES;
+    signal ubx_age      : integer range 0 to G_UBX_FRESH_CYCLES;
 
 begin  -- architecture rtl
 
@@ -469,6 +479,8 @@ begin  -- architecture rtl
       utc_locked   <= '0';
       sync_tgl_r   <= '0';
       pps_tgl_r    <= '0';
+      pps_age      <= G_PPS_ALIVE_CYCLES;   -- not alive until an edge is accepted
+      ubx_age      <= G_UBX_FRESH_CYCLES;
       timestamp_vld <= '0';
     elsif (rising_edge(sys_clock)) then
       -- synchronize PPS (2 FF)
@@ -495,6 +507,20 @@ begin  -- architecture rtl
       if (pps_refr /= 0) then
         pps_refr <= pps_refr - 1;
       end if;
+      -- Ages of the last accepted PPS edge and the last valid UBX decode,
+      -- saturating at the alive/fresh limits. These are what the host sees as
+      -- PPS_ALIVE / UBX_FRESH in the metadata status word.
+      if (re_pps = '1') then
+        pps_age <= 0;
+      elsif (pps_age /= G_PPS_ALIVE_CYCLES) then
+        pps_age <= pps_age + 1;
+      end if;
+      if (epoch_calc_vld = '1') then
+        ubx_age <= 0;
+      elsif (ubx_age /= G_UBX_FRESH_CYCLES) then
+        ubx_age <= ubx_age + 1;
+      end if;
+
       re_pps <= '0';
       if (pps_clean = '1' and pps_clean_d = '0' and pps_refr = 0) then
         re_pps   <= '1';
@@ -532,6 +558,8 @@ begin  -- architecture rtl
   utc_locked_o <= utc_locked;
   sync_tgl     <= sync_tgl_r;
   pps_tgl      <= pps_tgl_r;
+  pps_alive_o  <= '1' when pps_age /= G_PPS_ALIVE_CYCLES else '0';
+  ubx_fresh_o  <= '1' when ubx_age /= G_UBX_FRESH_CYCLES else '0';
 
 
   --

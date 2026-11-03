@@ -62,6 +62,10 @@ architecture hosted_bladerf of bladerf is
     signal gps_utc_locked  : std_logic;
     signal gps_sync_tgl    : std_logic;
     signal gps_pps_tgl     : std_logic;
+    signal gps_pps_alive          : std_logic;
+    signal gps_ubx_fresh          : std_logic;
+    signal gps_word               : std_logic_vector(31 downto 0);
+    signal gps_epoch_rx           : std_logic_vector(31 downto 0);
     signal gps_reset_n : std_logic;   -- power-on-only reset for gps_uart (from PLL lock)
     signal gps_rx_timestamp_vld : std_logic;
     signal gps_dummy_out : std_logic;
@@ -658,7 +662,8 @@ begin
     U_rx : entity work.rx
         generic map (
             NUM_STREAMS            => adc_controls'length,
-            ENABLE_GAIN_TAG        => true
+            ENABLE_GAIN_TAG        => true,
+            ENABLE_META_V2         => true
         )
         port map (
             rx_reset               => rx_reset,
@@ -670,10 +675,10 @@ begin
             usb_speed              => usb_speed_rx,
             rx_mux_sel             => rx_mux_sel,
             rx_overflow_led        => rx_overflow_led,
-            --rx_timestamp           => rx_timestamp,
-            -- Sample-exact GPS timestamp, generated in the rx_clock domain
-            -- (see rx_sample_ts.vhd); fifo_writer latches it per message.
-            rx_timestamp           => unsigned(gps_rx_timestamp_sync),
+            -- The stock free-running sample counter. GPS time travels in the
+            -- header extension dwords instead (hdr_ext0/1 below), so hosts
+            -- without GPS -- or without a fix -- see exactly what they always did.
+            rx_timestamp           => rx_timestamp,
 
             -- Triggering
             trigger_arm            => rx_trigger_ctl.arm,
@@ -709,6 +714,11 @@ begin
             -- U_ctrl_out_xfer below.
             rfic_ctrl_out          => rfic_ctrl_out_rx,
             rfic_ctrl_out_valid    => rfic_ctrl_out_rx_valid,
+
+            -- GPS time for the 24-byte header (rx_sample_ts, rx_clock domain):
+            -- 0x10 = {status, samples since PPS}, 0x14 = UTC epoch seconds
+            hdr_ext0               => gps_word,
+            hdr_ext1               => gps_epoch_rx,
 
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_pclk_pll,
@@ -771,6 +781,8 @@ begin
         utc_locked_o  => gps_utc_locked,
         sync_tgl      => gps_sync_tgl,
         pps_tgl       => gps_pps_tgl,
+        pps_alive_o   => gps_pps_alive,
+        ubx_fresh_o   => gps_ubx_fresh,
         txd           => gps_uart_txd,
         dummy_out     => gps_dummy_out);
 
@@ -782,11 +794,16 @@ begin
         sys_clock  => sys_clock,
         epoch_sec  => gps_epoch_sec,
         utc_locked => gps_utc_locked,
-        sync_tgl   => gps_sync_tgl,
-        pps_tgl    => gps_pps_tgl,
-        rx_clock   => rx_clock,
-        sample_v   => adc_streams(0).data_v,
-        timestamp  => gps_rx_timestamp_sync);
+        pps_alive    => gps_pps_alive,
+        ubx_fresh    => gps_ubx_fresh,
+        sync_tgl     => gps_sync_tgl,
+        pps_tgl      => gps_pps_tgl,
+        rx_clock     => rx_clock,
+        rx_enable    => rx_enable,
+        sample_v     => adc_streams(0).data_v,
+        timestamp    => gps_rx_timestamp_sync,
+        gps_word     => gps_word,
+        gps_epoch    => gps_epoch_rx);
 
     p_dummy: process (sys_clock) is
       variable temp0, temp1, temp2, temp3 : std_logic;
