@@ -32,7 +32,11 @@ entity rx is
 
         -- Tag the RX metadata header with a snapshot of rfic_ctrl_out. Only
         -- enable this where that port is actually wired to the RFIC pins.
-        ENABLE_GAIN_TAG      : boolean := false
+        ENABLE_GAIN_TAG      : boolean := false;
+
+        -- 24-byte RX metadata header: a {hdr_ext1, hdr_ext0} entry ahead of
+        -- every message's samples (see fifo_writer).
+        ENABLE_META_V2       : boolean := false
     );
     port (
         rx_reset               : in    std_logic;
@@ -84,6 +88,10 @@ entity rx is
         -- levels that do not care need not wire it up.
         rfic_ctrl_out          : in    std_logic_vector(7 downto 0) := (others => '0');
         rfic_ctrl_out_valid    : in    std_logic := '0';
+
+        -- Header v2 extension dwords (ENABLE_META_V2), rx_clock domain.
+        hdr_ext0               : in    std_logic_vector(31 downto 0) := (others => '0');
+        hdr_ext1               : in    std_logic_vector(31 downto 0) := (others => '0');
 
         -- Metadata to host via FX3
         meta_fifo_rclock       : in    std_logic;
@@ -246,7 +254,8 @@ begin
             FIFO_DATA_WIDTH       => sample_fifo.wdata'length,
             META_FIFO_USEDW_WIDTH => meta_fifo.wused'length,
             META_FIFO_DATA_WIDTH  => meta_fifo.wdata'length,
-            ENABLE_GAIN_TAG       => ENABLE_GAIN_TAG
+            ENABLE_GAIN_TAG       => ENABLE_GAIN_TAG,
+            ENABLE_META_V2        => ENABLE_META_V2
         )
         port map (
             clock               =>  rx_clock,
@@ -261,6 +270,8 @@ begin
             time_marker         =>  time_marker,
             rfic_ctrl_out       =>  rfic_ctrl_out,
             rfic_ctrl_out_valid =>  rfic_ctrl_out_valid,
+            hdr_ext0            =>  hdr_ext0,
+            hdr_ext1            =>  hdr_ext1,
 
             fifo_full           =>  sample_fifo.wfull,
             fifo_usedw          =>  sample_fifo.wused,

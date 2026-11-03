@@ -179,6 +179,16 @@
 #define BLADERF_CAP_FPGA_RX_TIME_MARK (((uint64_t)1) << 41)
 
 /**
+ * FPGA v0.19.0 extends the RX metadata header to 24 bytes in the SC16_Q11_META
+ * and SC8_Q7_META formats: a timestamp status dword at 0x10 and a PPS-interval
+ * dword at 0x14, with two fewer samples per message. The timestamp itself is
+ * {UTC epoch seconds, RX samples since the PPS} when the status word says so.
+ * There is no in-band marker a 16-byte-header image could not fake, so the
+ * FPGA version is the discriminator, exactly as for the gain tag.
+ */
+#define BLADERF_CAP_FPGA_RX_META_V2 (((uint64_t)1) << 42)
+
+/**
  * Max number of gain calibration tables associated to max number of channels
  */
 #define NUM_GAIN_CAL_TBLS 4

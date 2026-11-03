@@ -346,6 +346,8 @@ set_location_assignment PIN_E15 -to hw_rev[1]
 set_location_assignment PIN_C11 -to ps_sync_1p1
 set_location_assignment PIN_C13 -to ps_sync_1p8
 
+set_location_assignment PIN_C16 -to dummy_out
+
 # Bank 8A
 set_location_assignment PIN_G10 -to exp_gpio[15]
 set_location_assignment PIN_L7  -to exp_gpio[17]
@@ -396,6 +398,8 @@ set outs {
 for { set i 1 } { $i < 4 } { incr i } {
     lappend outs "led\[${i}\]"
 }
+
+set_instance_assignment -name IO_STANDARD          "3.3-V LVCMOS"    -to dummy_out
 
 foreach pin ${outs} {
     set_instance_assignment -name IO_STANDARD          "3.3-V LVCMOS"    -to ${pin}

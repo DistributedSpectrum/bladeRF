@@ -6,6 +6,32 @@ hosted on GitHub: https://github.com/nuand/bladeRF
 ================================================================================
 
 --------------------------------
+v0.19.0 (2026-11-03)
+--------------------------------
+
+Extends the RX metadata header to 24 bytes and carries GPS-disciplined UTC time
+beside the sample counter. bladeRF 2.0 (micro) only.
+
+ Features:
+ * hdl: RX metadata header v2. fifo_writer writes a 64-bit extension entry into
+   the sample FIFO ahead of every message's samples, so the host sees a 24-byte
+   header -- two extension dwords at 0x10 and 0x14, sampled in the same cycle
+   as the timestamp -- and two fewer samples per message (2042 on SuperSpeed,
+   250 on Hi-Speed). The timestamp stays the free-running sample counter; the
+   16-byte header, the gain tag and the time marker are unchanged; the GPIF is
+   untouched. Gain-tag chunks still span 511 dwords, the extension entry being
+   the first two dwords of chunk 0.
+ * hdl: GPS time. gps_uart decodes UBX-NAV-TIMEUTC from a u-blox receiver on
+   the expansion header (RX pin 56, PPS pin 50, timepulse GND pin 52) and
+   qualifies the PPS; rx_sample_ts counts RX samples since the PPS in the
+   rx_clock domain, exact to the sample, and fills the extension with
+   {status, samples since PPS} and the UTC epoch seconds. Status bits:
+   UTC_VALID, PPS_ALIVE, FRAC_VALID (a PPS seen since RX was enabled; samples
+   are only counted while RX runs), UBX_FRESH, GPS_LOCK, GPS_PRESENT.
+ * hdl: gain-tag wiring restored on this branch (it had been dropped from
+   the top level when the GPS UART was first added).
+
+--------------------------------
 v0.18.0 (2026-09-03)
 --------------------------------
 

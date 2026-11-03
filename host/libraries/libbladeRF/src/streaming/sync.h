@@ -206,6 +206,10 @@ struct sync_meta {
     unsigned int msg_num;         /* Which message within the buffer are we in?
                                    * Range is: 0 to msg_per_buf   */
     unsigned int samples_per_msg; /* Number of samples within a message */
+    size_t header_size;           /* Bytes of header at the start of each
+                                   * message: METADATA_HEADER_SIZE, or
+                                   * METADATA_V2_HEADER_SIZE on an RX stream
+                                   * from an FPGA with the v2 header */
     unsigned int samples_per_ts;  /* Number of samples within a timestamp */
 
     union {
@@ -214,6 +218,38 @@ struct sync_meta {
             uint64_t
                 msg_timestamp;  /* Timestamp contained in the current message */
             uint32_t msg_flags; /* Flags for the current message */
+
+            /* Header v2 GPS extension of the current message (0 on a v1
+             * header or a non-GPS image) */
+            uint32_t msg_gps_word;
+            uint32_t msg_gps_epoch;
+
+            /* GPS time bookkeeping. See metadata.h for the wire format. */
+            struct {
+                bool known;         /* A GPS header has ever been consumed */
+                uint32_t last_bits; /* bladerf_metadata.status bits of the
+                                     * most recent header, GPS_LOCK included */
+
+                /* Reset at the start of each sync_rx() call */
+                bool seen;          /* A header was consumed this call */
+                uint32_t bits;      /* OR of the headers consumed this call,
+                                     * GPS_LOCK excluded */
+                bool lock_all;      /* Every header consumed this call locked */
+                bool have_first;    /* first_* describe the first sample
+                                     * returned by this call */
+                uint32_t first_word;
+                uint32_t first_epoch;
+                uint64_t first_frac;
+
+                /* PPS interval, derived: the counter value at the PPS that
+                 * began a second is (timestamp - FRAC), and consecutive
+                 * seconds differ by the sample rate as measured against GPS.
+                 * Persists across calls. */
+                bool have_pps_pos;
+                uint32_t last_epoch;
+                uint64_t last_pps_pos;
+                uint32_t pps_interval;  /* 0 until measured */
+            } gps;
 
             /* RFIC gain profile, accumulated over every message consumed by
              * the current sync_rx() call. One call can span many messages but
@@ -229,6 +265,9 @@ struct sync_meta {
                 uint8_t last_base;
                 bool last_lock;
                 bool last_time_mark;
+                bool last_gps_lock;
+                uint32_t last_gps_word;
+                uint32_t last_gps_epoch;
                 uint8_t last_chunk[SYNC_GAIN_TAG_CHUNKS];
 
                 /* Reset at the start of each sync_rx() call */

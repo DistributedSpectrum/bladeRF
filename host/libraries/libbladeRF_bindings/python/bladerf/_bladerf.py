@@ -1201,7 +1201,11 @@ class BladeRF:
                     chunk_gain_index=tuple(t.chunk_gain_index),
                     locked=bool(t.flags & RX_GAIN_TAG_LOCKED),
                     carried=bool(t.flags & RX_GAIN_TAG_CARRIED),
-                    time_mark=bool(t.flags & RX_GAIN_TAG_TIME_MARK))
+                    time_mark=bool(t.flags & RX_GAIN_TAG_TIME_MARK),
+                    gps_lock=bool(t.flags & RX_GAIN_TAG_GPS_LOCK),
+                    pps_interval=t.pps_interval,
+                    gps_epoch=t.gps_epoch,
+                    gps_frac=t.gps_frac)
                 for t in tags]
 
     def set_rx_time_marker(self, value):
@@ -1525,6 +1529,12 @@ RxGainTag = collections.namedtuple(
 
 # bladerf_metadata.status bit mirroring the RX time marker (FPGA >= v0.18.0).
 META_FLAG_RX_HW_TIME_MARK = 1 << 4
+META_STATUS_GPS_PRESENT = 1 << 8
+META_STATUS_GPS_UTC_VALID = 1 << 9
+META_STATUS_GPS_PPS_ALIVE = 1 << 10
+META_STATUS_GPS_LOCK = 1 << 11
+META_STATUS_GPS_UBX_FRESH = 1 << 12
+META_STATUS_GPS_FRAC_VALID = 1 << 13
 
 RX_GAIN_TAG_VERSION_NONE = 0
 RX_GAIN_TAG_VERSION_1 = 1
@@ -1540,11 +1550,50 @@ RX_GAIN_TAG_LOCKED = 1 << 1
 RX_GAIN_TAG_CARRIED = 1 << 2
 # The RX time marker as latched at the head of this entry's message (FPGA >= v0.18.0).
 RX_GAIN_TAG_TIME_MARK = 1 << 3
+RX_GAIN_TAG_GPS_LOCK = 1 << 4
 
 RxGainTagMsg = collections.namedtuple(
     "RxGainTagMsg",
     "timestamp sample_offset sample_count msg_sample_offset gain_index flags "
-    "chunk_gain_index locked carried time_mark")
+    "chunk_gain_index locked carried time_mark gps_lock pps_interval "
+    "gps_epoch gps_frac")
+
+RX_GPS_TIME_VERSION_NONE = 0
+RX_GPS_TIME_VERSION_1 = 1
+RX_GPS_TIME_UTC_VALID = 1 << 0
+RX_GPS_TIME_PPS_ALIVE = 1 << 1
+RX_GPS_TIME_FRAC_VALID = 1 << 2
+RX_GPS_TIME_UBX_FRESH = 1 << 3
+RX_GPS_TIME_LOCK = 1 << 4
+
+RxGpsTime = collections.namedtuple(
+    "RxGpsTime",
+    "version flags epoch frac pps_interval locked")
+
+
+def rx_gps_time(meta):
+    """Decode the GPS time that bladerf_sync_rx() overlays on
+    bladerf_metadata.reserved after the gain tag (FPGA v0.19.0 or later on a
+    GPS image, metadata RX format).
+
+    `meta` is the cffi "struct bladerf_metadata *" passed to sync_rx.
+
+    Returns an RxGpsTime -- sample n of the returned buffer was taken at
+    epoch + (frac + n) / sample_rate -- or None when the image supplies no
+    GPS time. Trust it only when `locked` (META_STATUS_GPS_LOCK) is set.
+    """
+    t = ffi.new("struct bladerf_rx_gps_time *")
+    off = ffi.sizeof("struct bladerf_rx_gain_tag")
+    ffi.memmove(t, ffi.cast("uint8_t *", meta.reserved) + off,
+                ffi.sizeof("struct bladerf_rx_gps_time"))
+    if t.version == RX_GPS_TIME_VERSION_NONE:
+        return None
+    return RxGpsTime(version=t.version,
+                     flags=t.flags,
+                     epoch=t.epoch,
+                     frac=t.frac,
+                     pps_interval=t.pps_interval,
+                     locked=bool(t.flags & RX_GPS_TIME_LOCK))
 
 
 def rx_gain_tag(meta):

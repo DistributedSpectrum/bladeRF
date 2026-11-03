@@ -122,9 +122,10 @@ static inline unsigned int msg_per_buf(size_t msg_size, size_t buf_size,
 }
 
 static inline unsigned int samples_per_msg(size_t msg_size,
-                                           size_t bytes_per_sample)
+                                           size_t bytes_per_sample,
+                                           size_t header_size)
 {
-    size_t n = (msg_size - METADATA_HEADER_SIZE) / bytes_per_sample;
+    size_t n = (msg_size - header_size) / bytes_per_sample;
     assert(n <= UINT_MAX);
     return (unsigned int) n;
 }
@@ -241,7 +242,17 @@ int sync_init(struct bladerf_sync *sync,
     sync->meta.state = SYNC_META_STATE_HEADER;
     sync->meta.msg_size = msg_size;
     sync->meta.msg_per_buf = msg_per_buf(msg_size, buffer_size, bytes_per_sample);
-    sync->meta.samples_per_msg = samples_per_msg(msg_size, bytes_per_sample);
+    /* The v2 header is an RX-only, metadata-format-only extension, and the
+     * FPGA version is the only thing that says it is there. */
+    sync->meta.header_size = METADATA_HEADER_SIZE;
+    if ((layout & BLADERF_DIRECTION_MASK) == BLADERF_RX &&
+        (format == BLADERF_FORMAT_SC16_Q11_META ||
+         format == BLADERF_FORMAT_SC8_Q7_META) &&
+        have_cap_dev(dev, BLADERF_CAP_FPGA_RX_META_V2)) {
+        sync->meta.header_size = METADATA_V2_HEADER_SIZE;
+    }
+    sync->meta.samples_per_msg =
+        samples_per_msg(msg_size, bytes_per_sample, sync->meta.header_size);
     sync->meta.samples_per_ts = (layout == BLADERF_RX_X2 || layout == BLADERF_TX_X2) ? 2:1;
 
     log_verbose("%s: Buffer size (in bytes): %u\n",
@@ -305,6 +316,9 @@ int sync_init(struct bladerf_sync *sync,
 
             sync->meta.msg_timestamp = 0;
             sync->meta.msg_flags = 0;
+            sync->meta.msg_gps_word = 0;
+            sync->meta.msg_gps_epoch = 0;
+            memset(&sync->meta.gps, 0, sizeof(sync->meta.gps));
             sync->meta.have_timestamp = false;
             sync->buf_mgmt.overrun_pending = false;
             sync->buf_mgmt.stale_pending = false;
@@ -638,6 +652,10 @@ static inline uint64_t gain_tag_msg_start_ts(struct bladerf_sync *s)
 
 /* Attribute `count` samples, landing at `sample_offset` in the caller's buffer,
  * to the message they came out of. Call before curr_msg_off advances. */
+static inline void gps_normalize(const struct bladerf_sync *s,
+                                 uint32_t *epoch,
+                                 uint64_t *frac);
+
 static void gain_tag_record_samples(struct bladerf_sync *s,
                                     unsigned int sample_offset,
                                     unsigned int count)
@@ -675,6 +693,17 @@ static void gain_tag_record_samples(struct bladerf_sync *s,
         if (s->meta.gain_tag.last_time_mark) {
             e->flags |= BLADERF_RX_GAIN_TAG_TIME_MARK;
         }
+        if (s->meta.gain_tag.last_gps_lock) {
+            e->flags |= BLADERF_RX_GAIN_TAG_GPS_LOCK;
+        }
+        {
+            uint32_t ep = s->meta.gain_tag.last_gps_epoch;
+            uint64_t fr = s->meta.gain_tag.last_gps_word & METADATA_GPS_FRAC_MASK;
+            gps_normalize(s, &ep, &fr);
+            e->gps_epoch = ep;
+            e->gps_frac  = (uint32_t)fr;
+        }
+        e->pps_interval = s->meta.gps.pps_interval;
         memcpy(e->chunk_gain_index, s->meta.gain_tag.last_chunk,
                sizeof(s->meta.gain_tag.last_chunk));
     }
@@ -746,6 +775,10 @@ static inline void accumulate_gain_tag(struct bladerf_sync *s,
     s->meta.gain_tag.last_lock = tag.lock;
     s->meta.gain_tag.last_time_mark =
         (s->meta.msg_flags & BLADERF_META_FLAG_RX_HW_TIME_MARK) != 0;
+    s->meta.gain_tag.last_gps_lock =
+        (s->meta.msg_gps_word & METADATA_GPS_LOCK) != 0;
+    s->meta.gain_tag.last_gps_word  = s->meta.msg_gps_word;
+    s->meta.gain_tag.last_gps_epoch = s->meta.msg_gps_epoch;
     memcpy(s->meta.gain_tag.last_chunk, tag.chunk, sizeof(tag.chunk));
 
     if (s->meta.gain_tag.count < UINT16_MAX) {
@@ -764,8 +797,171 @@ static inline void accumulate_gain_tag(struct bladerf_sync *s,
         if (s->meta.gain_tag.last_time_mark) {
             e->flags |= BLADERF_RX_GAIN_TAG_TIME_MARK;
         }
+        if (s->meta.gain_tag.last_gps_lock) {
+            e->flags |= BLADERF_RX_GAIN_TAG_GPS_LOCK;
+        }
+        {
+            uint32_t ep = s->meta.msg_gps_epoch;
+            uint64_t fr = s->meta.msg_gps_word & METADATA_GPS_FRAC_MASK;
+            gps_normalize(s, &ep, &fr);
+            e->gps_epoch = ep;
+            e->gps_frac  = (uint32_t)fr;
+        }
+        e->pps_interval = s->meta.gps.pps_interval;
         memcpy(e->chunk_gain_index, tag.chunk, sizeof(tag.chunk));
     }
+}
+
+/* A sample that coincides with the PPS edge is labelled by the FPGA as the last
+ * sample of the old second, {E, L}, which is the same instant as {E+1, 0}; and
+ * an offset into a message that straddles the edge runs past L. Once the
+ * second's length is known, express both as the new second so every
+ * published fraction lies in [0, L). */
+static inline void gps_normalize(const struct bladerf_sync *s,
+                                 uint32_t *epoch,
+                                 uint64_t *frac)
+{
+    if (s->meta.gps.pps_interval != 0 && *frac >= s->meta.gps.pps_interval) {
+        *frac -= s->meta.gps.pps_interval;
+        (*epoch)++;
+    }
+}
+
+/* Header v2: read the GPS extension of the current message, fold its status
+ * into this call's summary, and keep the PPS-interval derivation going. On a
+ * 16-byte header there is nothing to read. Must run after the message's
+ * timestamp has been read into msg_timestamp. */
+static inline void note_gps(struct bladerf_sync *s)
+{
+    uint32_t w, bits = 0;
+
+    if (s->meta.header_size < METADATA_V2_HEADER_SIZE) {
+        s->meta.msg_gps_word  = 0;
+        s->meta.msg_gps_epoch = 0;
+        return;
+    }
+
+    w = metadata_get_gps_word(s->meta.curr_msg);
+    s->meta.msg_gps_word  = w;
+    s->meta.msg_gps_epoch = metadata_get_gps_epoch(s->meta.curr_msg);
+
+    if ((w & METADATA_GPS_PRESENT) == 0) {
+        /* An extension that is not GPS time: nothing to report */
+        s->meta.msg_gps_word  = 0;
+        s->meta.msg_gps_epoch = 0;
+        return;
+    }
+
+    bits |= BLADERF_META_STATUS_GPS_PRESENT;
+    if (w & METADATA_GPS_UTC_VALID) {
+        bits |= BLADERF_META_STATUS_GPS_UTC_VALID;
+    }
+    if (w & METADATA_GPS_PPS_ALIVE) {
+        bits |= BLADERF_META_STATUS_GPS_PPS_ALIVE;
+    }
+    if (w & METADATA_GPS_UBX_FRESH) {
+        bits |= BLADERF_META_STATUS_GPS_UBX_FRESH;
+    }
+    if (w & METADATA_GPS_FRAC_VALID) {
+        bits |= BLADERF_META_STATUS_GPS_FRAC_VALID;
+    }
+
+    if (!s->meta.gps.seen) {
+        s->meta.gps.seen     = true;
+        s->meta.gps.bits     = 0;
+        s->meta.gps.lock_all = true;
+    }
+    s->meta.gps.bits |= bits;
+    if ((w & METADATA_GPS_LOCK) == 0) {
+        s->meta.gps.lock_all = false;
+    }
+
+    s->meta.gps.known     = true;
+    s->meta.gps.last_bits = bits;
+    if (w & METADATA_GPS_LOCK) {
+        s->meta.gps.last_bits |= BLADERF_META_STATUS_GPS_LOCK;
+    }
+
+    /* The counter value at the PPS that began this second. Identical for
+     * every message of the second; one second later it has moved by exactly
+     * the number of samples in between. Only meaningful once the fraction is
+     * anchored to a PPS seen with RX running. */
+    if (w & METADATA_GPS_FRAC_VALID) {
+        const uint64_t pps_pos =
+            s->meta.msg_timestamp - (w & METADATA_GPS_FRAC_MASK);
+
+        if (s->meta.gps.have_pps_pos &&
+            s->meta.msg_gps_epoch == s->meta.gps.last_epoch + 1 &&
+            pps_pos > s->meta.gps.last_pps_pos &&
+            pps_pos - s->meta.gps.last_pps_pos <= UINT32_MAX) {
+            s->meta.gps.pps_interval =
+                (uint32_t)(pps_pos - s->meta.gps.last_pps_pos);
+        }
+        if (!s->meta.gps.have_pps_pos ||
+            s->meta.msg_gps_epoch != s->meta.gps.last_epoch) {
+            s->meta.gps.have_pps_pos = true;
+            s->meta.gps.last_epoch   = s->meta.msg_gps_epoch;
+            s->meta.gps.last_pps_pos = pps_pos;
+        }
+    } else {
+        s->meta.gps.have_pps_pos = false;
+        s->meta.gps.pps_interval = 0;
+    }
+}
+
+/* Remember the GPS time of the first sample this call returns. Called before
+ * the copy, while curr_msg_off still points at that sample. */
+static inline void note_gps_first_sample(struct bladerf_sync *s)
+{
+    if (s->meta.header_size < METADATA_V2_HEADER_SIZE || s->meta.gps.have_first) {
+        return;
+    }
+    s->meta.gps.have_first  = true;
+    s->meta.gps.first_word  = s->meta.msg_gps_word;
+    s->meta.gps.first_epoch = s->meta.msg_gps_epoch;
+    s->meta.gps.first_frac  = (s->meta.msg_gps_word & METADATA_GPS_FRAC_MASK) +
+                              s->meta.curr_msg_off / s->meta.samples_per_ts;
+}
+
+/* Publish the GPS status and time for this call: status flags, and a
+ * bladerf_rx_gps_time overlaid after the gain tag in reserved[]. A call that
+ * consumed headers reports the OR of their bits and GPS_LOCK only if every one
+ * of them was locked; a call that consumed none (reading less than a message
+ * at a time) repeats the most recent header's status so it is never left
+ * guessing. Must run after publish_gain_tag(), which clears reserved[]. */
+static inline void publish_gps(struct bladerf_sync *s,
+                               struct bladerf_metadata *user_meta)
+{
+    struct bladerf_rx_gps_time t;
+
+    if (s->meta.header_size < METADATA_V2_HEADER_SIZE) {
+        return;
+    }
+
+    if (s->meta.gps.seen) {
+        user_meta->status |= s->meta.gps.bits;
+        if (s->meta.gps.lock_all) {
+            user_meta->status |= BLADERF_META_STATUS_GPS_LOCK;
+        }
+    } else if (s->meta.gps.known) {
+        user_meta->status |= s->meta.gps.last_bits;
+    }
+
+    memset(&t, 0, sizeof(t));
+    if (s->meta.gps.have_first && (s->meta.gps.first_word & METADATA_GPS_PRESENT)) {
+        uint64_t frac = s->meta.gps.first_frac;
+        uint32_t epoch = s->meta.gps.first_epoch;
+
+        gps_normalize(s, &epoch, &frac);
+
+        t.version      = BLADERF_RX_GPS_TIME_VERSION_1;
+        t.flags        = (uint8_t)((s->meta.gps.first_word >> 26) & 0x1f);
+        t.epoch        = epoch;
+        t.frac         = (uint32_t)frac;
+        t.pps_interval = s->meta.gps.pps_interval;
+    }
+    memcpy(&user_meta->reserved[sizeof(struct bladerf_rx_gain_tag)], &t,
+           sizeof(t));
 }
 
 /* Publish the accumulated profile into the caller's metadata. Always writes the
@@ -867,6 +1063,8 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
             goto out;
         } else {
             user_meta->status = 0;
+            s->meta.gps.seen  = false;
+            s->meta.gps.have_first = false;
             target_timestamp = user_meta->timestamp;
             reset_gain_tag(s);
             gain_tag_reserve(s, num_samples);
@@ -1166,6 +1364,7 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
                               BLADERF_META_FLAG_RX_HW_MINIEXP1 |
                               BLADERF_META_FLAG_RX_HW_MINIEXP2);
 
+                        note_gps(s);
                         accumulate_gain_tag(s, s->meta.curr_msg);
 
                         s->meta.curr_msg_off = 0;
@@ -1230,10 +1429,11 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
 
                             memcpy(samples_dest + samples2bytes(s, samples_returned),
                                    s->meta.curr_msg +
-                                        METADATA_HEADER_SIZE +
+                                        s->meta.header_size +
                                         samples2bytes(s, s->meta.curr_msg_off),
                                    samples2bytes(s, samples_to_copy));
 
+                            note_gps_first_sample(s);
                             gain_tag_record_samples(s, samples_returned,
                                                     samples_to_copy);
 
@@ -1356,6 +1556,7 @@ int sync_rx(struct bladerf_sync *s, void *samples, unsigned num_samples,
         if (s->stream_config.format == BLADERF_FORMAT_SC16_Q11_META ||
             s->stream_config.format == BLADERF_FORMAT_SC8_Q7_META) {
             publish_gain_tag(s, user_meta);
+            publish_gps(s, user_meta);
         }
     }
 

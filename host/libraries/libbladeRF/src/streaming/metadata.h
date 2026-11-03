@@ -103,6 +103,44 @@
  * that never comes back is the "unsupported" signal in itself, and the
  * capability bit only saves the caller from having to wait for it.
  *
+ * FPGA v0.19.0 (BLADERF_CAP_FPGA_RX_META_V2) lengthens the RX header to 24
+ * bytes in the SC16_Q11_META and SC8_Q7_META formats. The FPGA writes one
+ * 64-bit entry into the sample FIFO ahead of every message's samples, so the
+ * 16-byte header above is followed by two extension dwords and the message
+ * carries two fewer samples (2042 on SuperSpeed, 250 on Hi-Speed, in 16-bit
+ * terms). The timestamp at 0x04 is still the free-running sample counter, so
+ * everything that consumed the 16-byte header keeps its meaning. On a GPS image
+ * the extension is GPS time, sampled at the same instant as the counter:
+ *
+ *       +-----------------+
+ *  0x10 |    GPS word     |    4 bytes, Little-endian uint32_t
+ *       +-----------------+
+ *  0x14 |    GPS epoch    |    4 bytes, Little-endian uint32_t
+ *       +-----------------+
+ *
+ * GPS word:
+ *       25:0  FRAC        RX samples since the PPS edge that began the second,
+ *                         saturating at 2^26-1
+ *         26  UTC_VALID   the epoch has been loaded from a valid GPS time fix
+ *         27  PPS_ALIVE   a PPS edge was accepted within the last 1.5 s
+ *         28  FRAC_VALID  a PPS edge has been seen since RX was enabled. The
+ *                         FPGA counts samples only while they flow, so until
+ *                         the first PPS of a session FRAC is short by however
+ *                         long RX was off
+ *         29  UBX_FRESH   a valid GPS time message within the last 5 s
+ *         30  GPS_LOCK    UTC_VALID, PPS_ALIVE and FRAC_VALID
+ *         31  GPS_PRESENT constant 1 on a GPS image: the extension is GPS time
+ * GPS epoch: UTC seconds since the Unix epoch (0 until UTC_VALID).
+ *
+ * So payload sample n of a message was taken at epoch + (FRAC + n) / rate, and
+ * the PPS that began the second sits at counter value (timestamp - FRAC); the
+ * difference of that value between consecutive seconds is the sample rate as
+ * measured against GPS, which the sync layer derives and reports.
+ *
+ * The gain-tag chunks keep their 511-dword span; the extension entry is the
+ * first two dwords of chunk 0, so payload sample s (0-based) belongs to chunk
+ * (s + 2) / 511 in 16-bit mode.
+ *
  * The term "buffer" is used to describe a block of of data received from or
  * sent to the device. The size of a "buffer" (in bytes) is always a multiple
  * of the size of a "message." Said another way, a buffer will always evenly
@@ -160,6 +198,20 @@
 
 #define METADATA_HEADER_SIZE (METADATA_FLAGS_OFFSET + METADATA_FLAGS_SIZE)
 
+/* Header v2 (BLADERF_CAP_FPGA_RX_META_V2): two more dwords after the flags */
+#define METADATA_V2_GPS_WORD_OFFSET (METADATA_HEADER_SIZE)
+#define METADATA_V2_GPS_EPOCH_OFFSET (METADATA_HEADER_SIZE + sizeof(uint32_t))
+#define METADATA_V2_HEADER_SIZE (METADATA_HEADER_SIZE + 2 * sizeof(uint32_t))
+
+/* GPS word bits (header v2, offset 0x10) */
+#define METADATA_GPS_FRAC_MASK 0x03ffffffu
+#define METADATA_GPS_UTC_VALID (1u << 26)
+#define METADATA_GPS_PPS_ALIVE (1u << 27)
+#define METADATA_GPS_FRAC_VALID (1u << 28)
+#define METADATA_GPS_UBX_FRESH (1u << 29)
+#define METADATA_GPS_LOCK (1u << 30)
+#define METADATA_GPS_PRESENT (1u << 31)
+
 /* RFIC gain tag, carried in the reserved word in SC16_Q11_META mode */
 #define METADATA_GAIN_TAG_CHUNKS 4
 #define METADATA_GAIN_TAG_DELTA_BITS 6
@@ -194,6 +246,22 @@ static inline uint32_t metadata_get_flags(const uint8_t *header)
     uint32_t ret;
     assert(sizeof(ret) == METADATA_FLAGS_SIZE);
     memcpy(&ret, &header[METADATA_FLAGS_OFFSET], METADATA_FLAGS_SIZE);
+    return LE32_TO_HOST(ret);
+}
+
+/* Header v2 only: the caller must have established the header size from
+ * BLADERF_CAP_FPGA_RX_META_V2; on a 16-byte header these bytes are samples. */
+static inline uint32_t metadata_get_gps_word(const uint8_t *header)
+{
+    uint32_t ret;
+    memcpy(&ret, &header[METADATA_V2_GPS_WORD_OFFSET], sizeof(ret));
+    return LE32_TO_HOST(ret);
+}
+
+static inline uint32_t metadata_get_gps_epoch(const uint8_t *header)
+{
+    uint32_t ret;
+    memcpy(&ret, &header[METADATA_V2_GPS_EPOCH_OFFSET], sizeof(ret));
     return LE32_TO_HOST(ret);
 }
 

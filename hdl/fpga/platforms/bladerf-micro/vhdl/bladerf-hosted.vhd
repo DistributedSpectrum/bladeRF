@@ -54,6 +54,23 @@ architecture hosted_bladerf of bladerf is
     signal nios_xb_gpio_out       : std_logic_vector(31 downto 0) := (others => '0');
     signal nios_xb_gpio_oe        : std_logic_vector(31 downto 0) := (others => '0');
 
+    signal gps_uart_rxd : std_logic;
+    signal gps_uart_txd : std_logic;    
+    signal gps_rx_timestamp : std_logic_vector(63 downto 0);
+    signal gps_rx_timestamp_sync : std_logic_vector(63 downto 0);   -- rx_clock domain, sample-exact
+    signal gps_epoch_sec   : std_logic_vector(31 downto 0);
+    signal gps_utc_locked  : std_logic;
+    signal gps_sync_tgl    : std_logic;
+    signal gps_pps_tgl     : std_logic;
+    signal gps_pps_alive          : std_logic;
+    signal gps_ubx_fresh          : std_logic;
+    signal gps_word               : std_logic_vector(31 downto 0);
+    signal gps_epoch_rx           : std_logic_vector(31 downto 0);
+    signal gps_reset_n : std_logic;   -- power-on-only reset for gps_uart (from PLL lock)
+    signal gps_rx_timestamp_vld : std_logic;
+    signal gps_dummy_out : std_logic;
+    
+    
     signal nios_gpio              : nios_gpio_t;
     signal nios_gpo_slv           : std_logic_vector(31 downto 0);
 
@@ -90,6 +107,10 @@ architecture hosted_bladerf of bladerf is
     signal meta_en_rx             : std_logic;
 
     signal rx_time_marker_rx      : std_logic;
+
+    -- AD9361 CTRL_OUT, moved from sys_clock into rx_clock as one atomic byte
+    signal rfic_ctrl_out_rx       : std_logic_vector(7 downto 0);
+    signal rfic_ctrl_out_rx_valid : std_logic;
 
     signal eightbit_en_pclk       : std_logic;
     signal eightbit_en_tx         : std_logic;
@@ -131,10 +152,6 @@ architecture hosted_bladerf of bladerf is
     signal timestamp_req          : std_logic;
     signal timestamp_ack          : std_logic;
     signal fx3_timestamp          : unsigned(63 downto 0);
-
-    -- AD9361 CTRL_OUT, moved from sys_clock into rx_clock as one atomic byte
-    signal rfic_ctrl_out_rx       : std_logic_vector(7 downto 0);
-    signal rfic_ctrl_out_rx_valid : std_logic;
 
     signal rx_ts_reset            : std_logic;
     signal tx_ts_reset            : std_logic;
@@ -187,6 +204,15 @@ architecture hosted_bladerf of bladerf is
     signal wbm_wb_stb_o           : std_logic;
     signal wbm_wb_ack_i           : std_logic;
     signal wbm_wb_cyc_o           : std_logic;
+
+    signal dbg_clk_cnt : unsigned(4 downto 0);
+    signal dbg_clock : std_logic;
+
+    
+    
+    --constant C_GSP_DIV_CNT : integer := 4340;
+    --constant C_GSP_DIV_CNT : integer := 128;    
+    --constant C_GSP_DIV_CNT : integer := 520;    
 begin
 
     U_rx_pkt_gen : entity work.rx_packet_generator
@@ -436,6 +462,7 @@ begin
             xb_gpio_in_port                 => nios_xb_gpio_in,
             xb_gpio_out_port                => nios_xb_gpio_out,
             xb_gpio_dir_export              => nios_xb_gpio_oe,
+            
             command_serial_in               => command_serial_in,
             command_serial_out              => command_serial_out,
             oc_i2c_arst_i                   => '0',
@@ -546,9 +573,13 @@ begin
 
     -- Expansion GPIO outputs
     generate_xb_gpio_out : for i in exp_gpio'range generate
+      gen_normal_gpio : if i /=0 and i /= 1 and i /= 2 generate
         exp_gpio(i) <= nios_xb_gpio_out(i) when nios_xb_gpio_oe(i) = '1' else 'Z';
+      end generate;
     end generate;
 
+    exp_gpio(1) <= gps_uart_txd;
+    
     tx_packet_ready <= '1';
 
     -- TX Submodule
@@ -631,7 +662,8 @@ begin
     U_rx : entity work.rx
         generic map (
             NUM_STREAMS            => adc_controls'length,
-            ENABLE_GAIN_TAG        => true
+            ENABLE_GAIN_TAG        => true,
+            ENABLE_META_V2         => true
         )
         port map (
             rx_reset               => rx_reset,
@@ -643,6 +675,9 @@ begin
             usb_speed              => usb_speed_rx,
             rx_mux_sel             => rx_mux_sel,
             rx_overflow_led        => rx_overflow_led,
+            -- The stock free-running sample counter. GPS time travels in the
+            -- header extension dwords instead (hdr_ext0/1 below), so hosts
+            -- without GPS -- or without a fix -- see exactly what they always did.
             rx_timestamp           => rx_timestamp,
 
             -- Triggering
@@ -680,6 +715,11 @@ begin
             rfic_ctrl_out          => rfic_ctrl_out_rx,
             rfic_ctrl_out_valid    => rfic_ctrl_out_rx_valid,
 
+            -- GPS time for the 24-byte header (rx_sample_ts, rx_clock domain):
+            -- 0x10 = {status, samples since PPS}, 0x14 = UTC epoch seconds
+            hdr_ext0               => gps_word,
+            hdr_ext1               => gps_epoch_rx,
+
             -- Metadata to host via FX3
             meta_fifo_rclock       => fx3_pclk_pll,
             meta_fifo_raclr        => not rx_enable_pclk,
@@ -703,6 +743,79 @@ begin
             adc_streams            => adc_streams
         );
 
+    p_dbg_clk: process (sys_clock) is
+    begin  -- process p_dbg_clk
+      if (rising_edge(sys_clock)) then  -- rising clock edge
+        dbg_clk_cnt <= (dbg_clk_cnt + 1) mod 32; 
+      end if;
+    end process p_dbg_clk;
+
+    dbg_clock <= dbg_clk_cnt(4);
+
+    -- gps_uart gets a POWER-ON-ONLY reset derived from the sys_clock PLL lock,
+    -- NOT the FX3 stream reset (sys_reset = fx3_ctl(7)). libbladeRF pulses the
+    -- FX3 reset on every RX enable, which used to reset the GPS time and leave
+    -- the first ~1 s of every capture untimed (epoch 0) until the next UBX
+    -- resync. GPS time is independent of the sample stream, so it now persists
+    -- across stream enable/disable. (gps_uart and its uart cores are active-LOW.)
+    U_reset_sync_gps : entity work.reset_synchronizer
+      generic map (
+        INPUT_LEVEL  => '0',    -- PLL not locked => reset
+        OUTPUT_LEVEL => '0'     -- active-low out
+      )
+      port map (
+        clock => sys_clock,
+        async => sys_pll_locked,
+        sync  => gps_reset_n
+      );
+
+    gps_uart_1: entity work.gps_uart
+      port map (
+        sys_clock     => sys_clock,
+        sys_reset     => gps_reset_n,
+        rxd           => gps_uart_rxd,
+        pps           => exp_gpio(2),
+        timestamp     => gps_rx_timestamp,
+        timestamp_vld => gps_rx_timestamp_vld,
+        epoch_sec_o   => gps_epoch_sec,
+        utc_locked_o  => gps_utc_locked,
+        sync_tgl      => gps_sync_tgl,
+        pps_tgl       => gps_pps_tgl,
+        pps_alive_o   => gps_pps_alive,
+        ubx_fresh_o   => gps_ubx_fresh,
+        txd           => gps_uart_txd,
+        dummy_out     => gps_dummy_out);
+
+    -- Sample-exact timestamp owned by the rx_clock domain: seconds advance and
+    -- the sample count restarts in the same rx cycle at each PPS; the absolute
+    -- second is loaded from UBX ~42 ms later. See rx_sample_ts.vhd.
+    gps_rx_ts_1: entity work.rx_sample_ts
+      port map (
+        sys_clock  => sys_clock,
+        epoch_sec  => gps_epoch_sec,
+        utc_locked => gps_utc_locked,
+        pps_alive    => gps_pps_alive,
+        ubx_fresh    => gps_ubx_fresh,
+        sync_tgl     => gps_sync_tgl,
+        pps_tgl      => gps_pps_tgl,
+        rx_clock     => rx_clock,
+        rx_enable    => rx_enable,
+        sample_v     => adc_streams(0).data_v,
+        timestamp    => gps_rx_timestamp_sync,
+        gps_word     => gps_word,
+        gps_epoch    => gps_epoch_rx);
+
+    p_dummy: process (sys_clock) is
+      variable temp0, temp1, temp2, temp3 : std_logic;
+    begin  -- process p_dummy
+      if (rising_edge(sys_clock)) then  -- rising clock edge
+
+        dummy_out <= gps_dummy_out;
+        
+      end if;
+    end process p_dummy;
+
+    
     adc_assignment_proc : process( all )
     begin
         for i in adc_controls'range loop
@@ -845,6 +958,23 @@ begin
             clock               =>  rx_clock,
             async               =>  nios_gpio.o.rx_time_marker,
             sync                =>  rx_time_marker_rx
+        );
+
+    -- The metadata gain tag is assembled in rx_clock, but adi_ctrl_out is only
+    -- synchronized into sys_clock (for the Nios readback register below). Reuse
+    -- that synchronized copy rather than adding a third set of per-bit chains,
+    -- and carry all eight bits across the remaining domain boundary in a single
+    -- parallel load so a header can never see a mixture of two gain indices.
+    U_ctrl_out_xfer : entity work.ctrl_out_xfer
+        port map (
+            src_clock           =>  sys_clock,
+            src_reset           =>  sys_reset,
+            src_data            =>  rffe_gpio.i.ctrl_out,
+
+            dst_clock           =>  rx_clock,
+            dst_reset           =>  rx_reset,
+            dst_data            =>  rfic_ctrl_out_rx,
+            dst_valid           =>  rfic_ctrl_out_rx_valid
         );
 
     U_sync_meta_en_tx : entity work.synchronizer
@@ -999,6 +1129,7 @@ begin
         );
 
     generate_sync_xb_gpio_in : for i in exp_gpio'range generate
+      gen_normal_gpio : if i /= 0 and i /= 1 generate
         U_sync_xb_gpio_in : entity work.synchronizer
           generic map (
             RESET_LEVEL         =>  '0'
@@ -1008,8 +1139,11 @@ begin
             async               =>  exp_gpio(i),
             sync                =>  nios_xb_gpio_in(i)
           );
+      end generate;
     end generate;
 
+    gps_uart_rxd <= exp_gpio(0);
+    
     U_sync_rx_enable : entity work.synchronizer
         generic map (
             RESET_LEVEL =>  '0'
@@ -1053,23 +1187,6 @@ begin
             end if;
         end if;
     end process;
-
-    -- The metadata gain tag is assembled in rx_clock, but adi_ctrl_out is only
-    -- synchronized into sys_clock (for the Nios readback register below). Reuse
-    -- that synchronized copy rather than adding a third set of per-bit chains,
-    -- and carry all eight bits across the remaining domain boundary in a single
-    -- parallel load so a header can never see a mixture of two gain indices.
-    U_ctrl_out_xfer : entity work.ctrl_out_xfer
-        port map (
-            src_clock           =>  sys_clock,
-            src_reset           =>  sys_reset,
-            src_data            =>  rffe_gpio.i.ctrl_out,
-
-            dst_clock           =>  rx_clock,
-            dst_reset           =>  rx_reset,
-            dst_data            =>  rfic_ctrl_out_rx,
-            dst_valid           =>  rfic_ctrl_out_rx_valid
-        );
 
     U_handshake_timestamp : entity work.handshake
         generic map (

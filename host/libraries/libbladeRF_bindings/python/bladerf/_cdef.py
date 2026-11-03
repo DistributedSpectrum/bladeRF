@@ -346,7 +346,18 @@ header = """
     uint8_t gain_index;
     uint8_t flags;
     uint8_t chunk_gain_index[8];
-    uint8_t reserved[4];
+    uint32_t pps_interval;
+    uint32_t gps_epoch;
+    uint32_t gps_frac;
+  };
+  struct bladerf_rx_gps_time
+  {
+    uint8_t version;
+    uint8_t flags;
+    uint16_t reserved;
+    uint32_t epoch;
+    uint32_t frac;
+    uint32_t pps_interval;
   };
   int bladerf_interleave_stream_buffer(bladerf_channel_layout layout,
     bladerf_format format, unsigned int buffer_size, void *samples);
